@@ -1,14 +1,16 @@
 # Rust build artifacts
-/target
+target/
 *.tmp
-/target/
+Cargo.lock.bak
 
-# Taskplane working files
+# Taskplane / agent working files
 .worktrees/
-.pi/batch-state.json
-.pi/merge-results/
-.pi/supervisor/
-
-.claude/
 .pi/
-docs/itnernal/
+.claude/
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Stray artifacts
+/1
