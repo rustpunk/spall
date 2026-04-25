@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target
 *.tmp
+/target/
 
 # Taskplane working files
 .worktrees/
