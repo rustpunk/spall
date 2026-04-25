@@ -1,37 +1,103 @@
-use crate::ir::{ParameterLocation, ResolvedOperation, ResolvedSpec};
+use crate::ir::{ParameterLocation, ResolvedOperation, ResolvedSpec, SpecIndex};
 use clap::{Arg, ArgAction, ArgGroup, Command};
 use indexmap::IndexMap;
 
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 /// Build a clap `Command` tree from a resolved spec for a given API.
-///
-/// Operations are grouped by their first tag. If the spec contains only a
-/// single tag (or the default fallback), operations are registered directly
-/// under the API root to avoid forcing users to type a redundant tag name.
 pub fn build_operations_cmd(api_name: &str, spec: &ResolvedSpec) -> Command {
+    let light_ops: Vec<LightOp> = spec.operations.iter().map(|op| LightOp {
+        operation_id: &op.operation_id,
+        summary: op.summary.as_deref(),
+        deprecated: op.deprecated,
+        tags: &op.tags,
+        params: op
+            .parameters
+            .iter()
+            .map(|p| LightParam {
+                name: &p.name,
+                location: p.location,
+                required: p.required,
+                description: p.description.as_deref(),
+                schema: Some(&p.schema),
+            })
+            .collect(),
+        has_body: op.request_body.is_some(),
+        body_required: op.request_body.as_ref().map(|b| b.required).unwrap_or(false),
+    }).collect();
+    build_root_cmd(api_name, &spec.title, &spec.version, &light_ops)
+}
+
+/// Build a clap `Command` tree from a lightweight cached index.
+pub fn build_operations_cmd_from_index(api_name: &str, index: &SpecIndex) -> Command {
+    let light_ops: Vec<LightOp> = index.operations.iter().map(|op| LightOp {
+        operation_id: &op.operation_id,
+        summary: op.summary.as_deref(),
+        deprecated: op.deprecated,
+        tags: &op.tags,
+        params: op
+            .parameters
+            .iter()
+            .map(|p| LightParam {
+                name: &p.name,
+                location: p.location,
+                required: p.required,
+                description: None,
+                schema: None,
+            })
+            .collect(),
+        has_body: op.has_request_body,
+        body_required: op.request_body_required,
+    }).collect();
+    build_root_cmd(api_name, &index.title, &index.version, &light_ops)
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+struct LightParam<'a> {
+    name: &'a str,
+    location: ParameterLocation,
+    required: bool,
+    description: Option<&'a str>,
+    schema: Option<&'a crate::ir::ResolvedSchema>,
+}
+
+struct LightOp<'a> {
+    operation_id: &'a str,
+    summary: Option<&'a str>,
+    deprecated: bool,
+    tags: &'a [String],
+    params: Vec<LightParam<'a>>,
+    has_body: bool,
+    body_required: bool,
+}
+
+fn build_root_cmd(api_name: &str, title: &str, version: &str, ops: &[LightOp]) -> Command {
     let mut root = Command::new(api_name.to_string())
-        .about(format!("{} API ({})", spec.title, spec.version));
+        .about(format!("{} API ({})", title, version));
 
-    let groups = group_by_tag(&spec.operations);
+    let groups = group_by_tag(ops);
 
-    // Single-tag flatten: register operations directly under root.
     if groups.len() == 1 {
         for op in groups.values().next().unwrap() {
-            root = root.subcommand(build_operation_cmd(op));
+            root = root.subcommand(build_op_cmd(op));
         }
         return root;
     }
 
-    // Multi-tag: create tag subcommands and also register ops under root
-    // for direct access.
     let mut seen_root: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (tag, ops) in &groups {
+    for (tag, tag_ops) in &groups {
         let mut tag_cmd = Command::new(tag.clone())
             .about(format!("{} operations", tag));
 
-        for op in ops {
-            tag_cmd = tag_cmd.subcommand(build_operation_cmd(op));
-            if seen_root.insert(&op.operation_id) {
-                root = root.subcommand(build_operation_cmd(op));
+        for op in tag_ops {
+            tag_cmd = tag_cmd.subcommand(build_op_cmd(op));
+            if seen_root.insert(op.operation_id) {
+                root = root.subcommand(build_op_cmd(op));
             }
         }
 
@@ -41,102 +107,73 @@ pub fn build_operations_cmd(api_name: &str, spec: &ResolvedSpec) -> Command {
     root
 }
 
-/// Build a single operation subcommand with its arguments.
-fn build_operation_cmd(op: &ResolvedOperation) -> Command {
-    let mut cmd = Command::new(op.operation_id.clone())
-        .about(op.summary.clone().unwrap_or_default());
+fn build_op_cmd(op: &LightOp) -> Command {
+    let mut cmd = Command::new(op.operation_id.to_string())
+        .about(op.summary.unwrap_or_default().to_string());
 
     if op.deprecated {
         cmd = cmd.before_help("[DEPRECATED] This operation is deprecated.");
     }
 
-    // Path params → positional args (internal ID: path-{name})
-    for param in &op.parameters {
-        if param.location == ParameterLocation::Path {
-            let id = format!("path-{}", param.name);
-            let mut arg = Arg::new(id.clone())
-                .value_name(param.name.clone())
-                .required(true)
-                .help(
-                    param
-                        .description
-                        .clone()
-                        .unwrap_or_default(),
-                );
-
-            arg = apply_schema_parsing(arg, &param.schema);
-            cmd = cmd.arg(arg);
+    for param in &op.params {
+        match param.location {
+            ParameterLocation::Path => {
+                let id = format!("path-{}", param.name);
+                let mut arg = Arg::new(id.clone())
+                    .value_name(param.name.to_string())
+                    .required(param.required)
+                    .help(param.description.unwrap_or_default().to_string());
+                if let Some(schema) = param.schema {
+                    arg = apply_schema_parsing(arg, schema);
+                }
+                cmd = cmd.arg(arg);
+            }
+            ParameterLocation::Query => {
+                let id = format!("query-{}", param.name);
+                let mut arg = Arg::new(id.clone())
+                    .long(param.name.to_string())
+                    .required(param.required)
+                    .help(param.description.unwrap_or_default().to_string());
+                if let Some(schema) = param.schema {
+                    arg = apply_schema_parsing(arg, schema);
+                }
+                cmd = cmd.arg(arg);
+            }
+            ParameterLocation::Header => {
+                let id = format!("header-{}", param.name);
+                let kebab = param.name.to_ascii_lowercase().replace('_', "-");
+                let mut arg = Arg::new(id.clone())
+                    .long(format!("header-{}", kebab))
+                    .required(param.required)
+                    .help(param.description.unwrap_or_default().to_string());
+                if let Some(schema) = param.schema {
+                    arg = apply_schema_parsing(arg, schema);
+                }
+                cmd = cmd.arg(arg);
+            }
+            ParameterLocation::Cookie => {
+                let id = format!("cookie-{}", param.name);
+                let kebab = param.name.to_ascii_lowercase().replace('_', "-");
+                let mut arg = Arg::new(id.clone())
+                    .long(format!("cookie-{}", kebab))
+                    .required(param.required)
+                    .help(param.description.unwrap_or_default().to_string());
+                if let Some(schema) = param.schema {
+                    arg = apply_schema_parsing(arg, schema);
+                }
+                cmd = cmd.arg(arg);
+            }
         }
     }
 
-    // Query params → --flags (internal ID: query-{name})
-    for param in &op.parameters {
-        if param.location == ParameterLocation::Query {
-            let id = format!("query-{}", param.name);
-            let mut arg = Arg::new(id.clone())
-                .long(param.name.clone())
-                .required(param.required)
-                .help(
-                    param
-                        .description
-                        .clone()
-                        .unwrap_or_default(),
-                );
-
-            arg = apply_schema_parsing(arg, &param.schema);
-            cmd = cmd.arg(arg);
-        }
-    }
-
-    // Header params → --header-{name}
-    for param in &op.parameters {
-        if param.location == ParameterLocation::Header {
-            let id = format!("header-{}", param.name);
-            let kebab = param.name.to_ascii_lowercase().replace('_', "-");
-            let mut arg = Arg::new(id.clone())
-                .long(format!("header-{}", kebab))
-                .required(param.required)
-                .help(
-                    param
-                        .description
-                        .clone()
-                        .unwrap_or_default(),
-                );
-
-            arg = apply_schema_parsing(arg, &param.schema);
-            cmd = cmd.arg(arg);
-        }
-    }
-
-    // Cookie params → --cookie-{name}
-    for param in &op.parameters {
-        if param.location == ParameterLocation::Cookie {
-            let id = format!("cookie-{}", param.name);
-            let kebab = param.name.to_ascii_lowercase().replace('_', "-");
-            let mut arg = Arg::new(id.clone())
-                .long(format!("cookie-{}", kebab))
-                .required(param.required)
-                .help(
-                    param
-                        .description
-                        .clone()
-                        .unwrap_or_default(),
-                );
-
-            arg = apply_schema_parsing(arg, &param.schema);
-            cmd = cmd.arg(arg);
-        }
-    }
-
-    // Request body args
-    if let Some(body) = &op.request_body {
+    if op.has_body {
         let mut data_arg = Arg::new("data")
             .long("data")
             .short('d')
             .action(ArgAction::Append)
             .help("Request body (JSON). Use @file.json or - for stdin.");
 
-        if body.required {
+        if op.body_required {
             data_arg = data_arg.required(true);
         } else {
             cmd = cmd.arg(
@@ -149,7 +186,6 @@ fn build_operation_cmd(op: &ResolvedOperation) -> Command {
 
         cmd = cmd.arg(data_arg);
 
-        // Form uploads (Wave 1)
         cmd = cmd.arg(
             Arg::new("form")
                 .long("form")
@@ -159,7 +195,6 @@ fn build_operation_cmd(op: &ResolvedOperation) -> Command {
                 .conflicts_with("field"),
         );
 
-        // Form-encoded fields (Wave 1)
         cmd = cmd.arg(
             Arg::new("field")
                 .long("field")
@@ -169,7 +204,6 @@ fn build_operation_cmd(op: &ResolvedOperation) -> Command {
                 .conflicts_with("form"),
         );
 
-        // Ensure only one body mechanism is used
         cmd = cmd.group(
             ArgGroup::new("body")
                 .args(["data", "form", "field"])
@@ -180,7 +214,6 @@ fn build_operation_cmd(op: &ResolvedOperation) -> Command {
     cmd
 }
 
-/// Apply schema-aware parsing hints to a clap Arg.
 fn apply_schema_parsing(mut arg: Arg, schema: &crate::ir::ResolvedSchema) -> Arg {
     if !schema.enum_values.is_empty() {
         let values: Vec<String> = schema
@@ -204,13 +237,10 @@ fn apply_schema_parsing(mut arg: Arg, schema: &crate::ir::ResolvedSchema) -> Arg
     arg
 }
 
-/// Group operations by their first tag.
-fn group_by_tag(
-    operations: &[ResolvedOperation],
-) -> IndexMap<String, Vec<&ResolvedOperation>> {
-    let mut map: IndexMap<String, Vec<&ResolvedOperation>> = IndexMap::new();
+fn group_by_tag<'a>(ops: &'a [LightOp<'a>]) -> IndexMap<String, Vec<&'a LightOp<'a>>> {
+    let mut map: IndexMap<String, Vec<&LightOp>> = IndexMap::new();
 
-    for op in operations {
+    for op in ops {
         let tag = op
             .tags
             .first()

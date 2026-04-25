@@ -5,6 +5,7 @@
 mod commands;
 mod completions;
 mod execute;
+mod fetch;
 mod http;
 mod output;
 
@@ -75,10 +76,15 @@ async fn run() -> miette::Result<()> {
     let registry = ApiRegistry::load().map_err(SpallCliError::Config)?;
     let args: Vec<String> = std::env::args().collect();
 
+    let cache_dir = dirs::cache_dir()
+        .map(|d| d.join("spall"))
+        .unwrap_or_else(|| spall_config::sources::config_dir().join("cache"));
+    std::fs::create_dir_all(&cache_dir).ok();
+
     // Fast path: `spall <api> --help` / `spall <api> -h` bypasses Phase 1
     // because Phase 1 stubs have disable_help_flag(true) and would error.
     if let Some(api_name) = detect_api_help(&registry, &args) {
-        return show_api_help(&registry, &api_name).await;
+        return show_api_help(&registry, &api_name, &cache_dir).await;
     }
 
     let mut phase1 = build_phase1(&registry);
@@ -96,10 +102,10 @@ async fn run() -> miette::Result<()> {
     };
 
     match phase1_matches.subcommand() {
-        Some(("api", sub)) => commands::api::handle_api_management(sub),
+        Some(("api", sub)) => commands::api::handle_api_management(sub, &cache_dir).await,
         Some((api_name, api_matches)) => {
             let remaining = execute::collect_remaining_args(api_matches);
-            handle_api_operation(api_name, remaining, &registry, &phase1_matches).await
+            handle_api_operation(api_name, remaining, &registry, &phase1_matches, &cache_dir).await
         }
         None => {
             phase1.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
@@ -122,61 +128,78 @@ fn detect_api_help(registry: &ApiRegistry, args: &[String]) -> Option<String> {
 }
 
 /// Show help for an API by loading its spec and building Phase 2.
-async fn show_api_help(registry: &ApiRegistry, api_name: &str) -> miette::Result<()> {
+async fn show_api_help(
+    registry: &ApiRegistry,
+    api_name: &str,
+    cache_dir: &std::path::Path,
+) -> miette::Result<()> {
     let entry = registry.find(api_name).unwrap();
-    match spall_core::loader::load_spec(&entry.source) {
-        Ok(spec) => {
-            let mut phase2 = spall_core::command::build_operations_cmd(api_name, &spec);
-            for arg in spall_global_args() {
-                phase2 = phase2.arg(arg);
-            }
-            phase2.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
-            println!();
-            Ok(())
-        }
+    let raw = match fetch::load_raw(&entry.source, cache_dir).await {
+        Ok(bytes) => bytes,
         Err(e) => {
             // Degraded help from cache
-            if let Some(index) = spall_core::cache::load_cached_index(&entry.source) {
+            if let Some(index) = spall_core::cache::load_cached_index(&entry.source, cache_dir) {
                 eprintln!(
                     "⚠  Could not load spec for '{}'. Showing cached operation list from {}.",
                     api_name, index.cached_at
                 );
-                print_degraded_help(api_name, &index)?;
-                Ok(())
+                let mut phase2 =
+                    spall_core::command::build_operations_cmd_from_index(api_name, &index);
+                for arg in spall_global_args() {
+                    phase2 = phase2.arg(arg);
+                }
+                phase2.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
+                println!();
+                return Ok(());
             } else {
-                Err(SpallCliError::SpecLoadFailed {
+                return Err(SpallCliError::SpecLoadFailed {
+                    api: api_name.to_string(),
+                    source: entry.source.clone(),
+                    cause: spall_core::error::SpallCoreError::InvalidSource(e.to_string()),
+                }
+                .into());
+            }
+        }
+    };
+
+    let spec = match spall_core::cache::load_or_resolve(
+        &entry.source,
+        &raw,
+        cache_dir,
+    ) {
+        Ok(spec) => spec,
+        Err(e) => {
+            if let Some(index) = spall_core::cache::load_cached_index(&entry.source, cache_dir
+            ) {
+                eprintln!(
+                    "⚠  Could not load spec for '{}'. Showing cached operation list from {}.",
+                    api_name, index.cached_at
+                );
+                let mut phase2 =
+                    spall_core::command::build_operations_cmd_from_index(api_name, &index);
+                for arg in spall_global_args() {
+                    phase2 = phase2.arg(arg);
+                }
+                phase2.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
+                println!();
+                return Ok(());
+            } else {
+                return Err(SpallCliError::SpecLoadFailed {
                     api: api_name.to_string(),
                     source: entry.source.clone(),
                     cause: e,
                 }
-                .into())
+                .into());
             }
         }
-    }
-}
+    };
 
-/// Print a degraded operation list from a cached SpecIndex.
-fn print_degraded_help(api_name: &str, index: &spall_core::ir::SpecIndex) -> miette::Result<()> {
-    println!("{} API — cached operation list\n", index.title);
-    println!("Usage: spall {} <operation> [args]\n", api_name);
-    println!("Operations:");
-    for op in &index.operations {
-        let deprecated = if op.deprecated { " [DEPRECATED]" } else { "" };
-        println!(
-            "  {:<6} {:<30} {} {}  {}  {}  {}",
-            "",
-            op.operation_id,
-            deprecated,
-            op.method,
-            op.path_template,
-            op.summary.as_deref().unwrap_or(""),
-            if op.tags.is_empty() {
-                String::new()
-            } else {
-                format!("(tag: {})", op.tags.join(", "))
-            }
-        );
+    let mut phase2 = spall_core::command::build_operations_cmd(api_name, &spec);
+    for arg in spall_global_args() {
+        phase2 = phase2.arg(arg);
     }
+    phase2.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
+    println!();
     Ok(())
 }
 
@@ -186,18 +209,26 @@ async fn handle_api_operation(
     remaining: Vec<String>,
     registry: &ApiRegistry,
     phase1_matches: &ArgMatches,
+    cache_dir: &std::path::Path,
 ) -> miette::Result<()> {
     let entry = registry
         .find(api_name)
         .ok_or_else(|| SpallCliError::Usage(format!("Unknown API: {}", api_name)))?;
 
-    let spec = spall_core::loader::load_spec(&entry.source).map_err(|e| {
-        SpallCliError::SpecLoadFailed {
+    let raw = fetch::load_raw(&entry.source, cache_dir)
+        .await
+        .map_err(|e| SpallCliError::SpecLoadFailed {
+            api: api_name.to_string(),
+            source: entry.source.clone(),
+            cause: spall_core::error::SpallCoreError::InvalidSource(e.to_string()),
+        })?;
+
+    let spec = spall_core::cache::load_or_resolve(&entry.source, &raw, cache_dir)
+        .map_err(|e| SpallCliError::SpecLoadFailed {
             api: api_name.to_string(),
             source: entry.source.clone(),
             cause: e,
-        }
-    })?;
+        })?;
 
     let mut phase2 = spall_core::command::build_operations_cmd(api_name, &spec);
     for arg in spall_global_args() {
@@ -231,7 +262,7 @@ async fn handle_api_operation(
     // Phase 2 structure may be flat (single tag) or nested (multiple tags).
     // Try direct operation match first.
     if let Some(op) = spec.operations.iter().find(|o| o.operation_id == tag_or_op) {
-        return execute::execute_operation(op, entry, op_matches, phase1_matches)
+        return execute::execute_operation(op, &spec, entry, op_matches, phase1_matches)
             .await
             .map_err(Into::into);
     }
@@ -250,7 +281,7 @@ async fn handle_api_operation(
                 SpallCliError::Usage(format!("Unknown operation: {}", op_name))
             })?;
 
-        return execute::execute_operation(op, entry, inner_matches, phase1_matches)
+        return execute::execute_operation(op, &spec, entry, inner_matches, phase1_matches)
             .await
             .map_err(Into::into);
     }

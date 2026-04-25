@@ -6,12 +6,15 @@ use clap::ArgMatches;
 use miette::Result;
 
 /// Handle `spall api add|list|remove|refresh`.
-pub fn handle_api_management(matches: &ArgMatches) -> Result<()> {
+pub async fn handle_api_management(
+    matches: &ArgMatches,
+    cache_dir: &std::path::Path,
+) -> Result<()> {
     match matches.subcommand() {
         Some(("add", sub)) => handle_add(sub),
         Some(("list", sub)) => handle_list(sub),
         Some(("remove", sub)) => handle_remove(sub),
-        Some(("refresh", sub)) => handle_refresh(sub),
+        Some(("refresh", sub)) => handle_refresh(sub, cache_dir).await,
         _ => {
             // Should not happen if clap parsing is correct.
             Ok(())
@@ -53,14 +56,44 @@ fn handle_remove(matches: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
-fn handle_refresh(matches: &ArgMatches) -> Result<()> {
+async fn handle_refresh(
+    matches: &ArgMatches,
+    cache_dir: &std::path::Path,
+) -> Result<()> {
     let all = matches.get_flag("all");
     let name = matches.get_one::<String>("name");
-    // TODO(Wave 1.5): re-fetch remote specs and invalidate caches.
+
+    let registry = spall_config::registry::ApiRegistry::load().map_err(|e| {
+        crate::SpallCliError::Config(e)
+    })?;
+
     if all {
-        eprintln!("Refreshing all APIs...");
+        for entry in &registry.apis {
+            if entry.source.starts_with("http://") || entry.source.starts_with("https://") {
+                match crate::fetch::refresh(&entry.source, cache_dir).await {
+                    Ok(_) => eprintln!("Refreshed API '{}'", entry.name),
+                    Err(e) => eprintln!("Failed to refresh API '{}': {}", entry.name, e),
+                }
+            }
+        }
     } else if let Some(n) = name {
-        eprintln!("Refreshing API '{}'...", n);
+        let entry = registry
+            .find(n)
+            .ok_or_else(|| crate::SpallCliError::Usage(format!("Unknown API: {}", n)))?;
+        if entry.source.starts_with("http://") || entry.source.starts_with("https://") {
+            crate::fetch::refresh(&entry.source, cache_dir)
+                .await
+                .map_err(|e| crate::SpallCliError::Network(e.to_string()))?;
+            eprintln!("Refreshed API '{}'", n);
+        } else {
+            eprintln!("Warning: refresh only applies to remote specs. '{}' is a file source.", n);
+        }
+    } else {
+        return Err(crate::SpallCliError::Usage(
+            "Provide an API name or use --all".to_string(),
+        )
+        .into());
     }
+
     Ok(())
 }

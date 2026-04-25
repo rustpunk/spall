@@ -58,8 +58,16 @@ pub fn emit_response(
 
     match mode {
         OutputMode::Pretty => {
-            // TODO(Wave 1): pretty-print JSON with colors.
-            io::stdout().write_all(body)?;
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+                if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+                    io::stdout().write_all(pretty.as_bytes())?;
+                    io::stdout().write_all(b"\n")?;
+                } else {
+                    io::stdout().write_all(body)?;
+                }
+            } else {
+                io::stdout().write_all(body)?;
+            }
         }
         OutputMode::Raw => {
             io::stdout().write_all(body)?;

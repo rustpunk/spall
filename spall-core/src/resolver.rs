@@ -1,7 +1,8 @@
 use crate::error::SpallCoreError;
 use crate::ir::{
     HttpMethod, ParameterLocation, ResolvedMediaType, ResolvedOperation, ResolvedParameter,
-    ResolvedRequestBody, ResolvedResponse, ResolvedSchema, ResolvedSpec, SecurityRequirement,
+    ResolvedRequestBody, ResolvedResponse, ResolvedSchema, ResolvedServer, ResolvedSpec,
+    SecurityRequirement,
 };
 use indexmap::IndexMap;
 use openapiv3::{
@@ -24,6 +25,15 @@ pub fn resolve_spec(raw: &OpenAPI, _source: &str) -> Result<ResolvedSpec, SpallC
         .map(|s| s.url.clone())
         .unwrap_or_else(|| "/".to_string());
 
+    let spec_servers: Vec<ResolvedServer> = raw
+        .servers
+        .iter()
+        .map(|s| ResolvedServer {
+            url: s.url.clone(),
+            description: s.description.clone(),
+        })
+        .collect();
+
     let mut operations: Vec<ResolvedOperation> = Vec::new();
     let mut seen_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
@@ -36,6 +46,19 @@ pub fn resolve_spec(raw: &OpenAPI, _source: &str) -> Result<ResolvedSpec, SpallC
                 })
             }
             ReferenceOr::Item(item) => item,
+        };
+
+        let path_servers: Vec<ResolvedServer> = if path_item.servers.is_empty() {
+            spec_servers.clone()
+        } else {
+            path_item
+                .servers
+                .iter()
+                .map(|s| ResolvedServer {
+                    url: s.url.clone(),
+                    description: s.description.clone(),
+                })
+                .collect()
         };
 
         let path_params: Vec<ReferenceOr<Parameter>> = path_item.parameters.clone();
@@ -60,6 +83,25 @@ pub fn resolve_spec(raw: &OpenAPI, _source: &str) -> Result<ResolvedSpec, SpallC
                 op.operation_id.as_deref(),
                 &mut seen_ids,
             );
+
+            let operation_servers = if op.servers.is_empty() {
+                if path_servers.is_empty() {
+                    vec![ResolvedServer {
+                        url: "/".into(),
+                        description: None,
+                    }]
+                } else {
+                    path_servers.clone()
+                }
+            } else {
+                op.servers
+                    .iter()
+                    .map(|s| ResolvedServer {
+                        url: s.url.clone(),
+                        description: s.description.clone(),
+                    })
+                    .collect()
+            };
 
             let security = resolve_security(
                 raw.security.as_deref(),
@@ -97,6 +139,7 @@ pub fn resolve_spec(raw: &OpenAPI, _source: &str) -> Result<ResolvedSpec, SpallC
                 security,
                 tags: op.tags.clone(),
                 extensions: op.extensions.clone(),
+                servers: operation_servers,
             });
         }
     }
@@ -106,6 +149,7 @@ pub fn resolve_spec(raw: &OpenAPI, _source: &str) -> Result<ResolvedSpec, SpallC
         version,
         base_url,
         operations,
+        servers: spec_servers,
     })
 }
 

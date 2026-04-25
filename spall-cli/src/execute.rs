@@ -3,9 +3,10 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE};
 use secrecy::ExposeSecret;
 use spall_config::credentials::CredentialResolver;
 use spall_config::registry::ApiEntry;
-use spall_core::ir::{HttpMethod, ParameterLocation, ResolvedOperation, ResolvedRequestBody};
+use spall_core::ir::{HttpMethod, ParameterLocation, ResolvedOperation, ResolvedRequestBody, ResolvedSpec};
 
 use std::io::Read;
+use std::time::Instant;
 
 /// Collect remaining arguments after Phase 1 match.
 pub fn collect_remaining_args(matches: &ArgMatches) -> Vec<String> {
@@ -25,11 +26,12 @@ pub fn collect_remaining_args(matches: &ArgMatches) -> Vec<String> {
 /// Execute a matched operation.
 pub async fn execute_operation(
     op: &ResolvedOperation,
+    spec: &ResolvedSpec,
     entry: &ApiEntry,
     phase2_matches: &ArgMatches,
     phase1_matches: &ArgMatches,
 ) -> Result<(), crate::SpallCliError> {
-    let mut url = build_url(op, entry, phase1_matches, phase2_matches)?;
+    let mut url = build_url(op, spec, entry, phase1_matches, phase2_matches)?;
 
     let mut headers = HeaderMap::new();
 
@@ -97,33 +99,13 @@ pub async fn execute_operation(
         );
     }
 
-    // Build client
+    // Timing
+    let start = Instant::now();
+
     let http_config = crate::http::config_from_matches(phase1_matches, phase2_matches);
     let client = crate::http::build_http_client(&http_config).map_err(|e| {
         crate::SpallCliError::HttpClient(e.to_string())
     })?;
-
-    // Build request
-    let mut req_builder = match op.method {
-        HttpMethod::Get => client.get(&url),
-        HttpMethod::Post => client.post(&url),
-        HttpMethod::Put => client.put(&url),
-        HttpMethod::Delete => client.delete(&url),
-        HttpMethod::Patch => client.patch(&url),
-        HttpMethod::Head => client.head(&url),
-        HttpMethod::Options => client.request(reqwest::Method::OPTIONS, &url),
-        HttpMethod::Trace => client.request(reqwest::Method::TRACE, &url),
-    };
-
-    req_builder = req_builder.headers(headers);
-
-    if let Some(body) = body_data.body {
-        req_builder = req_builder.body(body);
-    }
-
-    if !query_pairs.is_empty() {
-        req_builder = req_builder.query(&query_pairs);
-    }
 
     // Dry run
     if combined.get_flag("spall-dry-run") {
@@ -131,19 +113,83 @@ pub async fn execute_operation(
         return Ok(());
     }
 
-    // Send request
-    let resp = req_builder.send().await.map_err(|e| {
-        crate::SpallCliError::Network(e.to_string())
-    })?;
+    // Send request with retry loop
+    let retry_count = combined.get_one::<u8>("spall-retry").unwrap_or(1);
+
+    let resp = if let Some(form) = body_data.multipart {
+        let mut req_builder = match op.method {
+            HttpMethod::Get => client.get(&url),
+            HttpMethod::Post => client.post(&url),
+            HttpMethod::Put => client.put(&url),
+            HttpMethod::Delete => client.delete(&url),
+            HttpMethod::Patch => client.patch(&url),
+            HttpMethod::Head => client.head(&url),
+            HttpMethod::Options => client.request(reqwest::Method::OPTIONS, &url),
+            HttpMethod::Trace => client.request(reqwest::Method::TRACE, &url),
+        };
+        req_builder = req_builder.headers(headers).multipart(form);
+        if !query_pairs.is_empty() {
+            req_builder = req_builder.query(&query_pairs);
+        }
+        req_builder.send().await.map_err(|e| {
+            crate::SpallCliError::Network(e.to_string())
+        })?
+    } else {
+        let mut resp = None;
+        for attempt in 0..=retry_count {
+            let mut req_builder = match op.method {
+                HttpMethod::Get => client.get(&url),
+                HttpMethod::Post => client.post(&url),
+                HttpMethod::Put => client.put(&url),
+                HttpMethod::Delete => client.delete(&url),
+                HttpMethod::Patch => client.patch(&url),
+                HttpMethod::Head => client.head(&url),
+                HttpMethod::Options => client.request(reqwest::Method::OPTIONS, &url),
+                HttpMethod::Trace => client.request(reqwest::Method::TRACE, &url),
+            };
+
+            req_builder = req_builder.headers(headers.clone());
+
+            if let Some(ref body) = body_data.body {
+                req_builder = req_builder.body(body.clone());
+            }
+
+            if !query_pairs.is_empty() {
+                req_builder = req_builder.query(&query_pairs);
+            }
+
+            match req_builder.send().await {
+                Ok(r) => {
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    let is_transient = e.is_connect() || e.is_timeout();
+                    if is_transient && attempt < retry_count {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    return Err(crate::SpallCliError::Network(e.to_string()));
+                }
+            }
+        }
+        resp.unwrap()
+    };
 
     let status = resp.status();
     let body_bytes = resp.bytes().await.map_err(|e| {
         crate::SpallCliError::Network(e.to_string())
     })?;
 
+    let duration = start.elapsed();
+
     // Verbose output
     if combined.get_flag("spall-verbose") {
-        eprintln!("HTTP {}", status);
+        eprintln!("HTTP {} {}", status, url);
+    }
+
+    if combined.get_flag("spall-time") && combined.get_flag("spall-verbose") {
+        eprintln!("Duration: {:?}", duration);
     }
 
     // Output formatting
@@ -191,7 +237,10 @@ impl MergedMatches<'_> {
         self.phase2.get_one::<T>(id).cloned().or_else(|| self.phase1.get_one::<T>(id).cloned())
     }
 
-    fn get_many<T: Clone + Send + Sync + 'static>(&self, id: &str) -> Option<clap::parser::ValuesRef<'_, T>> {
+    fn get_many<T: Clone + Send + Sync + 'static>(
+        &self,
+        id: &str,
+    ) -> Option<clap::parser::ValuesRef<'_, T>> {
         self.phase2.get_many::<T>(id).or_else(|| self.phase1.get_many::<T>(id))
     }
 }
@@ -199,18 +248,19 @@ impl MergedMatches<'_> {
 /// Build the full request URL.
 fn build_url(
     op: &ResolvedOperation,
+    spec: &ResolvedSpec,
     entry: &ApiEntry,
     phase1_matches: &ArgMatches,
     phase2_matches: &ArgMatches,
 ) -> Result<String, crate::SpallCliError> {
-    let base = entry.base_url.clone()
+    let base = entry
+        .base_url
+        .clone()
         .or_else(|| phase2_matches.get_one::<String>("spall-server").cloned())
         .or_else(|| phase1_matches.get_one::<String>("spall-server").cloned())
-        .unwrap_or_else(|| {
-            // Parse openapi servers from spec... for Wave 1, we just use a dummy or extract from spec.
-            // TODO: use ResolvedSpec.base_url directly; currently not passed to execute_operation.
-            "/".to_string()
-        });
+        .or_else(|| op.servers.first().map(|s| s.url.clone()))
+        .or_else(|| spec.servers.first().map(|s| s.url.clone()))
+        .unwrap_or_else(|| "/".to_string());
 
     let mut path = op.path_template.clone();
     for param in &op.parameters {
@@ -253,6 +303,7 @@ fn resolve_auth(entry: &ApiEntry, matches: &MergedMatches) -> Option<secrecy::Se
 struct BodyData {
     content_type: Option<String>,
     body: Option<Vec<u8>>,
+    multipart: Option<reqwest::multipart::Form>,
 }
 
 /// Resolve request body from --data, --form, or --field.
@@ -265,6 +316,7 @@ fn resolve_body(
         return Ok(BodyData {
             content_type: None,
             body: None,
+            multipart: None,
         });
     };
 
@@ -273,6 +325,7 @@ fn resolve_body(
         return Ok(BodyData {
             content_type: None,
             body: None,
+            multipart: None,
         });
     }
 
@@ -302,22 +355,64 @@ fn resolve_body(
             return Ok(BodyData {
                 content_type: Some(ct),
                 body: Some(data.into_bytes()),
+                multipart: None,
             });
         }
     }
 
-    // --form (multipart, Wave 1 stub)
-    if phase2_matches.get_many::<String>("form").is_some() {
-        eprintln!("Warning: --form multipart upload is not yet fully implemented in Wave 1");
+    // --form (multipart, Wave 1.5)
+    if let Some(values) = phase2_matches.get_many::<String>("form") {
+        let mut form = reqwest::multipart::Form::new();
+        for val in values {
+            if let Some((key, rest)) = val.split_once('=') {
+                if let Some(path) = rest.strip_prefix('@') {
+                    let content = std::fs::read(path).map_err(|e| {
+                        crate::SpallCliError::Usage(format!(
+                            "Failed to read file {}: {}",
+                            path, e
+                        ))
+                    })?;
+                    let part = reqwest::multipart::Part::bytes(content)
+                        .file_name(path.to_string());
+                    form = form.part(key.to_string(), part);
+                } else {
+                    form = form.text(key.to_string(), rest.to_string());
+                }
+            }
+        }
+        return Ok(BodyData {
+            content_type: Some("multipart/form-data".to_string()),
+            body: None,
+            multipart: Some(form),
+        });
     }
 
-    // --field (form-urlencoded, Wave 1 stub)
-    if phase2_matches.get_many::<String>("field").is_some() {
-        eprintln!("Warning: --field form-urlencoded is not yet fully implemented in Wave 1");
+    // --field (form-urlencoded, Wave 1.5)
+    if let Some(values) = phase2_matches.get_many::<String>("field") {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for val in values {
+            if let Some((key, value)) = val.split_once('=') {
+                pairs.push((key.to_string(), value.to_string()));
+            }
+        }
+        let encoded = urlencoding::encode(
+            &pairs
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join("&"),
+        )
+        .to_string();
+        return Ok(BodyData {
+            content_type: Some("application/x-www-form-urlencoded".to_string()),
+            body: Some(encoded.into_bytes()),
+            multipart: None,
+        });
     }
 
     Ok(BodyData {
         content_type: None,
         body: None,
+        multipart: None,
     })
 }

@@ -7,7 +7,12 @@ use crate::resolver::resolve_spec;
 /// Wave 1: supports file paths. URL loading is deferred to Wave 1.5.
 pub fn load_spec(source: &str) -> Result<ResolvedSpec, SpallCoreError> {
     let raw = load_raw(source)?;
-    let text = String::from_utf8_lossy(&raw);
+    load_spec_from_bytes(&raw, source)
+}
+
+/// Parse and resolve raw spec bytes into a `ResolvedSpec`.
+pub fn load_spec_from_bytes(raw: &[u8], source: &str) -> Result<ResolvedSpec, SpallCoreError> {
+    let text = String::from_utf8_lossy(raw);
 
     let openapi: openapiv3::OpenAPI = if looks_like_json(&text) {
         serde_json::from_str(&text).map_err(|e| SpallCoreError::SpecParse {

@@ -6,22 +6,25 @@ use serde::{Deserialize, Serialize};
 pub struct SpecIndex {
     pub title: String,
     pub base_url: String,
-    /// IR format version for automatic cache invalidation on upgrades.
-    pub version: u32,
-    pub operations: Vec<OperationMeta>,
+    /// Spec version string (e.g. "1.0.0").
+    pub version: String,
+    pub operations: Vec<SpecIndexOp>,
     /// When this index was cached.
     pub cached_at: String,
 }
 
 /// Minimal operation metadata for the index.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct OperationMeta {
+pub struct SpecIndexOp {
     pub operation_id: String,
     pub method: HttpMethod,
     pub path_template: String,
     pub summary: Option<String>,
     pub tags: Vec<String>,
     pub deprecated: bool,
+    pub parameters: Vec<ParamIndex>,
+    pub has_request_body: bool,
+    pub request_body_required: bool,
 }
 
 /// Full resolved operation.
@@ -39,6 +42,7 @@ pub struct ResolvedOperation {
     pub security: Vec<SecurityRequirement>,
     pub tags: Vec<String>,
     pub extensions: IndexMap<String, serde_json::Value>,
+    pub servers: Vec<ResolvedServer>,
 }
 
 /// A resolved parameter with all $refs flattened.
@@ -87,6 +91,21 @@ pub struct ResolvedHeader {
     pub schema: ResolvedSchema,
 }
 
+/// A resolved server entry.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ResolvedServer {
+    pub url: String,
+    pub description: Option<String>,
+}
+
+/// Lightweight parameter index for degraded --help.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ParamIndex {
+    pub name: String,
+    pub location: ParameterLocation,
+    pub required: bool,
+}
+
 /// Simplified schema representation for IR.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ResolvedSchema {
@@ -131,6 +150,44 @@ impl std::fmt::Display for HttpMethod {
     }
 }
 
+/// Resolved servers for an operation (operation > path > spec > default).
+impl ResolvedSpec {
+    pub fn to_index(&self) -> SpecIndex {
+        SpecIndex {
+            title: self.title.clone(),
+            base_url: self.base_url.clone(),
+            version: self.version.clone(),
+            operations: self.operations.iter().map(|op| op.to_index_op()).collect(),
+            cached_at: {
+                let d = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                format!("{}", d.as_secs())
+            },
+        }
+    }
+}
+
+impl ResolvedOperation {
+    pub fn to_index_op(&self) -> SpecIndexOp {
+        SpecIndexOp {
+            operation_id: self.operation_id.clone(),
+            method: self.method,
+            path_template: self.path_template.clone(),
+            summary: self.summary.clone(),
+            tags: self.tags.clone(),
+            deprecated: self.deprecated,
+            parameters: self.parameters.iter().map(|p| ParamIndex {
+                name: p.name.clone(),
+                location: p.location,
+                required: p.required,
+            }).collect(),
+            has_request_body: self.request_body.is_some(),
+            request_body_required: self.request_body.as_ref().map(|b| b.required).unwrap_or(false),
+        }
+    }
+}
+
 /// Security requirement copied from OpenAPI.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SecurityRequirement {
@@ -145,6 +202,7 @@ pub struct ResolvedSpec {
     pub version: String,
     pub base_url: String,
     pub operations: Vec<ResolvedOperation>,
+    pub servers: Vec<ResolvedServer>,
 }
 
 /// Parameter location.
