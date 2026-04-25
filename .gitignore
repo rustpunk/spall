@@ -1,2 +1,9 @@
+# Rust build artifacts
 /target
 *.tmp
+
+# Taskplane working files
+.worktrees/
+.pi/batch-state.json
+.pi/merge-results/
+.pi/supervisor/
