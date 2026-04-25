@@ -1,0 +1,18 @@
+# Per-API configuration for petstore
+
+source = "https://petstore.swagger.io/v2/swagger.json"
+
+# Override the base URL for this API
+base_url = "https://petstore.swagger.io/v2"
+
+# Default headers added to every request
+[headers]
+X-Request-With = "spall"
+
+[auth]
+# Read token from an environment variable (hyphens become underscores)
+token_env = "SPALL_PETSTORE_TOKEN"
+
+# Alternatively, reference a keyring entry
+# keyring_service = "spall-petstore"
+# keyring_user = "api-token"

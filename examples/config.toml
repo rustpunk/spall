@@ -1,0 +1,18 @@
+# Global spall configuration
+
+[[api]]
+name = "petstore"
+spec = "https://petstore.swagger.io/v2/swagger.json"
+
+[[api]]
+name = "github"
+spec = "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json"
+
+# Auto-scan directories for spec files
+spec_dirs = [
+    "~/.config/spall/specs",
+]
+
+[defaults]
+output = "json"    # json | yaml | table | raw
+color = "auto"     # auto | always | never
