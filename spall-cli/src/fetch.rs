@@ -137,7 +137,7 @@ fn write_raw_cache(
         expires_at: now_secs() + RAW_CACHE_TTL_SECS,
     };
     let meta_bytes = postcard::to_allocvec(&meta)
-        .map_err(|e| SpallCliError::Network(e.to_string()))?;
+        .map_err(|e| SpallCliError::Cache(e.to_string()))?;
     atomic_write(&raw_path(source, cache_dir), bytes)?;
     atomic_write(&raw_meta_path(source, cache_dir), &meta_bytes)?;
     Ok(())
@@ -149,7 +149,7 @@ fn write_raw_meta(
     meta: &RawMeta,
 ) -> Result<(), SpallCliError> {
     let meta_bytes = postcard::to_allocvec(meta)
-        .map_err(|e| SpallCliError::Network(e.to_string()))?;
+        .map_err(|e| SpallCliError::Cache(e.to_string()))?;
     atomic_write(&raw_meta_path(source, cache_dir), &meta_bytes)?;
     Ok(())
 }

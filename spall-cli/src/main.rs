@@ -44,6 +44,9 @@ If this API requires a VPN, ensure you're connected."))]
     #[error("Network error: {0}")]
     Network(String),
 
+    #[error("Cache error: {0}")]
+    Cache(String),
+
     #[error("HTTP client error: {0}")]
     HttpClient(String),
 }
@@ -55,6 +58,7 @@ impl SpallCliError {
             SpallCliError::Config(_) => EXIT_USAGE,
             SpallCliError::Usage(_) => EXIT_USAGE,
             SpallCliError::Network(_) => EXIT_NETWORK,
+            SpallCliError::Cache(_) => EXIT_USAGE,
             SpallCliError::HttpClient(_) => EXIT_NETWORK,
         }
     }

@@ -188,7 +188,7 @@ pub async fn execute_operation(
         eprintln!("HTTP {} {}", status, url);
     }
 
-    if combined.get_flag("spall-time") && combined.get_flag("spall-verbose") {
+    if combined.get_flag("spall-time") || combined.get_flag("spall-verbose") {
         eprintln!("Duration: {:?}", duration);
     }
 
