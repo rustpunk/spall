@@ -7,3 +7,7 @@
 .pi/batch-state.json
 .pi/merge-results/
 .pi/supervisor/
+
+.claude/
+.pi/
+docs/itnernal/

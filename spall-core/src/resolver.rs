@@ -4,6 +4,7 @@ use crate::ir::{
     ResolvedRequestBody, ResolvedResponse, ResolvedSchema, ResolvedServer, ResolvedSpec,
     SecurityRequirement,
 };
+use crate::value::SpallValue;
 use indexmap::IndexMap;
 use openapiv3::{
     Components, Header, OpenAPI, Parameter, ReferenceOr, RequestBody, Response, Schema,
@@ -138,7 +139,10 @@ pub fn resolve_spec(raw: &OpenAPI, _source: &str) -> Result<ResolvedSpec, SpallC
                 responses,
                 security,
                 tags: op.tags.clone(),
-                extensions: op.extensions.clone(),
+                extensions: op.extensions
+                    .iter()
+                    .map(|(k, v)| (k.clone(), SpallValue::from(v)))
+                    .collect(),
                 servers: operation_servers,
             });
         }
@@ -397,17 +401,17 @@ pub fn resolve_schema(
         openapiv3::SchemaKind::Type(openapiv3::Type::String(s)) => s
             .enumeration
             .iter()
-            .filter_map(|v| v.as_ref().map(|s| serde_json::Value::String(s.clone())))
+            .filter_map(|v| v.as_ref().map(|s| SpallValue::Str(s.clone())))
             .collect(),
         openapiv3::SchemaKind::Type(openapiv3::Type::Number(n)) => n
             .enumeration
             .iter()
-            .filter_map(|v| v.map(|f| serde_json::json!(f)))
+            .filter_map(|v| v.map(SpallValue::F64))
             .collect(),
         openapiv3::SchemaKind::Type(openapiv3::Type::Integer(i)) => i
             .enumeration
             .iter()
-            .filter_map(|v| v.map(|ii| serde_json::json!(ii)))
+            .filter_map(|v| v.map(SpallValue::I64))
             .collect(),
         _ => Vec::new(),
     };
@@ -416,7 +420,7 @@ pub fn resolve_schema(
         type_name,
         format,
         description: schema.schema_data.description.clone(),
-        default: schema.schema_data.default.clone(),
+        default: schema.schema_data.default.as_ref().map(SpallValue::from),
         enum_values,
         nullable: schema.schema_data.nullable,
         read_only: schema.schema_data.read_only,
@@ -460,7 +464,7 @@ fn resolve_media_type(
 
     Ok(ResolvedMediaType {
         schema,
-        example: mt.example.clone(),
+        example: mt.example.as_ref().map(SpallValue::from),
         examples: mt
             .examples
             .iter()
@@ -469,10 +473,13 @@ fn resolve_media_type(
                     k.clone(),
                     match v {
                         ReferenceOr::Reference { reference } => {
-                            serde_json::Value::String(reference.clone())
+                            SpallValue::Str(reference.clone())
                         }
                         ReferenceOr::Item(ex) => {
-                            ex.value.clone().unwrap_or(serde_json::Value::Null)
+                            ex.value
+                                .as_ref()
+                                .map(SpallValue::from)
+                                .unwrap_or(SpallValue::Null)
                         }
                     },
                 )

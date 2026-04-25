@@ -1,4 +1,5 @@
 use crate::ir::{ParameterLocation, ResolvedOperation, ResolvedSpec, SpecIndex};
+use crate::value::SpallValue;
 use clap::{Arg, ArgAction, ArgGroup, Command};
 use indexmap::IndexMap;
 
@@ -219,7 +220,10 @@ fn apply_schema_parsing(mut arg: Arg, schema: &crate::ir::ResolvedSchema) -> Arg
         let values: Vec<String> = schema
             .enum_values
             .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .filter_map(|v| match v {
+                SpallValue::Str(s) => Some(s.clone()),
+                _ => None,
+            })
             .collect();
         if !values.is_empty() {
             arg = arg.value_parser(clap::builder::PossibleValuesParser::new(values));
@@ -227,9 +231,9 @@ fn apply_schema_parsing(mut arg: Arg, schema: &crate::ir::ResolvedSchema) -> Arg
     }
 
     if let Some(default) = &schema.default {
-        let s = match default.as_str() {
-            Some(s) => s.to_string(),
-            None => default.to_string(),
+        let s = match default {
+            SpallValue::Str(s) => s.clone(),
+            other => format!("{}", other),
         };
         arg = arg.default_value(s);
     }

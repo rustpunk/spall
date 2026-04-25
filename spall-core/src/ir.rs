@@ -1,3 +1,4 @@
+use crate::value::SpallValue;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +42,7 @@ pub struct ResolvedOperation {
     pub responses: IndexMap<String, ResolvedResponse>,
     pub security: Vec<SecurityRequirement>,
     pub tags: Vec<String>,
-    pub extensions: IndexMap<String, serde_json::Value>,
+    pub extensions: IndexMap<String, SpallValue>,
     pub servers: Vec<ResolvedServer>,
 }
 
@@ -78,8 +79,8 @@ pub struct ResolvedResponse {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ResolvedMediaType {
     pub schema: Option<ResolvedSchema>,
-    pub example: Option<serde_json::Value>,
-    pub examples: IndexMap<String, serde_json::Value>,
+    pub example: Option<SpallValue>,
+    pub examples: IndexMap<String, SpallValue>,
 }
 
 /// Resolved header.
@@ -112,8 +113,8 @@ pub struct ResolvedSchema {
     pub type_name: Option<String>,
     pub format: Option<String>,
     pub description: Option<String>,
-    pub default: Option<serde_json::Value>,
-    pub enum_values: Vec<serde_json::Value>,
+    pub default: Option<SpallValue>,
+    pub enum_values: Vec<SpallValue>,
     pub nullable: bool,
     pub read_only: bool,
     pub write_only: bool,

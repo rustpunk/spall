@@ -8,3 +8,4 @@ pub mod error;
 pub mod ir;
 pub mod loader;
 pub mod resolver;
+pub mod value;
