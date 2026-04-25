@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_variables, unused_imports)]
+#![allow(unused_imports)]
 
 //! spall-cli: Binary entry point. Two-phase clap parse and dispatch.
 

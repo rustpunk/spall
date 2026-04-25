@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_variables, unused_imports)]
+#![allow(unused_imports)]
 
 //! Response formatting, TTY detection, and output modes.
 

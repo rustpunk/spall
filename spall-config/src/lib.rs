@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_variables, unused_imports)]
+#![allow(unused_imports)]
 
 //! spall-config: Configuration parsing, API registry, and credential stack.
 
