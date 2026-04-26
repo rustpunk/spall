@@ -435,9 +435,15 @@ pub fn resolve_schema(
     // Extract type name from SchemaKind
     let type_name = match &schema.schema_kind {
         openapiv3::SchemaKind::Type(t) => {
-            let s = format!("{:?}", t);
-            let type_str = s.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-            Some(type_str)
+            let name = match t {
+                openapiv3::Type::String(_) => "string",
+                openapiv3::Type::Number(_) => "number",
+                openapiv3::Type::Integer(_) => "integer",
+                openapiv3::Type::Object(_) => "object",
+                openapiv3::Type::Array(_) => "array",
+                openapiv3::Type::Boolean(_) => "boolean",
+            };
+            Some(name.to_string())
         }
         _ => None,
     };

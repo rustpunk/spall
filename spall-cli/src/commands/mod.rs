@@ -3,3 +3,4 @@
 //! CLI subcommands.
 
 pub mod api;
+pub mod history;

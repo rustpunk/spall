@@ -30,6 +30,7 @@ pub async fn execute_operation(
     entry: &ApiEntry,
     phase2_matches: &ArgMatches,
     phase1_matches: &ArgMatches,
+    cache_dir: &std::path::Path,
 ) -> Result<(), crate::SpallCliError> {
     let url = build_url(op, spec, entry, phase1_matches, phase2_matches)?;
 
@@ -119,12 +120,15 @@ pub async fn execute_operation(
         return Ok(());
     }
 
-    // Preview (Phase D stub)
+    // Preview (Phase D)
     if combined.get_flag("spall-preview") {
-        eprintln!("Preview: {} {}", op.method, url);
-        for (k, v) in &headers {
-            eprintln!("  {}: {}", k, v.to_str().unwrap_or("?"));
-        }
+        let body_slice = body_data.body.as_deref();
+        crate::preview::print_preview(
+            &op.method.to_string(),
+            &url,
+            &headers,
+            body_slice,
+        );
         return Ok(());
     }
 
@@ -144,19 +148,24 @@ pub async fn execute_operation(
 
         let paginator = crate::paginate::Paginator::default();
         let mut pages: Vec<serde_json::Value> = Vec::new();
-        let mut current_url = url;
+        let mut current_url = url.clone();
+        let mut first_status: Option<reqwest::StatusCode> = None;
 
-        for _ in 0..paginator.max_pages {
+        for page_num in 0..paginator.max_pages {
             let (status, resp_headers, body_bytes) = send_one(
                 &client,
                 op.method,
                 &current_url,
                 headers.clone(),
-                body_data.body.clone(),
+                if page_num == 0 { body_data.body.clone() } else { None },
                 None,
                 &query_pairs,
                 retry_count,
             ).await?;
+
+            if first_status.is_none() {
+                first_status = Some(status);
+            }
 
             if combined.get_flag("spall-verbose") {
                 eprintln!("HTTP {} {}", status, current_url);
@@ -188,26 +197,91 @@ pub async fn execute_operation(
         }
 
         let final_value = paginator.concat_results(pages);
-        crate::output::emit_json_value(&final_value, mode, save_path)
-            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+
+        // Record history for paginated request (use first page status / final URL)
+        let duration_ms = start.elapsed().as_millis() as u64;
+        record_history(
+            cache_dir,
+            &entry.name,
+            &op.operation_id,
+            &op.method.to_string(),
+            &current_url,
+            first_status,
+            &headers,
+            &HeaderMap::new(),
+            duration_ms,
+        );
+
+        // Apply filter if requested
+        if let Some(filter_expr) = combined.get_one::<String>("spall-filter") {
+            match crate::filter::filter_response(&filter_expr, &final_value) {
+                Ok(filtered) => {
+                    crate::output::emit_json_value(&filtered, mode, save_path)
+                        .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+                }
+                Err(e) => {
+                    eprintln!("Warning: filter failed ({}). Falling back to unfiltered.", e);
+                    crate::output::emit_json_value(&final_value, mode, save_path)
+                        .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+                }
+            }
+        } else {
+            crate::output::emit_json_value(&final_value, mode, save_path)
+                .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+        }
     } else {
-        let (status, _headers, body_bytes) = send_one(
+        let (status, resp_headers, body_bytes) = send_one(
             &client,
             op.method,
             &url,
-            headers,
+            headers.clone(),
             body_data.body,
             body_data.multipart,
             &query_pairs,
             retry_count,
         ).await?;
 
+        // Record history
+        let duration_ms = start.elapsed().as_millis() as u64;
+        record_history(
+            cache_dir,
+            &entry.name,
+            &op.operation_id,
+            &op.method.to_string(),
+            &url,
+            Some(status),
+            &headers,
+            &resp_headers,
+            duration_ms,
+        );
+
         if combined.get_flag("spall-verbose") {
             eprintln!("HTTP {} {}", status, url);
         }
 
-        crate::output::emit_response(&body_bytes, mode, save_path)
-            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+        // Apply filter if requested
+        if let Some(filter_expr) = combined.get_one::<String>("spall-filter") {
+            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                match crate::filter::filter_response(&filter_expr, &json_val) {
+                    Ok(filtered) => {
+                        crate::output::emit_json_value(&filtered, mode, save_path)
+                            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: filter failed ({}). Falling back to unfiltered.", e);
+                        crate::output::emit_response(&body_bytes, mode, save_path)
+                            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+                    }
+                }
+            } else {
+                eprintln!("Warning: --filter requires JSON response. Falling back to raw.");
+                crate::output::emit_response(&body_bytes, mode, save_path)
+                    .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+            }
+        } else {
+            crate::output::emit_response(&body_bytes, mode, save_path)
+                .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+        }
 
         if status.is_client_error() {
             std::process::exit(crate::EXIT_HTTP_4XX);
@@ -502,4 +576,66 @@ fn resolve_body(
         body: None,
         multipart: None,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Record a request to the history database, redacting sensitive headers.
+fn record_history(
+    cache_dir: &std::path::Path,
+    api: &str,
+    operation: &str,
+    method: &str,
+    url: &str,
+    status: Option<reqwest::StatusCode>,
+    req_headers: &HeaderMap,
+    resp_headers: &HeaderMap,
+    duration_ms: u64,
+) {
+    let history = match crate::history::History::open(cache_dir) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let request_headers: Vec<(String, String)> = req_headers
+        .iter()
+        .map(|(k, v)| {
+            let val = if crate::history::is_sensitive_header(k.as_str()) {
+                "[REDACTED]".to_string()
+            } else {
+                v.to_str().unwrap_or("?").to_string()
+            };
+            (k.to_string(), val)
+        })
+        .collect();
+
+    let response_headers: Vec<(String, String)> = resp_headers
+        .iter()
+        .map(|(k, v)| {
+            let val = if crate::history::is_sensitive_header(k.as_str()) {
+                "[REDACTED]".to_string()
+            } else {
+                v.to_str().unwrap_or("?").to_string()
+            };
+            (k.to_string(), val)
+        })
+        .collect();
+
+    let record = crate::history::RequestRecord {
+        timestamp,
+        api: api.to_string(),
+        operation: operation.to_string(),
+        method: method.to_string(),
+        url: url.to_string(),
+        status_code: status.map(|s| s.as_u16()).unwrap_or(0),
+        duration_ms,
+        request_headers,
+        response_headers,
+    };
+
+    let _ = history.record(&record);
 }

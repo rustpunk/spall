@@ -6,9 +6,12 @@ mod commands;
 mod completions;
 mod execute;
 mod fetch;
+mod filter;
+mod history;
 mod http;
 mod output;
 mod paginate;
+mod preview;
 mod validate;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -110,6 +113,15 @@ async fn run() -> miette::Result<()> {
 
     match phase1_matches.subcommand() {
         Some(("api", sub)) => commands::api::handle_api_management(sub, &cache_dir).await,
+        Some(("completions", sub)) => {
+            let shell = sub.get_one::<String>("shell")
+                .ok_or_else(|| SpallCliError::Usage("shell argument required".to_string()))?;
+            let script = completions::generate_completions(shell)?;
+            println!("{}", script);
+            Ok(())
+        }
+        Some(("history", sub)) => commands::history::handle_history(sub, &cache_dir),
+        Some(("__complete", sub)) => handle_complete(sub, &registry).await,
         Some((api_name, api_matches)) => {
             let remaining = execute::collect_remaining_args(api_matches);
             handle_api_operation(api_name, remaining, &registry, &phase1_matches, &cache_dir).await
@@ -120,6 +132,61 @@ async fn run() -> miette::Result<()> {
             Ok(())
         }
     }
+}
+
+async fn handle_complete(
+    matches: &ArgMatches,
+    registry: &ApiRegistry,
+) -> miette::Result<()> {
+    let api_name = matches.get_one::<String>("api")
+        .ok_or_else(|| SpallCliError::Usage("API name required".to_string()))?;
+    let word = matches.get_one::<String>("word").map(|s| s.as_str()).unwrap_or("");
+
+    let entry = match registry.resolve_profile(api_name, None) {
+        Some(e) => e,
+        None => {
+            return Ok(());
+        }
+    };
+
+    let cache_dir = dirs::cache_dir()
+        .map(|d| d.join("spall"))
+        .unwrap_or_else(|| spall_config::sources::config_dir().join("cache"));
+
+    let raw = match fetch::load_raw(&entry.source, &cache_dir).await {
+        Ok(b) => b,
+        Err(_) => {
+            if let Some(index) = spall_core::cache::load_cached_index(&entry.source, &cache_dir
+            ) {
+                for op in &index.operations {
+                    if op.operation_id.starts_with(word) {
+                        println!("{}", op.operation_id);
+                    }
+                }
+            }
+            return Ok(());
+        }
+    };
+
+    let spec = match spall_core::cache::load_or_resolve(&entry.source, &raw, &cache_dir
+    ) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+
+    for op in &spec.operations {
+        if op.operation_id.starts_with(word) {
+            println!("{}", op.operation_id);
+        }
+        for param in &op.parameters {
+            let id = format!("{}-{}", param.location.as_str(), param.name);
+            if id.starts_with(word) {
+                println!("{}", id);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Detect `spall <api> --help` / `spall <api> -h` before Phase 1 parsing.
@@ -270,7 +337,7 @@ async fn handle_api_operation(
     // Phase 2 structure may be flat (single tag) or nested (multiple tags).
     // Try direct operation match first.
     if let Some(op) = spec.operations.iter().find(|o| o.operation_id == tag_or_op) {
-        return execute::execute_operation(op, &spec, &entry, op_matches, phase1_matches)
+        return execute::execute_operation(op, &spec, &entry, op_matches, phase1_matches, cache_dir)
             .await
             .map_err(Into::into);
     }
@@ -289,7 +356,7 @@ async fn handle_api_operation(
                 SpallCliError::Usage(format!("Unknown operation: {}", op_name))
             })?;
 
-        return execute::execute_operation(op, &spec, &entry, inner_matches, phase1_matches)
+        return execute::execute_operation(op, &spec, &entry, inner_matches, phase1_matches, cache_dir)
             .await
             .map_err(Into::into);
     }
@@ -310,6 +377,19 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
         .about("Break free. Hit the endpoint.")
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand(api_management_cmd())
+        .subcommand(history_cmd())
+        .subcommand(
+            Command::new("completions")
+                .about("Generate shell completion scripts")
+                .arg(Arg::new("shell").required(true).help("Shell: bash, zsh, or fish")),
+        )
+        .subcommand(
+            Command::new("__complete")
+                .hide(true)
+                .about("Internal completion helper")
+                .arg(Arg::new("api").required(true).help("API name"))
+                .arg(Arg::new("word").help("Partial word to complete")),
+        )
         .args(spall_global_args());
 
     for entry in &registry.apis {
@@ -324,6 +404,19 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
     }
 
     root
+}
+
+/// Build the `spall history` subcommand tree.
+fn history_cmd() -> Command {
+    Command::new("history")
+        .about("Request/response history")
+        .subcommand(Command::new("list").about("List recent requests"))
+        .subcommand(
+            Command::new("show")
+                .about("Show request details")
+                .arg(Arg::new("id").required(true).help("Request ID")),
+        )
+        .subcommand(Command::new("clear").about("Clear history"))
 }
 
 /// Build the `spall api` management subcommand.
@@ -462,5 +555,9 @@ fn spall_global_args() -> Vec<Arg> {
             .long("profile")
             .global(true)
             .help("Active config profile (e.g., staging, production)"),
+        Arg::new("spall-filter")
+            .long("filter")
+            .global(true)
+            .help("JMESPath filter expression for JSON responses"),
     ]
 }

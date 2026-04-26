@@ -25,44 +25,46 @@ pub fn preflight_validate(
         }
     }
 
-    // Validate JSON body if present
-    if let Some(values) = phase2_matches.get_many::<String>("data") {
-        let parts: Vec<String> = values.cloned().collect();
-        if let Some(last) = parts.last() {
-            let data = if last == "-" {
-                // Cannot validate stdin preflight without reading it; skip.
-                String::new()
-            } else if let Some(path) = last.strip_prefix('@') {
-                match std::fs::read_to_string(path) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        errors.push(ValidationError {
-                            pointer: "/body".to_string(),
-                            message: format!("cannot read body file '{}': {}", path, e),
-                        });
-                        String::new()
+    // Validate JSON body if present and operation has a request body
+    if op.request_body.is_some() {
+        if let Some(values) = phase2_matches.get_many::<String>("data") {
+            let parts: Vec<String> = values.cloned().collect();
+            if let Some(last) = parts.last() {
+                let data = if last == "-" {
+                    // Cannot validate stdin preflight without reading it; skip.
+                    String::new()
+                } else if let Some(path) = last.strip_prefix('@') {
+                    match std::fs::read_to_string(path) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            errors.push(ValidationError {
+                                pointer: "/body".to_string(),
+                                message: format!("cannot read body file '{}': {}", path, e),
+                            });
+                            String::new()
+                        }
                     }
-                }
-            } else {
-                last.clone()
-            };
+                } else {
+                    last.clone()
+                };
 
-            if !data.is_empty() {
-                if let Some(ref body_def) = op.request_body {
-                    if let Some(mt) = body_def.content.get("application/json") {
-                        if let Some(ref schema) = mt.schema {
-                            match serde_json::from_str::<serde_json::Value>(&data) {
-                                Ok(val) => {
-                                    let body_errors = validate_body(&val, schema);
-                                    for e in body_errors {
-                                        errors.push(e);
+                if !data.is_empty() {
+                    if let Some(ref body_def) = op.request_body {
+                        if let Some(mt) = body_def.content.get("application/json") {
+                            if let Some(ref schema) = mt.schema {
+                                match serde_json::from_str::<serde_json::Value>(&data) {
+                                    Ok(val) => {
+                                        let body_errors = validate_body(&val, schema);
+                                        for e in body_errors {
+                                            errors.push(e);
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    errors.push(ValidationError {
-                                        pointer: "/body".to_string(),
-                                        message: format!("invalid JSON body: {}", e),
-                                    });
+                                    Err(e) => {
+                                        errors.push(ValidationError {
+                                            pointer: "/body".to_string(),
+                                            message: format!("invalid JSON body: {}", e),
+                                        });
+                                    }
                                 }
                             }
                         }
