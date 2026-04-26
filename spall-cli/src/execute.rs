@@ -198,6 +198,16 @@ pub async fn execute_operation(
 
         let final_value = paginator.concat_results(pages);
 
+        // Response validation (warn-only, non-fatal)
+        if let Some(first) = first_status {
+            let ct = "application/json"; // pagination implies JSON
+            let warnings = crate::validate::response_validate(op, first.as_u16(), ct, &final_value);
+            if !warnings.is_empty() {
+                eprintln!("Warning: response body did not match schema:");
+                eprintln!("{}", crate::validate::format_errors(&warnings));
+            }
+        }
+
         // Record history for paginated request (use first page status / final URL)
         let duration_ms = start.elapsed().as_millis() as u64;
         record_history(
@@ -257,6 +267,21 @@ pub async fn execute_operation(
 
         if combined.get_flag("spall-verbose") {
             eprintln!("HTTP {} {}", status, url);
+        }
+
+        // Response validation (warn-only)
+        if status.is_success() {
+            let ct = resp_headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json");
+            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                let warnings = crate::validate::response_validate(op, status.as_u16(), ct, &json_val);
+                if !warnings.is_empty() {
+                    eprintln!("Warning: response body did not match schema:");
+                    eprintln!("{}", crate::validate::format_errors(&warnings));
+                }
+            }
         }
 
         // Apply filter if requested

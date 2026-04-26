@@ -81,6 +81,47 @@ pub fn preflight_validate(
     }
 }
 
+/// Validate a response body against the 2xx response schema (if present).
+///
+/// Returns errors as warnings — callers should print them to stderr and
+/// continue execution.
+pub fn response_validate(
+    op: &ResolvedOperation,
+    status: u16,
+    content_type: &str,
+    body: &serde_json::Value,
+) -> Vec<ValidationError> {
+    if !status.to_string().starts_with('2') {
+        return Vec::new();
+    }
+
+    let status_key = status.to_string();
+
+    let Some(response) = op.responses.get(&status_key) else {
+        return Vec::new();
+    };
+
+    // Normalise content type: strip charset, whitespace.
+    let ct_clean = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+
+    let Some(mt) = response.content.get(ct_clean)
+        .or_else(|| response.content.get("application/json"))
+        .or_else(|| response.content.values().next())
+    else {
+        return Vec::new();
+    };
+
+    if let Some(ref schema) = mt.schema {
+        validate_body(body, schema)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Format validation errors for stderr.
 pub fn format_errors(errors: &[ValidationError]) -> String {
     let mut lines = Vec::new();
