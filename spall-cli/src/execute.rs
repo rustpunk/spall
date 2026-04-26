@@ -1,7 +1,6 @@
 use clap::ArgMatches;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE};
 use secrecy::ExposeSecret;
-use spall_config::credentials::CredentialResolver;
 use spall_config::registry::ApiEntry;
 use spall_core::ir::{HttpMethod, ParameterLocation, ResolvedOperation, ResolvedRequestBody, ResolvedSpec};
 
@@ -57,15 +56,6 @@ pub async fn execute_operation(
         }
     }
 
-    // Authentication
-    let auth = resolve_auth(entry, &combined);
-    if let Some(token) = auth {
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            HeaderValue::from_str(token.expose_secret()).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-        );
-    }
-
     // Cookie params
     let mut cookies: Vec<String> = Vec::new();
     for param in &op.parameters {
@@ -81,14 +71,25 @@ pub async fn execute_operation(
     }
 
     // Query params
-    let mut query_pairs: Vec<(&str, &str)> = Vec::new();
+    let mut query_pairs: Vec<(String, String)> = Vec::new();
     for param in &op.parameters {
         if param.location == ParameterLocation::Query {
             let id = format!("query-{}", param.name);
             if let Some(v) = phase2_matches.get_one::<String>(&id) {
-                query_pairs.push((&param.name, v.as_str()));
+                query_pairs.push((param.name.clone(), v.clone()));
             }
         }
+    }
+
+    // Authentication (Wave 3 provider dispatch)
+    let cli_auth = combined.get_one::<String>("spall-auth");
+    let auth = crate::auth::resolve(
+        &entry.name,
+        entry.auth.as_ref(),
+        cli_auth.as_deref(),
+    );
+    if let Some(a) = auth {
+        crate::auth::apply(&a, &mut headers, &mut query_pairs);
     }
 
     // Request body
@@ -332,7 +333,7 @@ async fn send_one(
     headers: HeaderMap,
     body: Option<Vec<u8>>,
     mut multipart: Option<reqwest::multipart::Form>,
-    query_pairs: &[(&str, &str)],
+    query_pairs: &[(String, String)],
     retry_count: u8,
 ) -> Result<(reqwest::StatusCode, HeaderMap, Vec<u8>), crate::SpallCliError> {
     let max_attempts = if multipart.is_some() { 1 } else { retry_count + 1 };
@@ -466,24 +467,6 @@ fn build_url(
         format!("/{}", path)
     };
     Ok(format!("{}{}", base_trimmed, path_trimmed))
-}
-
-/// Resolve auth from --spall-auth, env vars, or config.
-fn resolve_auth(entry: &ApiEntry, matches: &MergedMatches) -> Option<secrecy::SecretString> {
-    if let Some(auth) = matches.get_one::<String>("spall-auth") {
-        return Some(secrecy::SecretString::new(auth.clone().into()));
-    }
-
-    let resolver = CredentialResolver {
-        api_name: entry.name.clone(),
-    };
-    if let Ok(token) = std::env::var(resolver.env_var_name()) {
-        if !token.is_empty() {
-            return Some(secrecy::SecretString::new(token.into()));
-        }
-    }
-
-    None
 }
 
 struct BodyData {

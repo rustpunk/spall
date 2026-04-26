@@ -1,5 +1,6 @@
+use crate::auth::AuthConfig;
 use crate::error::SpallConfigError;
-use crate::registry::{ApiEntry, AuthConfig};
+use crate::registry::ApiEntry;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -37,7 +38,7 @@ struct ApiToml {
     #[serde(default)]
     headers: HashMap<String, String>,
     #[serde(default)]
-    auth: Option<AuthToml>,
+    auth: Option<AuthConfig>,
     #[serde(default)]
     profile: HashMap<String, ProfileToml>,
 }
@@ -47,17 +48,8 @@ struct ProfileToml {
     base_url: Option<String>,
     #[serde(default)]
     headers: HashMap<String, String>,
-    auth: Option<AuthToml>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct AuthToml {
     #[serde(default)]
-    token_env: Option<String>,
-    #[serde(default)]
-    keyring_service: Option<String>,
-    #[serde(default)]
-    keyring_user: Option<String>,
+    auth: Option<AuthConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,21 +135,28 @@ pub fn scan_api_configs() -> Result<Vec<ApiEntry>, SpallConfigError> {
 
                 let headers: Vec<(String, String)> = cfg.headers.into_iter().collect();
 
-                let auth = cfg.auth.map(|a| AuthConfig {
-                    token_env: a.token_env,
-                    keyring_service: a.keyring_service,
-                    keyring_user: a.keyring_user,
-                });
+                // Convert legacy keyring fields to token_url when possible.
+                let mut auth = cfg.auth;
+                if let Some(ref mut a) = auth {
+                    if a.token_url.is_none() {
+                        if let (Some(svc), Some(usr)) = (a.keyring_service.clone(), a.keyring_user.clone()) {
+                            a.token_url = Some(format!("keyring://{}/{}", svc, usr));
+                        }
+                    }
+                }
 
                 let profiles: std::collections::HashMap<String, crate::registry::ProfileConfig> = cfg
                     .profile
                     .into_iter()
                     .map(|(name, p)| {
-                        let profile_auth = p.auth.map(|a| AuthConfig {
-                            token_env: a.token_env,
-                            keyring_service: a.keyring_service,
-                            keyring_user: a.keyring_user,
-                        });
+                        let mut profile_auth = p.auth;
+                        if let Some(ref mut a) = profile_auth {
+                            if a.token_url.is_none() {
+                                if let (Some(svc), Some(usr)) = (a.keyring_service.clone(), a.keyring_user.clone()) {
+                                    a.token_url = Some(format!("keyring://{}/{}", svc, usr));
+                                }
+                            }
+                        }
                         (
                             name,
                             crate::registry::ProfileConfig {

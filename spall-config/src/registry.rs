@@ -1,3 +1,4 @@
+use crate::auth::AuthConfig;
 use crate::error::SpallConfigError;
 use crate::sources::{load_global_config, scan_api_configs, scan_spec_dirs};
 use std::path::PathBuf;
@@ -27,17 +28,6 @@ pub struct ApiEntry {
     pub auth: Option<AuthConfig>,
     /// Per-API profiles overlay.
     pub profiles: std::collections::HashMap<String, ProfileConfig>,
-}
-
-/// Auth configuration reference.
-#[derive(Debug, Clone)]
-pub struct AuthConfig {
-    /// Name of the environment variable holding the token.
-    pub token_env: Option<String>,
-    /// Keyring service name.
-    pub keyring_service: Option<String>,
-    /// Keyring user/account name.
-    pub keyring_user: Option<String>,
 }
 
 /// Profile configuration overlay (Wave 2).

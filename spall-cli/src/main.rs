@@ -13,6 +13,7 @@ mod output;
 mod paginate;
 mod preview;
 mod validate;
+mod auth;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use miette::Diagnostic;
@@ -113,6 +114,7 @@ async fn run() -> miette::Result<()> {
 
     match phase1_matches.subcommand() {
         Some(("api", sub)) => commands::api::handle_api_management(sub, &cache_dir).await,
+        Some(("auth", sub)) => commands::auth::handle_auth(sub).await,
         Some(("completions", sub)) => {
             let shell = sub.get_one::<String>("shell")
                 .ok_or_else(|| SpallCliError::Usage("shell argument required".to_string()))?;
@@ -377,6 +379,7 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
         .about("Break free. Hit the endpoint.")
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand(api_management_cmd())
+        .subcommand(auth_cmd())
         .subcommand(history_cmd())
         .subcommand(
             Command::new("completions")
@@ -404,6 +407,22 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
     }
 
     root
+}
+
+/// Build the `spall auth` subcommand tree.
+fn auth_cmd() -> Command {
+    Command::new("auth")
+        .about("Authentication commands")
+        .subcommand(
+            Command::new("status")
+                .about("Show auth status for an API")
+                .arg(Arg::new("api").required(true).help("API name")),
+        )
+        .subcommand(
+            Command::new("login")
+                .about("Authenticate with an API (stub for PKCE)")
+                .arg(Arg::new("api").required(true).help("API name")),
+        )
 }
 
 /// Build the `spall history` subcommand tree.

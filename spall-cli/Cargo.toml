@@ -31,10 +31,15 @@ csv = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 jmespath = "0.5"
 chrono = "0.4"
+base64 = "0.22"
+rpassword = "7"
 
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+
+[features]
+hasp = []
 
 [lints.rust]
 unused = "allow"
