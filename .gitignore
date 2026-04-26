@@ -20,4 +20,4 @@ docs/internal/
 reserve/target/
 reserve/Cargo.lock
 
-lancedb/
+lancedb/docs/book/
