@@ -19,3 +19,5 @@ Cargo.lock.bak
 docs/internal/
 reserve/target/
 reserve/Cargo.lock
+
+lancedb/

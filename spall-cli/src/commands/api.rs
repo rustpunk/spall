@@ -5,7 +5,7 @@
 use clap::ArgMatches;
 use miette::Result;
 
-/// Handle `spall api add|list|remove|refresh`.
+/// Handle `spall api add|list|remove|refresh|discover`.
 pub async fn handle_api_management(
     matches: &ArgMatches,
     cache_dir: &std::path::Path,
@@ -15,6 +15,7 @@ pub async fn handle_api_management(
         Some(("list", sub)) => handle_list(sub),
         Some(("remove", sub)) => handle_remove(sub),
         Some(("refresh", sub)) => handle_refresh(sub, cache_dir).await,
+        Some(("discover", sub)) => handle_discover(sub).await,
         _ => {
             // Should not happen if clap parsing is correct.
             Ok(())
@@ -95,5 +96,37 @@ async fn handle_refresh(
         .into());
     }
 
+    Ok(())
+}
+
+async fn handle_discover(matches: &ArgMatches) -> Result<()> {
+    let url = matches
+        .get_one::<String>("url")
+        .ok_or_else(|| crate::SpallCliError::Usage("URL required".to_string()))?;
+
+    eprintln!("Probing {} for OpenAPI spec...", url);
+
+    let discovered = crate::discover::probe(url).await?;
+
+    // Check for name collision.
+    let registry = spall_config::registry::ApiRegistry::load()
+        .map_err(crate::SpallCliError::Config)?;
+    if registry.find(&discovered.name).is_some() {
+        return Err(crate::SpallCliError::Usage(format!(
+            "API name '{}' already exists. Remove it first or register manually with `spall api add`.",
+            discovered.name
+        )).into());
+    }
+
+    spall_config::registry::ApiRegistry::add_api(
+        &discovered.name,
+        &discovered.spec_url,
+    )
+    .map_err(crate::SpallCliError::Config)?;
+
+    eprintln!(
+        "Discovered and registered '{}' ({}) from {}",
+        discovered.name, discovered.title, discovered.spec_url
+    );
     Ok(())
 }

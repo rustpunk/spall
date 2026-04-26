@@ -4,6 +4,7 @@
 
 mod commands;
 mod completions;
+mod discover;
 mod execute;
 mod fetch;
 mod filter;
@@ -12,6 +13,7 @@ mod http;
 mod output;
 mod paginate;
 mod preview;
+mod repeat;
 mod validate;
 mod auth;
 
@@ -112,8 +114,30 @@ async fn run() -> miette::Result<()> {
         Err(e) => return Err(SpallCliError::Usage(e.to_string()).into()),
     };
 
+    // --spall-repeat: replay a request from history.
+    if phase1_matches.get_flag("spall-repeat") {
+        let entry_id = match phase1_matches.subcommand() {
+            Some(("history", sub)) => {
+                // "spall history show 42 --spall-repeat"
+                if let Some(("show", show_sub)) = sub.subcommand() {
+                    show_sub.get_one::<String>("id").and_then(|s| s.parse().ok())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        return crate::repeat::replay(&cache_dir,
+            entry_id,
+        ).await.map_err(Into::into);
+    }
+
     match phase1_matches.subcommand() {
-        Some(("api", sub)) => commands::api::handle_api_management(sub, &cache_dir).await,
+        Some(("api", sub)) => {
+            // --spall-repeat on `api discover` is a no-op, but let’s handle it
+            // consistently.  If the subcommand is "discover" we ignore the flag.
+            commands::api::handle_api_management(sub, &cache_dir).await
+        }
         Some(("auth", sub)) => commands::auth::handle_auth(sub).await,
         Some(("completions", sub)) => {
             let shell = sub.get_one::<String>("shell")
@@ -465,11 +489,21 @@ fn api_management_cmd() -> Command {
                 )
                 .arg(Arg::new("name").help("API name")),
         )
+        .subcommand(
+            Command::new("discover")
+                .about("Discover and register an API from a URL (RFC 8631)")
+                .arg(Arg::new("url").required(true).help("Base URL to probe")),
+        )
 }
 
 /// Register all `--spall-*` global flags.
 fn spall_global_args() -> Vec<Arg> {
     vec![
+        Arg::new("spall-repeat")
+            .long("spall-repeat")
+            .action(ArgAction::SetTrue)
+            .global(true)
+            .help("Replay the most recent request from history"),
         Arg::new("spall-output")
             .long("spall-output")
             .short('O')
