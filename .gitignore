@@ -17,3 +17,5 @@ Cargo.lock.bak
 
 # Internal docs (not tracked)
 docs/internal/
+reserve/target/
+reserve/Cargo.lock
