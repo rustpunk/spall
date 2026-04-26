@@ -8,6 +8,7 @@ mod execute;
 mod fetch;
 mod http;
 mod output;
+mod validate;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use miette::Diagnostic;
@@ -21,6 +22,7 @@ pub const EXIT_NETWORK: i32 = 2;
 pub const EXIT_SPEC: i32 = 3;
 pub const EXIT_HTTP_4XX: i32 = 4;
 pub const EXIT_HTTP_5XX: i32 = 5;
+pub const EXIT_VALIDATION: i32 = 10;
 
 /// CLI-specific errors with miette diagnostics.
 #[derive(Error, Diagnostic, Debug)]

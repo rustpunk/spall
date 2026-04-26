@@ -99,6 +99,13 @@ pub async fn execute_operation(
         );
     }
 
+    // Preflight validation (Wave 2)
+    if let Err(errors) = crate::validate::preflight_validate(op, phase2_matches) {
+        eprintln!("Validation failed:");
+        eprintln!("{}", crate::validate::format_errors(&errors));
+        std::process::exit(crate::EXIT_VALIDATION);
+    }
+
     // Timing
     let start = Instant::now();
 

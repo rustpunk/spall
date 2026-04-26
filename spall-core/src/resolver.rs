@@ -257,6 +257,20 @@ fn resolve_one_parameter(
             read_only: false,
             write_only: false,
             is_recursive: false,
+            pattern: None,
+            min_length: None,
+            max_length: None,
+            minimum: None,
+            maximum: None,
+            multiple_of: None,
+            exclusive_minimum: false,
+            exclusive_maximum: false,
+            min_items: None,
+            max_items: None,
+            unique_items: false,
+            additional_properties: true,
+            properties: IndexMap::new(),
+            items: None,
         },
     };
 
@@ -342,6 +356,20 @@ pub fn resolve_schema(
             read_only: false,
             write_only: false,
             is_recursive: true,
+            pattern: None,
+            min_length: None,
+            max_length: None,
+            minimum: None,
+            maximum: None,
+            multiple_of: None,
+            exclusive_minimum: false,
+            exclusive_maximum: false,
+            min_items: None,
+            max_items: None,
+            unique_items: false,
+            additional_properties: true,
+            properties: IndexMap::new(),
+            items: None,
         });
     }
 
@@ -363,6 +391,20 @@ pub fn resolve_schema(
                     read_only: false,
                     write_only: false,
                     is_recursive: true,
+                    pattern: None,
+                    min_length: None,
+                    max_length: None,
+                    minimum: None,
+                    maximum: None,
+                    multiple_of: None,
+                    exclusive_minimum: false,
+                    exclusive_maximum: false,
+                    min_items: None,
+                    max_items: None,
+                    unique_items: false,
+                    additional_properties: true,
+                    properties: IndexMap::new(),
+                    items: None,
                 });
             }
             resolve_schema_ref(reference, spec)?.ok_or_else(|| SpallCoreError::UnresolvedRef {
@@ -377,7 +419,6 @@ pub fn resolve_schema(
     let type_name = match &schema.schema_kind {
         openapiv3::SchemaKind::Type(t) => {
             let s = format!("{:?}", t);
-            // strip the enum wrapper: "String { ... }" → "string"
             let type_str = s.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
             Some(type_str)
         }
@@ -416,6 +457,108 @@ pub fn resolve_schema(
         _ => Vec::new(),
     };
 
+    // Extract validation fields
+    let mut pattern = None;
+    let mut min_length = None;
+    let mut max_length = None;
+    let mut minimum = None;
+    let mut maximum = None;
+    let mut multiple_of = None;
+    let mut exclusive_minimum = false;
+    let mut exclusive_maximum = false;
+    let mut min_items = None;
+    let mut max_items = None;
+    let mut unique_items = false;
+    let mut additional_properties = true;
+    let mut properties: IndexMap<String, ResolvedSchema> = IndexMap::new();
+    let mut items: Option<Box<ResolvedSchema>> = None;
+
+    match &schema.schema_kind {
+        openapiv3::SchemaKind::Type(openapiv3::Type::String(s)) => {
+            pattern = s.pattern.clone();
+            min_length = s.min_length;
+            max_length = s.max_length;
+        }
+        openapiv3::SchemaKind::Type(openapiv3::Type::Number(n)) => {
+            minimum = n.minimum;
+            maximum = n.maximum;
+            multiple_of = n.multiple_of;
+            exclusive_minimum = n.exclusive_minimum;
+            exclusive_maximum = n.exclusive_maximum;
+        }
+        openapiv3::SchemaKind::Type(openapiv3::Type::Integer(i)) => {
+            minimum = i.minimum.map(|v| v as f64);
+            maximum = i.maximum.map(|v| v as f64);
+            multiple_of = i.multiple_of.map(|v| v as f64);
+            exclusive_minimum = i.exclusive_minimum;
+            exclusive_maximum = i.exclusive_maximum;
+        }
+        openapiv3::SchemaKind::Type(openapiv3::Type::Array(a)) => {
+            min_items = a.min_items;
+            max_items = a.max_items;
+            unique_items = a.unique_items;
+            if let Some(ref item_ref) = a.items {
+                items = Some(Box::new(resolve_schema(
+                    &deref_boxed_ref(item_ref),
+                    spec,
+                    visited,
+                    depth + 1,
+                )?));
+            }
+        }
+        openapiv3::SchemaKind::Type(openapiv3::Type::Object(o)) => {
+            additional_properties = match &o.additional_properties {
+                Some(openapiv3::AdditionalProperties::Any(b)) => *b,
+                Some(openapiv3::AdditionalProperties::Schema(_)) => true,
+                None => true,
+            };
+            for (prop_name, prop_ref) in &o.properties {
+                let resolved = resolve_schema(&deref_boxed_ref(prop_ref),
+                    spec,
+                    visited,
+                    depth + 1,
+                )?;
+                properties.insert(prop_name.clone(), resolved);
+            }
+        }
+        openapiv3::SchemaKind::Any(any) => {
+            pattern = any.pattern.clone();
+            min_length = any.min_length;
+            max_length = any.max_length;
+            minimum = any.minimum;
+            maximum = any.maximum;
+            multiple_of = any.multiple_of;
+            exclusive_minimum = any.exclusive_minimum.unwrap_or(false);
+            exclusive_maximum = any.exclusive_maximum.unwrap_or(false);
+            min_items = any.min_items;
+            max_items = any.max_items;
+            unique_items = any.unique_items.unwrap_or(false);
+            additional_properties = match &any.additional_properties {
+                Some(openapiv3::AdditionalProperties::Any(b)) => *b,
+                Some(openapiv3::AdditionalProperties::Schema(_)) => true,
+                None => true,
+            };
+            for (prop_name, prop_ref) in &any.properties {
+                let resolved = resolve_schema(
+                    &deref_boxed_ref(prop_ref),
+                    spec,
+                    visited,
+                    depth + 1,
+                )?;
+                properties.insert(prop_name.clone(), resolved);
+            }
+            if let Some(ref item_ref) = &any.items {
+                items = Some(Box::new(resolve_schema(
+                    &deref_boxed_ref(item_ref),
+                    spec,
+                    visited,
+                    depth + 1,
+                )?));
+            }
+        }
+        _ => {}
+    }
+
     Ok(ResolvedSchema {
         type_name,
         format,
@@ -426,7 +569,31 @@ pub fn resolve_schema(
         read_only: schema.schema_data.read_only,
         write_only: schema.schema_data.write_only,
         is_recursive: false,
+        pattern,
+        min_length,
+        max_length,
+        minimum,
+        maximum,
+        multiple_of,
+        exclusive_minimum,
+        exclusive_maximum,
+        min_items,
+        max_items,
+        unique_items,
+        additional_properties,
+        properties,
+        items,
     })
+}
+
+/// Dereference a `Box<ReferenceOr<Schema>>` to a `ReferenceOr<Schema>`.
+fn deref_boxed_ref(r: &ReferenceOr<Box<Schema>>) -> ReferenceOr<Schema> {
+    match r {
+        ReferenceOr::Reference { reference } => ReferenceOr::Reference {
+            reference: reference.clone(),
+        },
+        ReferenceOr::Item(item) => ReferenceOr::Item(*item.clone()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +689,20 @@ fn resolve_response(
                 read_only: false,
                 write_only: false,
                 is_recursive: false,
+                pattern: None,
+                min_length: None,
+                max_length: None,
+                minimum: None,
+                maximum: None,
+                multiple_of: None,
+                exclusive_minimum: false,
+                exclusive_maximum: false,
+                min_items: None,
+                max_items: None,
+                unique_items: false,
+                additional_properties: true,
+                properties: IndexMap::new(),
+                items: None,
             },
         };
         headers.insert(

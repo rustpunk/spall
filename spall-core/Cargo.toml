@@ -17,6 +17,7 @@ sha2 = "0.10"
 indexmap = { version = "2", features = ["serde"] }
 thiserror = "2"
 url = "2"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"

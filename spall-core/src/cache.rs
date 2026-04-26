@@ -105,7 +105,7 @@ pub fn spec_hash(raw: &[u8]) -> [u8; 32] {
 }
 
 /// Current IR format version — bump when `ResolvedSpec` layout changes.
-pub const IR_VERSION: u32 = 1;
+pub const IR_VERSION: u32 = 2;
 
 /// SHA-256 of the source string itself, used for cache keying.
 pub fn source_hash(source: &str) -> [u8; 32] {

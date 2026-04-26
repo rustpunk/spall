@@ -120,6 +120,22 @@ pub struct ResolvedSchema {
     pub write_only: bool,
     /// Marker for schemas that exceeded $ref depth / cycle limits.
     pub is_recursive: bool,
+
+    // Validation fields (Wave 2)
+    pub pattern: Option<String>,
+    pub min_length: Option<usize>,
+    pub max_length: Option<usize>,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    pub multiple_of: Option<f64>,
+    pub exclusive_minimum: bool,
+    pub exclusive_maximum: bool,
+    pub min_items: Option<usize>,
+    pub max_items: Option<usize>,
+    pub unique_items: bool,
+    pub additional_properties: bool,
+    pub properties: IndexMap<String, ResolvedSchema>,
+    pub items: Option<Box<ResolvedSchema>>,
 }
 
 /// HTTP method enum.
