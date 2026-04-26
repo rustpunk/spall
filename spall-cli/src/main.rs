@@ -8,6 +8,7 @@ mod execute;
 mod fetch;
 mod http;
 mod output;
+mod paginate;
 mod validate;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -447,6 +448,16 @@ fn spall_global_args() -> Vec<Arg> {
             .short('c')
             .global(true)
             .help("Override request content type"),
+        Arg::new("spall-paginate")
+            .long("spall-paginate")
+            .action(ArgAction::SetTrue)
+            .global(true)
+            .help("Auto-follow Link header pagination"),
+        Arg::new("spall-preview")
+            .long("spall-preview")
+            .action(ArgAction::SetTrue)
+            .global(true)
+            .help("Show resolved request without sending"),
         Arg::new("profile")
             .long("profile")
             .global(true)

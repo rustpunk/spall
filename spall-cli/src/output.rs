@@ -16,6 +16,8 @@ pub enum OutputMode {
     Yaml,
     /// Table output (Wave 2).
     Table,
+    /// CSV output (Wave 2).
+    Csv,
 }
 
 impl Default for OutputMode {
@@ -36,15 +38,13 @@ impl OutputMode {
             "raw" => Some(OutputMode::Raw),
             "yaml" => Some(OutputMode::Yaml),
             "table" => Some(OutputMode::Table),
+            "csv" => Some(OutputMode::Csv),
             _ => None,
         }
     }
 }
 
 /// Write response body to stdout or a file.
-///
-/// Wave 1: basic stdout with mode selection.
-/// Wave 1.5+: file output via `@path` or `--spall-download`.
 pub fn emit_response(
     body: &[u8],
     mode: OutputMode,
@@ -54,6 +54,21 @@ pub fn emit_response(
         std::fs::write(path, body)?;
         eprintln!("Response saved to {}", path);
         return Ok(());
+    }
+
+    // If mode needs structured JSON, try parsing once and delegate.
+    match mode {
+        OutputMode::Yaml | OutputMode::Table | OutputMode::Csv => {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+                return emit_json_value(&value, mode, save_path);
+            }
+            // Fall back: if not valid JSON, warn and stream raw.
+            eprintln!("Warning: expected JSON for {} output, got non-JSON body. Falling back to raw.",
+                mode_name(mode));
+            io::stdout().write_all(body)?;
+            return Ok(());
+        }
+        _ => {}
     }
 
     match mode {
@@ -73,14 +88,223 @@ pub fn emit_response(
             io::stdout().write_all(body)?;
         }
         OutputMode::Yaml => {
-            // TODO(Wave 2): YAML serialization.
+            // Unreachable: handled above.
             io::stdout().write_all(body)?;
         }
         OutputMode::Table => {
-            // TODO(Wave 2): table formatting.
+            io::stdout().write_all(body)?;
+        }
+        OutputMode::Csv => {
             io::stdout().write_all(body)?;
         }
     }
 
     Ok(())
+}
+
+/// Emit an already-parsed JSON value directly.
+///
+/// Used by pagination to avoid serialising→re-parsing.
+pub fn emit_json_value(
+    value: &serde_json::Value,
+    mode: OutputMode,
+    save_path: Option<&str>,
+) -> io::Result<()> {
+    if let Some(path) = save_path {
+        let bytes = serde_json::to_vec(value).unwrap_or_default();
+        std::fs::write(path, bytes)?;
+        eprintln!("Response saved to {}", path);
+        return Ok(());
+    }
+
+    match mode {
+        OutputMode::Pretty => {
+            let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
+            io::stdout().write_all(pretty.as_bytes())?;
+            io::stdout().write_all(b"\n")?;
+        }
+        OutputMode::Raw => {
+            let raw = serde_json::to_vec(value).unwrap_or_default();
+            io::stdout().write_all(&raw)?;
+        }
+        OutputMode::Yaml => {
+            match serde_yaml::to_string(value) {
+                Ok(yaml) => {
+                    io::stdout().write_all(yaml.as_bytes())?;
+                }
+                Err(e) => {
+                    eprintln!("Warning: YAML serialization failed ({}). Falling back to pretty JSON.", e);
+                    let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
+                    io::stdout().write_all(pretty.as_bytes())?;
+                    io::stdout().write_all(b"\n")?;
+                }
+            }
+        }
+        OutputMode::Table => {
+            print_table(value)?;
+        }
+        OutputMode::Csv => {
+            print_csv(value)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn mode_name(mode: OutputMode) -> &'static str {
+    match mode {
+        OutputMode::Pretty => "pretty",
+        OutputMode::Raw => "raw",
+        OutputMode::Yaml => "yaml",
+        OutputMode::Table => "table",
+        OutputMode::Csv => "csv",
+    }
+}
+
+fn print_table(value: &serde_json::Value) -> io::Result<()> {
+    let rows = match value.as_array() {
+        Some(arr) => arr,
+        None => {
+            eprintln!("Warning: table mode requires a JSON array. Falling back to pretty JSON.");
+            let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
+            io::stdout().write_all(pretty.as_bytes())?;
+            io::stdout().write_all(b"\n")?;
+            return Ok(());
+        }
+    };
+
+    if rows.is_empty() {
+        println!("(empty result set)");
+        return Ok(());
+    }
+
+    // Collect all unique top-level keys in order of appearance.
+    let mut headers: Vec<String> = Vec::new();
+    let mut seen_headers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in rows {
+        if let Some(obj) = row.as_object() {
+            for key in obj.keys() {
+                if seen_headers.insert(key.clone()) {
+                    headers.push(key.clone());
+                }
+            }
+        }
+    }
+
+    // Build table rows.
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    for row in rows {
+        let mut table_row = Vec::with_capacity(headers.len());
+        if let Some(obj) = row.as_object() {
+            for key in &headers {
+                let cell = match obj.get(key) {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(v) => v.to_string(),
+                    None => String::new(),
+                };
+                table_row.push(cell);
+            }
+        } else {
+            eprintln!("Warning: table mode requires an array of objects. Row is not an object; falling back to pretty JSON.");
+            let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
+            io::stdout().write_all(pretty.as_bytes())?;
+            io::stdout().write_all(b"\n")?;
+            return Ok(());
+        }
+        table_rows.push(table_row);
+    }
+
+    let mut builder = tabled::builder::Builder::default();
+    builder.push_record(&headers);
+    for row in &table_rows {
+        builder.push_record(row);
+    }
+    let mut table = builder.build();
+    table.with(tabled::settings::Style::modern());
+    println!("{}", table);
+    Ok(())
+}
+
+fn print_csv(value: &serde_json::Value) -> io::Result<()> {
+    let rows = match value.as_array() {
+        Some(arr) => arr,
+        None => {
+            eprintln!("Warning: csv mode requires a JSON array. Falling back to raw.");
+            let raw = serde_json::to_vec(value).unwrap_or_default();
+            io::stdout().write_all(&raw)?;
+            return Ok(());
+        }
+    };
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut writer = csv::Writer::from_writer(io::stdout());
+
+    // Collect headers.
+    let mut headers: Vec<String> = Vec::new();
+    let mut seen_headers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in rows {
+        if let Some(obj) = row.as_object() {
+            for key in obj.keys() {
+                if seen_headers.insert(key.clone()) {
+                    headers.push(key.clone());
+                }
+            }
+        }
+    }
+
+    writer.write_record(&headers)?;
+
+    for row in rows {
+        if let Some(obj) = row.as_object() {
+            let record: Vec<String> = headers
+                .iter()
+                .map(|key| {
+                    match obj.get(key) {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(v) => v.to_string(),
+                        None => String::new(),
+                    }
+                })
+                .collect();
+            writer.write_record(&record)?;
+        } else {
+            eprintln!("Warning: csv mode requires an array of objects. Row is not an object; falling back to raw.");
+            drop(writer);
+            let raw = serde_json::to_vec(value).unwrap_or_default();
+            io::stdout().write_all(&raw)?;
+            return Ok(());
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yaml_roundtrip_from_json() {
+        let value = serde_json::json!({"name": "test", "count": 42});
+        let yaml = serde_yaml::to_string(&value).unwrap();
+        assert!(yaml.contains("name: test"));
+        assert!(yaml.contains("count: 42"));
+    }
+
+    #[test]
+    fn table_mode_non_array_fallback() {
+        let value = serde_json::json!("hello");
+        // Should not panic; falls back internally.
+        print_table(&value).unwrap();
+    }
+
+    #[test]
+    fn csv_mode_non_array_fallback() {
+        let value = serde_json::json!("hello");
+        print_csv(&value).unwrap();
+    }
 }

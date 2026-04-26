@@ -31,7 +31,7 @@ pub async fn execute_operation(
     phase2_matches: &ArgMatches,
     phase1_matches: &ArgMatches,
 ) -> Result<(), crate::SpallCliError> {
-    let mut url = build_url(op, spec, entry, phase1_matches, phase2_matches)?;
+    let url = build_url(op, spec, entry, phase1_matches, phase2_matches)?;
 
     let mut headers = HeaderMap::new();
 
@@ -106,7 +106,6 @@ pub async fn execute_operation(
         std::process::exit(crate::EXIT_VALIDATION);
     }
 
-    // Timing
     let start = Instant::now();
 
     let http_config = crate::http::config_from_matches(phase1_matches, phase2_matches);
@@ -120,109 +119,190 @@ pub async fn execute_operation(
         return Ok(());
     }
 
-    // Send request with retry loop
-    let retry_count = combined.get_one::<u8>("spall-retry").unwrap_or(1);
-
-    let resp = if let Some(form) = body_data.multipart {
-        let mut req_builder = match op.method {
-            HttpMethod::Get => client.get(&url),
-            HttpMethod::Post => client.post(&url),
-            HttpMethod::Put => client.put(&url),
-            HttpMethod::Delete => client.delete(&url),
-            HttpMethod::Patch => client.patch(&url),
-            HttpMethod::Head => client.head(&url),
-            HttpMethod::Options => client.request(reqwest::Method::OPTIONS, &url),
-            HttpMethod::Trace => client.request(reqwest::Method::TRACE, &url),
-        };
-        req_builder = req_builder.headers(headers).multipart(form);
-        if !query_pairs.is_empty() {
-            req_builder = req_builder.query(&query_pairs);
+    // Preview (Phase D stub)
+    if combined.get_flag("spall-preview") {
+        eprintln!("Preview: {} {}", op.method, url);
+        for (k, v) in &headers {
+            eprintln!("  {}: {}", k, v.to_str().unwrap_or("?"));
         }
-        req_builder.send().await.map_err(|e| {
-            crate::SpallCliError::Network(e.to_string())
-        })?
-    } else {
-        let mut resp = None;
-        for attempt in 0..=retry_count {
-            let mut req_builder = match op.method {
-                HttpMethod::Get => client.get(&url),
-                HttpMethod::Post => client.post(&url),
-                HttpMethod::Put => client.put(&url),
-                HttpMethod::Delete => client.delete(&url),
-                HttpMethod::Patch => client.patch(&url),
-                HttpMethod::Head => client.head(&url),
-                HttpMethod::Options => client.request(reqwest::Method::OPTIONS, &url),
-                HttpMethod::Trace => client.request(reqwest::Method::TRACE, &url),
-            };
-
-            req_builder = req_builder.headers(headers.clone());
-
-            if let Some(ref body) = body_data.body {
-                req_builder = req_builder.body(body.clone());
-            }
-
-            if !query_pairs.is_empty() {
-                req_builder = req_builder.query(&query_pairs);
-            }
-
-            match req_builder.send().await {
-                Ok(r) => {
-                    resp = Some(r);
-                    break;
-                }
-                Err(e) => {
-                    let is_transient = e.is_connect() || e.is_timeout();
-                    if is_transient && attempt < retry_count {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        continue;
-                    }
-                    return Err(crate::SpallCliError::Network(e.to_string()));
-                }
-            }
-        }
-        resp.unwrap()
-    };
-
-    let status = resp.status();
-    let body_bytes = resp.bytes().await.map_err(|e| {
-        crate::SpallCliError::Network(e.to_string())
-    })?;
-
-    let duration = start.elapsed();
-
-    // Verbose output
-    if combined.get_flag("spall-verbose") {
-        eprintln!("HTTP {} {}", status, url);
+        return Ok(());
     }
 
+    let retry_count = combined.get_one::<u8>("spall-retry").unwrap_or(1);
+    let mode = determine_output_mode(&combined);
+    let save_path_owned = combined.get_one::<String>("spall-download");
+    let save_path = save_path_owned.as_deref();
+
+    let paginate = combined.get_flag("spall-paginate");
+
+    if paginate {
+        if body_data.multipart.is_some() {
+            return Err(crate::SpallCliError::Usage(
+                "Cannot use --spall-paginate with multipart uploads".to_string()
+            ));
+        }
+
+        let paginator = crate::paginate::Paginator::default();
+        let mut pages: Vec<serde_json::Value> = Vec::new();
+        let mut current_url = url;
+
+        for _ in 0..paginator.max_pages {
+            let (status, resp_headers, body_bytes) = send_one(
+                &client,
+                op.method,
+                &current_url,
+                headers.clone(),
+                body_data.body.clone(),
+                None,
+                &query_pairs,
+                retry_count,
+            ).await?;
+
+            if combined.get_flag("spall-verbose") {
+                eprintln!("HTTP {} {}", status, current_url);
+            }
+
+            if !status.is_success() {
+                crate::output::emit_response(&body_bytes, mode, save_path)
+                    .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+                if status.is_client_error() {
+                    std::process::exit(crate::EXIT_HTTP_4XX);
+                } else {
+                    std::process::exit(crate::EXIT_HTTP_5XX);
+                }
+            }
+
+            let body_json = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                .map_err(|e| crate::SpallCliError::Usage(format!(
+                    "Pagination requires JSON responses: {}", e
+                )))?;
+            pages.push(body_json);
+
+            if let Some(next) = paginator.next_url(&resp_headers) {
+                current_url = resolve_next_url(&current_url, &next)?;
+                // After the first request, query params are embedded in the Link URL.
+                query_pairs.clear();
+            } else {
+                break;
+            }
+        }
+
+        let final_value = paginator.concat_results(pages);
+        crate::output::emit_json_value(&final_value, mode, save_path)
+            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+    } else {
+        let (status, _headers, body_bytes) = send_one(
+            &client,
+            op.method,
+            &url,
+            headers,
+            body_data.body,
+            body_data.multipart,
+            &query_pairs,
+            retry_count,
+        ).await?;
+
+        if combined.get_flag("spall-verbose") {
+            eprintln!("HTTP {} {}", status, url);
+        }
+
+        crate::output::emit_response(&body_bytes, mode, save_path)
+            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+
+        if status.is_client_error() {
+            std::process::exit(crate::EXIT_HTTP_4XX);
+        } else if status.is_server_error() {
+            std::process::exit(crate::EXIT_HTTP_5XX);
+        }
+    }
+
+    let duration = start.elapsed();
     if combined.get_flag("spall-time") || combined.get_flag("spall-verbose") {
         eprintln!("Duration: {:?}", duration);
     }
 
-    // Output formatting
-    let mode = if combined.get_flag("spall-verbose") {
+    Ok(())
+}
+
+/// Send a single HTTP request, with transient-error retry.
+#[allow(clippy::too_many_arguments)]
+async fn send_one(
+    client: &reqwest::Client,
+    method: HttpMethod,
+    url: &str,
+    headers: HeaderMap,
+    body: Option<Vec<u8>>,
+    mut multipart: Option<reqwest::multipart::Form>,
+    query_pairs: &[(&str, &str)],
+    retry_count: u8,
+) -> Result<(reqwest::StatusCode, HeaderMap, Vec<u8>), crate::SpallCliError> {
+    let max_attempts = if multipart.is_some() { 1 } else { retry_count + 1 };
+    for attempt in 0..max_attempts {
+        let mut req_builder = match method {
+            HttpMethod::Get => client.get(url),
+            HttpMethod::Post => client.post(url),
+            HttpMethod::Put => client.put(url),
+            HttpMethod::Delete => client.delete(url),
+            HttpMethod::Patch => client.patch(url),
+            HttpMethod::Head => client.head(url),
+            HttpMethod::Options => client.request(reqwest::Method::OPTIONS, url),
+            HttpMethod::Trace => client.request(reqwest::Method::TRACE, url),
+        };
+
+        req_builder = req_builder.headers(headers.clone());
+
+        if let Some(m) = multipart.take() {
+            req_builder = req_builder.multipart(m);
+        } else if let Some(ref b) = body {
+            req_builder = req_builder.body(b.clone());
+        }
+
+        if !query_pairs.is_empty() {
+            req_builder = req_builder.query(query_pairs);
+        }
+
+        match req_builder.send().await {
+            Ok(r) => {
+                let status = r.status();
+                let hdrs = r.headers().clone();
+                let bytes = r.bytes().await
+                    .map_err(|e| crate::SpallCliError::Network(e.to_string()))?
+                    .to_vec();
+                return Ok((status, hdrs, bytes));
+            }
+            Err(e) => {
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                return Err(crate::SpallCliError::Network(e.to_string()));
+            }
+        }
+    }
+    Err(crate::SpallCliError::Network("request failed after retries".to_string()))
+}
+
+/// Resolve a `next` URL from a Link header against the current request URL.
+fn resolve_next_url(current: &str, next: &str) -> Result<String, crate::SpallCliError> {
+    if next.starts_with("http://") || next.starts_with("https://") {
+        Ok(next.to_string())
+    } else {
+        let base = reqwest::Url::parse(current)
+            .map_err(|e| crate::SpallCliError::Network(format!("Invalid current URL: {}", e)))?;
+        let resolved = base.join(next)
+            .map_err(|e| crate::SpallCliError::Network(format!("Invalid next URL '{}': {}", next, e)))?;
+        Ok(resolved.to_string())
+    }
+}
+
+fn determine_output_mode(combined: &MergedMatches) -> crate::output::OutputMode {
+    if combined.get_flag("spall-verbose") {
         crate::output::OutputMode::Raw
     } else if let Some(output) = combined.get_one::<String>("spall-output") {
         crate::output::OutputMode::from_str(&output).unwrap_or_default()
     } else {
         crate::output::OutputMode::default()
-    };
-
-    let save_path_owned = combined.get_one::<String>("spall-download");
-    let save_path = save_path_owned.as_deref();
-
-    crate::output::emit_response(&body_bytes, mode, save_path).map_err(|e| {
-        crate::SpallCliError::HttpClient(e.to_string())
-    })?;
-
-    // Exit code based on HTTP status
-    if status.is_client_error() {
-        std::process::exit(crate::EXIT_HTTP_4XX);
-    } else if status.is_server_error() {
-        std::process::exit(crate::EXIT_HTTP_5XX);
     }
-
-    Ok(())
 }
 
 /// Merge Phase 1 and Phase 2 ArgMatches, preferring Phase 2 for overlapping values.
