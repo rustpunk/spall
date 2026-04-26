@@ -38,6 +38,16 @@ struct ApiToml {
     headers: HashMap<String, String>,
     #[serde(default)]
     auth: Option<AuthToml>,
+    #[serde(default)]
+    profile: HashMap<String, ProfileToml>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ProfileToml {
+    base_url: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    auth: Option<AuthToml>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -95,6 +105,7 @@ pub fn load_global_config() -> Result<GlobalConfig, SpallConfigError> {
             base_url: None,
             default_headers: Vec::new(),
             auth: None,
+            profiles: std::collections::HashMap::new(),
         })
         .collect();
 
@@ -138,6 +149,26 @@ pub fn scan_api_configs() -> Result<Vec<ApiEntry>, SpallConfigError> {
                     keyring_user: a.keyring_user,
                 });
 
+                let profiles: std::collections::HashMap<String, crate::registry::ProfileConfig> = cfg
+                    .profile
+                    .into_iter()
+                    .map(|(name, p)| {
+                        let profile_auth = p.auth.map(|a| AuthConfig {
+                            token_env: a.token_env,
+                            keyring_service: a.keyring_service,
+                            keyring_user: a.keyring_user,
+                        });
+                        (
+                            name,
+                            crate::registry::ProfileConfig {
+                                base_url: p.base_url,
+                                headers: p.headers.into_iter().collect(),
+                                auth: profile_auth,
+                            },
+                        )
+                    })
+                    .collect();
+
                 entries.push(ApiEntry {
                     name,
                     source: cfg.source,
@@ -145,6 +176,7 @@ pub fn scan_api_configs() -> Result<Vec<ApiEntry>, SpallConfigError> {
                     base_url: cfg.base_url,
                     default_headers: headers,
                     auth,
+                    profiles,
                 });
             }
         }
@@ -178,6 +210,7 @@ pub fn scan_spec_dirs(dirs: &[PathBuf]) -> Result<Vec<ApiEntry>, SpallConfigErro
                                 base_url: None,
                                 default_headers: Vec::new(),
                                 auth: None,
+                                profiles: std::collections::HashMap::new(),
                             });
                         }
                     }

@@ -25,9 +25,11 @@ pub struct ApiEntry {
     pub default_headers: Vec<(String, String)>,
     /// Auth configuration reference.
     pub auth: Option<AuthConfig>,
+    /// Per-API profiles overlay.
+    pub profiles: std::collections::HashMap<String, ProfileConfig>,
 }
 
-/// Auth configuration for an API (references only; no raw secrets).
+/// Auth configuration reference.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// Name of the environment variable holding the token.
@@ -36,6 +38,17 @@ pub struct AuthConfig {
     pub keyring_service: Option<String>,
     /// Keyring user/account name.
     pub keyring_user: Option<String>,
+}
+
+/// Profile configuration overlay (Wave 2).
+#[derive(Debug, Clone)]
+pub struct ProfileConfig {
+    /// Base URL override for this profile.
+    pub base_url: Option<String>,
+    /// Default headers for this profile.
+    pub headers: Vec<(String, String)>,
+    /// Auth override for this profile.
+    pub auth: Option<AuthConfig>,
 }
 
 impl ApiRegistry {
@@ -100,6 +113,38 @@ impl ApiRegistry {
     /// Find an entry by name.
     pub fn find(&self, name: &str) -> Option<&ApiEntry> {
         self.apis.iter().find(|e| e.name == name)
+    }
+
+    /// Resolve an API entry with an optional profile overlay.
+    ///
+    /// Returns a cloned `ApiEntry` with profile values applied on top of the
+    /// base configuration. Profile headers replace base headers with the same
+    /// key, and profile `base_url` / `auth` override the base values.
+    pub fn resolve_profile(
+        &self,
+        api_name: &str,
+        profile_name: Option<&str>,
+    ) -> Option<ApiEntry> {
+        let mut entry = self.find(api_name)?.clone();
+        if let Some(name) = profile_name {
+            if let Some(profile) = entry.profiles.get(name) {
+                if profile.base_url.is_some() {
+                    entry.base_url = profile.base_url.clone();
+                }
+                if !profile.headers.is_empty() {
+                    let mut header_map: std::collections::HashMap<String, String> =
+                        entry.default_headers.into_iter().collect();
+                    for (k, v) in &profile.headers {
+                        header_map.insert(k.clone(), v.clone());
+                    }
+                    entry.default_headers = header_map.into_iter().collect();
+                }
+                if profile.auth.is_some() {
+                    entry.auth = profile.auth.clone();
+                }
+            }
+        }
+        Some(entry)
     }
 }
 

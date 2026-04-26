@@ -217,8 +217,9 @@ async fn handle_api_operation(
     phase1_matches: &ArgMatches,
     cache_dir: &std::path::Path,
 ) -> miette::Result<()> {
+    let profile = phase1_matches.get_one::<String>("profile").map(|s| s.as_str());
     let entry = registry
-        .find(api_name)
+        .resolve_profile(api_name, profile)
         .ok_or_else(|| SpallCliError::Usage(format!("Unknown API: {}", api_name)))?;
 
     let raw = fetch::load_raw(&entry.source, cache_dir)
@@ -268,7 +269,7 @@ async fn handle_api_operation(
     // Phase 2 structure may be flat (single tag) or nested (multiple tags).
     // Try direct operation match first.
     if let Some(op) = spec.operations.iter().find(|o| o.operation_id == tag_or_op) {
-        return execute::execute_operation(op, &spec, entry, op_matches, phase1_matches)
+        return execute::execute_operation(op, &spec, &entry, op_matches, phase1_matches)
             .await
             .map_err(Into::into);
     }
@@ -287,7 +288,7 @@ async fn handle_api_operation(
                 SpallCliError::Usage(format!("Unknown operation: {}", op_name))
             })?;
 
-        return execute::execute_operation(op, &spec, entry, inner_matches, phase1_matches)
+        return execute::execute_operation(op, &spec, &entry, inner_matches, phase1_matches)
             .await
             .map_err(Into::into);
     }
@@ -446,5 +447,9 @@ fn spall_global_args() -> Vec<Arg> {
             .short('c')
             .global(true)
             .help("Override request content type"),
+        Arg::new("profile")
+            .long("profile")
+            .global(true)
+            .help("Active config profile (e.g., staging, production)"),
     ]
 }

@@ -5,6 +5,7 @@
 pub mod cache;
 pub mod command;
 pub mod error;
+pub mod extensions;
 pub mod ir;
 pub mod loader;
 pub mod resolver;

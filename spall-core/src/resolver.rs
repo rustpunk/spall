@@ -197,7 +197,7 @@ fn resolve_one_parameter(
         ReferenceOr::Item(item) => item.clone(),
     };
 
-    let (location, name, required, deprecated, description, style_str, explode, schema_ref) = match &p {
+    let (location, name, required, deprecated, description, style_str, explode, schema_ref, extensions) = match &p {
         Parameter::Query { parameter_data, style, .. } => (
             ParameterLocation::Query,
             &parameter_data.name,
@@ -207,6 +207,10 @@ fn resolve_one_parameter(
             serde_json::to_string(style).unwrap_or_else(|_| "\"form\"".to_string()),
             parameter_data.explode.unwrap_or(true),
             extract_schema_ref(&parameter_data.format),
+            parameter_data.extensions
+                .iter()
+                .map(|(k, v)| (k.clone(), SpallValue::from(v)))
+                .collect(),
         ),
         Parameter::Header { parameter_data, style, .. } => (
             ParameterLocation::Header,
@@ -217,6 +221,10 @@ fn resolve_one_parameter(
             serde_json::to_string(style).unwrap_or_else(|_| "\"simple\"".to_string()),
             parameter_data.explode.unwrap_or(false),
             extract_schema_ref(&parameter_data.format),
+            parameter_data.extensions
+                .iter()
+                .map(|(k, v)| (k.clone(), SpallValue::from(v)))
+                .collect(),
         ),
         Parameter::Path { parameter_data, style, .. } => (
             ParameterLocation::Path,
@@ -227,6 +235,10 @@ fn resolve_one_parameter(
             serde_json::to_string(style).unwrap_or_else(|_| "\"simple\"".to_string()),
             parameter_data.explode.unwrap_or(false),
             extract_schema_ref(&parameter_data.format),
+            parameter_data.extensions
+                .iter()
+                .map(|(k, v)| (k.clone(), SpallValue::from(v)))
+                .collect(),
         ),
         Parameter::Cookie { parameter_data, style, .. } => (
             ParameterLocation::Cookie,
@@ -237,6 +249,10 @@ fn resolve_one_parameter(
             serde_json::to_string(style).unwrap_or_else(|_| "\"form\"".to_string()),
             parameter_data.explode.unwrap_or(false),
             extract_schema_ref(&parameter_data.format),
+            parameter_data.extensions
+                .iter()
+                .map(|(k, v)| (k.clone(), SpallValue::from(v)))
+                .collect(),
         ),
     };
 
@@ -283,6 +299,7 @@ fn resolve_one_parameter(
         explode,
         schema,
         description,
+        extensions,
     })
 }
 

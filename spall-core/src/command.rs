@@ -1,3 +1,4 @@
+use crate::extensions::CliExtensions;
 use crate::ir::{ParameterLocation, ResolvedOperation, ResolvedSpec, SpecIndex};
 use crate::value::SpallValue;
 use clap::{Arg, ArgAction, ArgGroup, Command};
@@ -9,24 +10,35 @@ use indexmap::IndexMap;
 
 /// Build a clap `Command` tree from a resolved spec for a given API.
 pub fn build_operations_cmd(api_name: &str, spec: &ResolvedSpec) -> Command {
-    let light_ops: Vec<LightOp> = spec.operations.iter().map(|op| LightOp {
-        operation_id: &op.operation_id,
-        summary: op.summary.as_deref(),
-        deprecated: op.deprecated,
-        tags: &op.tags,
-        params: op
-            .parameters
-            .iter()
-            .map(|p| LightParam {
-                name: &p.name,
-                location: p.location,
-                required: p.required,
-                description: p.description.as_deref(),
-                schema: Some(&p.schema),
-            })
-            .collect(),
-        has_body: op.request_body.is_some(),
-        body_required: op.request_body.as_ref().map(|b| b.required).unwrap_or(false),
+    let light_ops: Vec<LightOp> = spec.operations.iter().map(|op| {
+        let ext = CliExtensions::from_operation(op);
+        LightOp {
+            operation_id: &op.operation_id,
+            cli_name: ext.cli_name,
+            hidden: ext.hidden,
+            group: ext.group,
+            summary: op.summary.as_deref(),
+            deprecated: op.deprecated,
+            tags: &op.tags,
+            params: op
+                .parameters
+                .iter()
+                .map(|p| {
+                    let p_ext = CliExtensions::from_parameter(p);
+                    LightParam {
+                        name: &p.name,
+                        cli_name: p_ext.cli_name,
+                        hidden: p_ext.hidden,
+                        location: p.location,
+                        required: p.required,
+                        description: p.description.as_deref(),
+                        schema: Some(&p.schema),
+                    }
+                })
+                .collect(),
+            has_body: op.request_body.is_some(),
+            body_required: op.request_body.as_ref().map(|b| b.required).unwrap_or(false),
+        }
     }).collect();
     build_root_cmd(api_name, &spec.title, &spec.version, &light_ops)
 }
@@ -35,6 +47,9 @@ pub fn build_operations_cmd(api_name: &str, spec: &ResolvedSpec) -> Command {
 pub fn build_operations_cmd_from_index(api_name: &str, index: &SpecIndex) -> Command {
     let light_ops: Vec<LightOp> = index.operations.iter().map(|op| LightOp {
         operation_id: &op.operation_id,
+        cli_name: None,
+        hidden: false,
+        group: None,
         summary: op.summary.as_deref(),
         deprecated: op.deprecated,
         tags: &op.tags,
@@ -43,6 +58,8 @@ pub fn build_operations_cmd_from_index(api_name: &str, index: &SpecIndex) -> Com
             .iter()
             .map(|p| LightParam {
                 name: &p.name,
+                cli_name: None,
+                hidden: false,
                 location: p.location,
                 required: p.required,
                 description: None,
@@ -61,6 +78,8 @@ pub fn build_operations_cmd_from_index(api_name: &str, index: &SpecIndex) -> Com
 
 struct LightParam<'a> {
     name: &'a str,
+    cli_name: Option<String>,
+    hidden: bool,
     location: ParameterLocation,
     required: bool,
     description: Option<&'a str>,
@@ -69,6 +88,9 @@ struct LightParam<'a> {
 
 struct LightOp<'a> {
     operation_id: &'a str,
+    cli_name: Option<String>,
+    hidden: bool,
+    group: Option<String>,
     summary: Option<&'a str>,
     deprecated: bool,
     tags: &'a [String],
@@ -90,14 +112,15 @@ fn build_root_cmd(api_name: &str, title: &str, version: &str, ops: &[LightOp]) -
         return root;
     }
 
-    let mut seen_root: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_root: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (tag, tag_ops) in &groups {
         let mut tag_cmd = Command::new(tag.clone())
             .about(format!("{} operations", tag));
 
         for op in tag_ops {
             tag_cmd = tag_cmd.subcommand(build_op_cmd(op));
-            if seen_root.insert(op.operation_id) {
+            let display = op.cli_name.clone().unwrap_or_else(|| op.operation_id.to_string());
+            if seen_root.insert(display) {
                 root = root.subcommand(build_op_cmd(op));
             }
         }
@@ -109,7 +132,8 @@ fn build_root_cmd(api_name: &str, title: &str, version: &str, ops: &[LightOp]) -
 }
 
 fn build_op_cmd(op: &LightOp) -> Command {
-    let mut cmd = Command::new(op.operation_id.to_string())
+    let cmd_name = op.cli_name.clone().unwrap_or_else(|| op.operation_id.to_string());
+    let mut cmd = Command::new(cmd_name.clone())
         .about(op.summary.unwrap_or_default().to_string());
 
     if op.deprecated {
@@ -117,6 +141,10 @@ fn build_op_cmd(op: &LightOp) -> Command {
     }
 
     for param in &op.params {
+        if param.hidden {
+            continue;
+        }
+        let long_name = param.cli_name.as_deref().unwrap_or(param.name);
         match param.location {
             ParameterLocation::Path => {
                 let id = format!("path-{}", param.name);
@@ -132,7 +160,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
             ParameterLocation::Query => {
                 let id = format!("query-{}", param.name);
                 let mut arg = Arg::new(id.clone())
-                    .long(param.name.to_string())
+                    .long(long_name.to_string())
                     .required(param.required)
                     .help(param.description.unwrap_or_default().to_string());
                 if let Some(schema) = param.schema {
@@ -142,7 +170,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
             }
             ParameterLocation::Header => {
                 let id = format!("header-{}", param.name);
-                let kebab = param.name.to_ascii_lowercase().replace('_', "-");
+                let kebab = long_name.to_ascii_lowercase().replace('_', "-");
                 let mut arg = Arg::new(id.clone())
                     .long(format!("header-{}", kebab))
                     .required(param.required)
@@ -154,7 +182,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
             }
             ParameterLocation::Cookie => {
                 let id = format!("cookie-{}", param.name);
-                let kebab = param.name.to_ascii_lowercase().replace('_', "-");
+                let kebab = long_name.to_ascii_lowercase().replace('_', "-");
                 let mut arg = Arg::new(id.clone())
                     .long(format!("cookie-{}", kebab))
                     .required(param.required)
@@ -245,10 +273,12 @@ fn group_by_tag<'a>(ops: &'a [LightOp<'a>]) -> IndexMap<String, Vec<&'a LightOp<
     let mut map: IndexMap<String, Vec<&LightOp>> = IndexMap::new();
 
     for op in ops {
-        let tag = op
-            .tags
-            .first()
-            .cloned()
+        if op.hidden {
+            continue;
+        }
+        let tag = op.group
+            .clone()
+            .or_else(|| op.tags.first().cloned())
             .unwrap_or_else(|| "default".to_string());
         map.entry(tag).or_default().push(op);
     }

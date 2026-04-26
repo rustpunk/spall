@@ -96,6 +96,7 @@ fn path_arg_ids() {
             items: None,
         },
         description: None,
+        extensions: Default::default(),
     });
     let spec = make_spec(vec![op]);
     let cmd = build_operations_cmd("pets", &spec);
@@ -140,6 +141,7 @@ fn query_flag_ids() {
             items: None,
         },
         description: None,
+        extensions: Default::default(),
     });
     let spec = make_spec(vec![op]);
     let cmd = build_operations_cmd("pets", &spec);
@@ -184,6 +186,7 @@ fn header_flag_ids() {
             items: None,
         },
         description: None,
+        extensions: Default::default(),
     });
     let spec = make_spec(vec![op]);
     let cmd = build_operations_cmd("pets", &spec);

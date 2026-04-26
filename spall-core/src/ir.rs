@@ -57,6 +57,7 @@ pub struct ResolvedParameter {
     pub explode: bool,
     pub schema: ResolvedSchema,
     pub description: Option<String>,
+    pub extensions: IndexMap<String, SpallValue>,
 }
 
 /// Request body after resolution.

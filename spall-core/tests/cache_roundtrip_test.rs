@@ -91,6 +91,7 @@ fn make_spec_with_values(title: &str) -> ResolvedSpec {
                 explode: false,
                 schema,
                 description: None,
+                extensions: Default::default(),
             }],
             request_body: Some(ResolvedRequestBody {
                 description: None,
