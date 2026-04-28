@@ -15,7 +15,7 @@ Three-crate workspace:
 
 - `openapiv3` for spec deserialization (behavioral logic is ours).
 - `clap` builder API (never derive).
-- `serde_saphyr = "0.0.24"` (NOT `serde_yaml`).
+- `serde_saphyr = "0.0.24"` (NOT `serde_yaml`). All YAML goes through `spall_core::yaml` chokepoint.
 - `reqwest` with `default-features = false` + `rustls-tls` + `multipart`.
 - `tokio` current_thread (`rt`, `macros`, `net`, `time`, `io-util`).
 - `miette` + `thiserror`.
@@ -47,16 +47,17 @@ cargo doc --workspace --no-deps
 ## Wave Structure
 
 - Wave 1: Core request flow (MVP). ✅
-- **Current: Wave 1.5** (IR cache, performance, reliability).
-- Wave 2: QoL (validation, profiles, pagination, completions, etc.).
-- Wave 3: Auth providers, REPL, chaining.
-- Wave 4: Daemon mode, plugins, mock server, OpenAPI 3.1.
+- Wave 1.5: IR cache, performance, reliability. ✅
+- Wave 2: QoL (validation, profiles, pagination, completions, history, output formats, filtering). ✅
+- Wave 3 Independent: Auth providers, repeat, spec autodiscovery. ✅
+- Wave 3: REPL, chaining. ⏳
+- Wave 4: Daemon mode, plugins, mock server, OpenAPI 3.1. ⏳
 
-**Current: Wave 1.** Don't implement beyond Wave 1 without explicit instruction.
+**Current: Wave 3.** Don't implement beyond Wave 3 without explicit instruction.
 
 ## openapiv3 Crate Limitations
 
-Only deserialization. `$ref` resolution, parameter merging, security inheritance, cycle detection, lenient parsing — all manual. We evaluated `openapiv3-extended` (v6) and chose `openapiv3` v2; re-evaluate before Wave 2 if resolver edge cases become painful.
+Only deserialization. `$ref` resolution, parameter merging, security inheritance, cycle detection, lenient parsing — all manual. We evaluated `openapiv3-extended` (v6) and chose `openapiv3` v2; re-evaluate before Wave 4 if resolver edge cases become painful.
 
 ## Key Patterns
 
@@ -67,3 +68,4 @@ Only deserialization. `$ref` resolution, parameter merging, security inheritance
 - Cache writes: temp file + atomic `fs::rename`.
 - JSON fallback if `serde_saphyr` fails on YAML.
 - Graceful `--help` degradation: if Phase 2 spec load fails but `--help` was requested, attempt to load cached `SpecIndex`.
+- YAML is parsed through `spall_core::yaml::from_str` — the single chokepoint with hard DoS budgets.

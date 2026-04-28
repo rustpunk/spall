@@ -71,7 +71,13 @@ async fn handle_refresh(
     if all {
         for entry in &registry.apis {
             if entry.source.starts_with("http://") || entry.source.starts_with("https://") {
-                match crate::fetch::refresh(&entry.source, cache_dir).await {
+                let proxy = crate::http::resolve_proxy(
+                    entry,
+                    &registry.defaults,
+                    &clap::ArgMatches::default(),
+                    &clap::ArgMatches::default(),
+                );
+                match crate::fetch::refresh(&entry.source, cache_dir, proxy.as_deref()).await {
                     Ok(_) => eprintln!("Refreshed API '{}'", entry.name),
                     Err(e) => eprintln!("Failed to refresh API '{}': {}", entry.name, e),
                 }
@@ -82,7 +88,13 @@ async fn handle_refresh(
             .find(n)
             .ok_or_else(|| crate::SpallCliError::Usage(format!("Unknown API: {}", n)))?;
         if entry.source.starts_with("http://") || entry.source.starts_with("https://") {
-            crate::fetch::refresh(&entry.source, cache_dir)
+            let proxy = crate::http::resolve_proxy(
+                entry,
+                &registry.defaults,
+                &clap::ArgMatches::default(),
+                &clap::ArgMatches::default(),
+            );
+            crate::fetch::refresh(&entry.source, cache_dir, proxy.as_deref())
                 .await
                 .map_err(|e| crate::SpallCliError::Network(e.to_string()))?;
             eprintln!("Refreshed API '{}'", n);

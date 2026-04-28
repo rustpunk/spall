@@ -15,11 +15,14 @@ Think **Restish, but Rust**.
 - Two-phase parsing for fast startup and rich per-operation help.
 - Schema-aware argument validation and typed flags.
 - Colored, formatted response output with TTY detection.
-- Config profiles, credential resolution, and shell completion support (coming in Wave 2+).
+- Config profiles, credential resolution, and shell completion support.
+- Response validation, pagination, request history, and spec autodiscovery.
+- IR cache with `postcard` for fast repeated loads.
+- YAML spec parsing via `serde_saphyr` (billion-laughs hardened).
 
 ## Status
 
-Alpha / Work in Progress — Wave 1 (core request flow) in progress.
+Alpha — core request flow (Wave 1), QoL (Wave 2), and auth/discovery (Wave 3 Independent) are implemented and tested.
 
 ## Quick Usage
 
@@ -35,4 +38,29 @@ spall petstore get-pet-by-id 1
 
 # POST with a body
 spall petstore add-pet --data '{"name":"Rex","status":"available"}'
+
+# Output as table
+spall petstore list-pets --spall-output table
+
+# Use a profile
+spall petstore get-pet-by-id 1 --profile staging
+
+# Replay last request
+spall --spall-repeat
+
+# Discover spec from a base URL
+spall api discover https://api.example.com
 ```
+
+## Build / Test
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace
+cargo doc --workspace --no-deps
+```
+
+## License
+
+MIT OR Apache-2.0

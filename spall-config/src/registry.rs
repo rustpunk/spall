@@ -9,6 +9,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct ApiRegistry {
     pub apis: Vec<ApiEntry>,
+    pub defaults: crate::sources::GlobalDefaults,
 }
 
 /// An entry in the API registry.
@@ -26,6 +27,8 @@ pub struct ApiEntry {
     pub default_headers: Vec<(String, String)>,
     /// Auth configuration reference.
     pub auth: Option<AuthConfig>,
+    /// Per-API proxy override.
+    pub proxy: Option<String>,
     /// Per-API profiles overlay.
     pub profiles: std::collections::HashMap<String, ProfileConfig>,
 }
@@ -39,6 +42,8 @@ pub struct ProfileConfig {
     pub headers: Vec<(String, String)>,
     /// Auth override for this profile.
     pub auth: Option<AuthConfig>,
+    /// Proxy override for this profile.
+    pub proxy: Option<String>,
 }
 
 impl ApiRegistry {
@@ -73,7 +78,7 @@ impl ApiRegistry {
             }
         }
 
-        Ok(ApiRegistry { apis })
+        Ok(ApiRegistry { apis, defaults: global.defaults })
     }
 
     /// Persist a new API to the registry by creating `~/.config/spall/apis/{name}.toml`.
@@ -120,6 +125,9 @@ impl ApiRegistry {
             if let Some(profile) = entry.profiles.get(name) {
                 if profile.base_url.is_some() {
                     entry.base_url = profile.base_url.clone();
+                }
+                if profile.proxy.is_some() {
+                    entry.proxy = profile.proxy.clone();
                 }
                 if !profile.headers.is_empty() {
                     let mut header_map: std::collections::HashMap<String, String> =

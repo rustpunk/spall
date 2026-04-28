@@ -35,9 +35,7 @@ pub async fn replay(
     eprintln!("Replaying request #{}: {} {}", row.id, row.method, row.url);
 
     // Build HTTP client using defaults.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
+    let client = crate::http::build_fetch_client(crate::http::resolve_env_proxy().as_deref())
         .map_err(|e| crate::SpallCliError::Network(e.to_string()))?;
 
     let method = match row.method.to_ascii_uppercase().as_str() {

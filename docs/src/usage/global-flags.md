@@ -25,6 +25,7 @@ All internal spall flags use the `--spall-*` prefix so they never collide with A
 | `--spall-insecure` | | Skip TLS certificate verification |
 | `--spall-ca-cert` | | Path to custom CA certificate |
 | `--spall-proxy` | | HTTP/SOCKS proxy URL |
+| `--spall-no-proxy` | | Disable proxy for this request |
 
 ## Request Modification
 

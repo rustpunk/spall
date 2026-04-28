@@ -28,7 +28,8 @@ pub async fn fetch_client_credentials(
         .collect::<Vec<_>>()
         .join("&");
 
-    let client = reqwest::Client::new();
+    let client = crate::http::build_fetch_client(crate::http::resolve_env_proxy().as_deref())
+        .map_err(|e| crate::SpallCliError::Network(e.to_string()))?;
     let resp = client
         .post(token_url)
         .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")

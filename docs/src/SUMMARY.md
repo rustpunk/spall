@@ -22,6 +22,7 @@
 
 - [Config Layout](config/layout.md)
 - [Profiles](config/profiles.md)
+- [Proxy Support](config/proxy.md)
 
 # Operations Guide
 

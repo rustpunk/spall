@@ -155,7 +155,7 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{HttpMethod, ResolvedOperation, ResolvedSpec, ResolvedServer, SpecIndex};
+    use crate::ir::{HttpMethod, ResolvedOperation, ResolvedSpec, ResolvedServer};
 
     fn dummy_spec(title: &str) -> ResolvedSpec {
         ResolvedSpec {

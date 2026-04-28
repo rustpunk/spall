@@ -5,28 +5,28 @@ use std::path::{Path, PathBuf};
 const RAW_CACHE_TTL_SECS: u64 = 3600;
 
 /// Load raw spec bytes. For URLs, checks TTL cache and conditional GET.
-pub async fn load_raw(source: &str, cache_dir: &Path) -> Result<Vec<u8>, SpallCliError> {
+pub async fn load_raw(source: &str, cache_dir: &Path, proxy_url: Option<&str>) -> Result<Vec<u8>, SpallCliError> {
     if source.starts_with("http://") || source.starts_with("https://") {
-        fetch_url(source, cache_dir).await
+        fetch_url(source, cache_dir, proxy_url).await
     } else {
         std::fs::read(source).map_err(|e| SpallCliError::Network(e.to_string()))
     }
 }
 
 /// Force network re-fetch of a URL source, update raw cache, invalidate IR cache.
-pub async fn refresh(source: &str, cache_dir: &Path) -> Result<Vec<u8>, SpallCliError> {
+pub async fn refresh(source: &str, cache_dir: &Path, proxy_url: Option<&str>) -> Result<Vec<u8>, SpallCliError> {
     if !source.starts_with("http://") && !source.starts_with("https://") {
         return Err(SpallCliError::Usage(format!(
             "refresh only applies to remote specs: {}",
             source
         )));
     }
-    let bytes = fetch_url_force(source, cache_dir).await?;
+    let bytes = fetch_url_force(source, cache_dir, proxy_url).await?;
     let _ = spall_core::cache::invalidate(source, cache_dir);
     Ok(bytes)
 }
 
-async fn fetch_url(source: &str, cache_dir: &Path) -> Result<Vec<u8>, SpallCliError> {
+async fn fetch_url(source: &str, cache_dir: &Path, proxy_url: Option<&str>) -> Result<Vec<u8>, SpallCliError> {
     if let Some(bytes) = read_raw_cache(source, cache_dir) {
         if let Ok(meta_bytes) = std::fs::read(raw_meta_path(source, cache_dir)) {
             if let Ok(meta) = postcard::from_bytes::<RawMeta>(&meta_bytes) {
@@ -34,20 +34,22 @@ async fn fetch_url(source: &str, cache_dir: &Path) -> Result<Vec<u8>, SpallCliEr
                 if now < meta.expires_at {
                     return Ok(bytes);
                 }
-                return conditional_get(source, cache_dir, &meta).await;
+                return conditional_get(source, cache_dir, &meta, proxy_url).await;
             }
         }
-        return fetch_url_force(source, cache_dir).await;
+        return fetch_url_force(source, cache_dir, proxy_url).await;
     }
-    fetch_url_force(source, cache_dir).await
+    fetch_url_force(source, cache_dir, proxy_url).await
 }
 
 async fn conditional_get(
     source: &str,
     cache_dir: &Path,
     meta: &RawMeta,
+    proxy_url: Option<&str>,
 ) -> Result<Vec<u8>, SpallCliError> {
-    let client = reqwest::Client::new();
+    let client = crate::http::build_fetch_client(proxy_url)
+        .map_err(|e| SpallCliError::Network(e.to_string()))?;
     let mut req = client.get(source);
     if let Some(etag) = &meta.etag {
         req = req.header(reqwest::header::IF_NONE_MATCH, etag);
@@ -78,8 +80,9 @@ async fn conditional_get(
     }
 }
 
-async fn fetch_url_force(source: &str, cache_dir: &Path) -> Result<Vec<u8>, SpallCliError> {
-    let client = reqwest::Client::new();
+async fn fetch_url_force(source: &str, cache_dir: &Path, proxy_url: Option<&str>) -> Result<Vec<u8>, SpallCliError> {
+    let client = crate::http::build_fetch_client(proxy_url)
+        .map_err(|e| SpallCliError::Network(e.to_string()))?;
     match client.get(source).send().await {
         Ok(resp) if resp.status().is_success() => {
             let etag = extract_etag(&resp);

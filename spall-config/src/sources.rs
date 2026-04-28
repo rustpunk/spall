@@ -28,6 +28,13 @@ struct InlineApi {
 struct Defaults {
     output: Option<String>,
     color: Option<String>,
+    #[serde(default)]
+    proxy: Option<ProxyDefaults>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+struct ProxyDefaults {
+    url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -40,6 +47,8 @@ struct ApiToml {
     #[serde(default)]
     auth: Option<AuthConfig>,
     #[serde(default)]
+    proxy: Option<String>,
+    #[serde(default)]
     profile: HashMap<String, ProfileToml>,
 }
 
@@ -50,6 +59,8 @@ struct ProfileToml {
     headers: HashMap<String, String>,
     #[serde(default)]
     auth: Option<AuthConfig>,
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +108,7 @@ pub fn load_global_config() -> Result<GlobalConfig, SpallConfigError> {
             base_url: None,
             default_headers: Vec::new(),
             auth: None,
+            proxy: None,
             profiles: std::collections::HashMap::new(),
         })
         .collect();
@@ -106,6 +118,7 @@ pub fn load_global_config() -> Result<GlobalConfig, SpallConfigError> {
     let defaults = GlobalDefaults {
         output: cfg.defaults.as_ref().and_then(|d| d.output.clone()),
         color: cfg.defaults.as_ref().and_then(|d| d.color.clone()),
+        proxy: cfg.defaults.as_ref().and_then(|d| d.proxy.as_ref().and_then(|p| p.url.clone())),
     };
 
     Ok(GlobalConfig {
@@ -163,6 +176,7 @@ pub fn scan_api_configs() -> Result<Vec<ApiEntry>, SpallConfigError> {
                                 base_url: p.base_url,
                                 headers: p.headers.into_iter().collect(),
                                 auth: profile_auth,
+                                proxy: p.proxy,
                             },
                         )
                     })
@@ -175,6 +189,7 @@ pub fn scan_api_configs() -> Result<Vec<ApiEntry>, SpallConfigError> {
                     base_url: cfg.base_url,
                     default_headers: headers,
                     auth,
+                    proxy: cfg.proxy,
                     profiles,
                 });
             }
@@ -209,6 +224,7 @@ pub fn scan_spec_dirs(dirs: &[PathBuf]) -> Result<Vec<ApiEntry>, SpallConfigErro
                                 base_url: None,
                                 default_headers: Vec::new(),
                                 auth: None,
+                                proxy: None,
                                 profiles: std::collections::HashMap::new(),
                             });
                         }
@@ -241,4 +257,5 @@ pub struct GlobalConfig {
 pub struct GlobalDefaults {
     pub output: Option<String>,
     pub color: Option<String>,
+    pub proxy: Option<String>,
 }

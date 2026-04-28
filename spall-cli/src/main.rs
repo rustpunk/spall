@@ -1,5 +1,3 @@
-#![allow(unused_imports)]
-
 //! spall-cli: Binary entry point. Two-phase clap parse and dispatch.
 
 mod commands;
@@ -179,7 +177,8 @@ async fn handle_complete(
         .map(|d| d.join("spall"))
         .unwrap_or_else(|| spall_config::sources::config_dir().join("cache"));
 
-    let raw = match fetch::load_raw(&entry.source, &cache_dir).await {
+    let proxy = crate::http::resolve_env_proxy();
+    let raw = match fetch::load_raw(&entry.source, &cache_dir, proxy.as_deref()).await {
         Ok(b) => b,
         Err(_) => {
             if let Some(index) = spall_core::cache::load_cached_index(&entry.source, &cache_dir
@@ -234,7 +233,8 @@ async fn show_api_help(
     cache_dir: &std::path::Path,
 ) -> miette::Result<()> {
     let entry = registry.find(api_name).unwrap();
-    let raw = match fetch::load_raw(&entry.source, cache_dir).await {
+    let proxy = crate::http::resolve_env_proxy();
+    let raw = match fetch::load_raw(&entry.source, cache_dir, proxy.as_deref()).await {
         Ok(bytes) => bytes,
         Err(e) => {
             // Degraded help from cache
@@ -316,7 +316,13 @@ async fn handle_api_operation(
         .resolve_profile(api_name, profile)
         .ok_or_else(|| SpallCliError::Usage(format!("Unknown API: {}", api_name)))?;
 
-    let raw = fetch::load_raw(&entry.source, cache_dir)
+    let proxy = crate::http::resolve_proxy(
+        &entry,
+        &registry.defaults,
+        phase1_matches,
+        &clap::ArgMatches::default(),
+    );
+    let raw = fetch::load_raw(&entry.source, cache_dir, proxy.as_deref())
         .await
         .map_err(|e| SpallCliError::SpecLoadFailed {
             api: api_name.to_string(),
@@ -363,7 +369,7 @@ async fn handle_api_operation(
     // Phase 2 structure may be flat (single tag) or nested (multiple tags).
     // Try direct operation match first.
     if let Some(op) = spec.operations.iter().find(|o| o.operation_id == tag_or_op) {
-        return execute::execute_operation(op, &spec, &entry, op_matches, phase1_matches, cache_dir)
+        return execute::execute_operation(op, &spec, &entry, op_matches, phase1_matches, cache_dir, &registry.defaults)
             .await
             .map_err(Into::into);
     }
@@ -382,7 +388,7 @@ async fn handle_api_operation(
                 SpallCliError::Usage(format!("Unknown operation: {}", op_name))
             })?;
 
-        return execute::execute_operation(op, &spec, &entry, inner_matches, phase1_matches, cache_dir)
+        return execute::execute_operation(op, &spec, &entry, inner_matches, phase1_matches, cache_dir, &registry.defaults)
             .await
             .map_err(Into::into);
     }
@@ -585,6 +591,11 @@ fn spall_global_args() -> Vec<Arg> {
             .long("spall-ca-cert")
             .global(true)
             .help("Path to custom CA certificate"),
+        Arg::new("spall-no-proxy")
+            .long("spall-no-proxy")
+            .action(ArgAction::SetTrue)
+            .global(true)
+            .help("Disable proxy for this request"),
         Arg::new("spall-proxy")
             .long("spall-proxy")
             .global(true)

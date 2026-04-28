@@ -5,10 +5,7 @@ use reqwest::header::LINK;
 /// Probe a URL for an RFC 8631 `service-desc` Link header, fetch the spec,
 /// and return a suggested API name + spec URL.
 pub async fn probe(url: &str) -> Result<DiscoveredApi, crate::SpallCliError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
+    let client = crate::http::build_fetch_client(crate::http::resolve_env_proxy().as_deref())
         .map_err(|e| crate::SpallCliError::Network(e.to_string()))?;
 
     // 1. HEAD first, fall back to GET.

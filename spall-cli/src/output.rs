@@ -1,5 +1,3 @@
-#![allow(unused_imports)]
-
 //! Response formatting, TTY detection, and output modes.
 
 use is_terminal::IsTerminal;
@@ -128,7 +126,7 @@ pub fn emit_json_value(
             io::stdout().write_all(&raw)?;
         }
         OutputMode::Yaml => {
-            match serde_yaml::to_string(value) {
+            match spall_core::yaml::to_string(value) {
                 Ok(yaml) => {
                     io::stdout().write_all(yaml.as_bytes())?;
                 }
@@ -290,7 +288,7 @@ mod tests {
     #[test]
     fn yaml_roundtrip_from_json() {
         let value = serde_json::json!({"name": "test", "count": 42});
-        let yaml = serde_yaml::to_string(&value).unwrap();
+        let yaml = spall_core::yaml::to_string(&value).unwrap();
         assert!(yaml.contains("name: test"));
         assert!(yaml.contains("count: 42"));
     }

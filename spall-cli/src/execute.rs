@@ -30,6 +30,7 @@ pub async fn execute_operation(
     phase2_matches: &ArgMatches,
     phase1_matches: &ArgMatches,
     cache_dir: &std::path::Path,
+    defaults: &spall_config::sources::GlobalDefaults,
 ) -> Result<(), crate::SpallCliError> {
     let url = build_url(op, spec, entry, phase1_matches, phase2_matches)?;
 
@@ -110,7 +111,10 @@ pub async fn execute_operation(
 
     let start = Instant::now();
 
-    let http_config = crate::http::config_from_matches(phase1_matches, phase2_matches);
+    let mut http_config = crate::http::config_from_matches(phase1_matches, phase2_matches);
+    let resolved_proxy = crate::http::resolve_proxy(entry, defaults, phase1_matches, phase2_matches);
+    http_config.proxy = resolved_proxy;
+
     let client = crate::http::build_http_client(&http_config).map_err(|e| {
         crate::SpallCliError::HttpClient(e.to_string())
     })?;

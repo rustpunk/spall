@@ -20,7 +20,7 @@ pub fn load_spec_from_bytes(raw: &[u8], source: &str) -> Result<ResolvedSpec, Sp
             url: source.to_string(),
         })?
     } else {
-        match serde_saphyr::from_str::<openapiv3::OpenAPI>(&text) {
+        match crate::yaml::from_str::<openapiv3::OpenAPI>(&text) {
             Ok(o) => o,
             Err(e) => {
                 // JSON fallback: many "YAML" URLs actually serve JSON.

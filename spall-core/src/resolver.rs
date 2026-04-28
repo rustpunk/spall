@@ -7,7 +7,7 @@ use crate::ir::{
 use crate::value::SpallValue;
 use indexmap::IndexMap;
 use openapiv3::{
-    Components, Header, OpenAPI, Parameter, ReferenceOr, RequestBody, Response, Schema,
+    Header, OpenAPI, Parameter, ReferenceOr, RequestBody, Response, Schema,
     SecurityRequirement as OpenApiSecurityRequirement,
 };
 

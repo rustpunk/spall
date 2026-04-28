@@ -1,5 +1,5 @@
 use crate::extensions::CliExtensions;
-use crate::ir::{ParameterLocation, ResolvedOperation, ResolvedSpec, SpecIndex};
+use crate::ir::{ParameterLocation, ResolvedSpec, SpecIndex};
 use crate::value::SpallValue;
 use clap::{Arg, ArgAction, ArgGroup, Command};
 use indexmap::IndexMap;

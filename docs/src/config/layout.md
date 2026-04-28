@@ -40,8 +40,11 @@ spec_dirs = [
 ]
 
 [defaults]
-output = "json"    # json | yaml | table | raw
+output = "json"    # json | pretty | raw | yaml | table | csv
 color = "auto"     # auto | always | never
+
+[defaults.proxy]
+url = "http://proxy:8080"
 ```
 
 ## Per-API Config (`apis/{name}.toml`)
@@ -74,15 +77,16 @@ base_url = "https://petstore.io"
 |-------|------|-------------|
 | `source` | string | Spec file path or URL (required) |
 | `base_url` | string | Override the spec's server URL |
+| `proxy` | string | HTTP/SOCKS proxy URL for this API |
 | `auth` | table | Auth configuration (see [Authentication](../usage/authentication.md)) |
 | `default_headers` | table | Headers added to every request |
 | `profiles` | table | Named environment overlays |
 
-## Cache Files
+## Proxy
 
 Spall manages the `cache/` directory automatically. You should not need to edit these files directly.
 
-- **Raw cache** (`*.raw`, `*.raw-meta`) stores fetched spec bytes with TTL and ETag for conditional GET.
+- **Raw cache** (`*.raw`, `*.raw-meta`) stores fetched spec bytes with TTL and ETag for conditional GET. Proxy settings are respected during spec fetches.
 - **IR cache** (`*.ir`) stores the resolved spec in postcard format for instant reload.
 - **Index cache** (`*.idx`) stores a lightweight `SpecIndex` for degraded `--help` when the spec is unreachable.
 - **History** (`history.db`) is a SQLite database of recent requests.

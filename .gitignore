@@ -20,4 +20,5 @@ docs/internal/
 reserve/target/
 reserve/Cargo.lock
 
+docs/book/
 lancedb/docs/book/

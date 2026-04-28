@@ -1,5 +1,3 @@
-#![allow(unused_imports)]
-
 //! spall-core: OpenAPI spec loading, resolution, IR, and dynamic clap command building.
 
 pub mod cache;
@@ -11,3 +9,4 @@ pub mod loader;
 pub mod resolver;
 pub mod validator;
 pub mod value;
+pub mod yaml;
