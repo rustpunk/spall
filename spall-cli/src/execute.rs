@@ -88,7 +88,7 @@ pub async fn execute_operation(
         &entry.name,
         entry.auth.as_ref(),
         cli_auth.as_deref(),
-    );
+    )?;
     if let Some(a) = auth {
         crate::auth::apply(&a, &mut headers, &mut query_pairs);
     }

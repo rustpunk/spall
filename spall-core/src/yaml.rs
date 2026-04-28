@@ -6,7 +6,7 @@
 //!
 //! 1. **Bus-factor mitigation.** `serde-saphyr` is pre-1.0. If we ever need
 //!    to fork or replace it, this file is the only thing that changes.
-//! 2. **DoS-defense chokepoint.** A single [`Budget`] keeps depth / size /
+//! 2. **DoS-defense chokepoint.** A single `Budget` keeps depth / size /
 //!    alias-expansion limits aligned with the threat model. Tightening the
 //!    limits is a one-file edit.
 

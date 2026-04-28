@@ -47,9 +47,17 @@ pub struct AuthConfig {
     /// Environment variable name for the token / credential.
     pub token_env: Option<String>,
 
-    /// URL-style secret reference (reserved for `hasp` integration).
+    /// URL-style secret reference via `hasp`.
     /// e.g. `keyring://spall/github-token`
     pub token_url: Option<String>,
+
+    /// URL-style secret reference for the password in Basic auth via `hasp`.
+    /// e.g. `keyring://spall/my-api-password`
+    pub password_url: Option<String>,
+
+    /// URL-style secret reference for the OAuth2 client secret via `hasp`.
+    /// e.g. `env://SPALL_CLIENT_SECRET`
+    pub client_secret_url: Option<String>,
 
     // API key specific fields
     /// `"header"` or `"query"`.

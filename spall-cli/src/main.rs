@@ -65,6 +65,9 @@ If this API requires a VPN, ensure you're connected."))]
 
     #[error("Validation failed")]
     ValidationFailed,
+
+    #[error("Auth resolution failed for '{api}': {message}")]
+    AuthResolution { api: String, message: String },
 }
 
 impl SpallCliError {
@@ -79,6 +82,7 @@ impl SpallCliError {
             SpallCliError::Http4xx(_) => EXIT_HTTP_4XX,
             SpallCliError::Http5xx(_) => EXIT_HTTP_5XX,
             SpallCliError::ValidationFailed => EXIT_VALIDATION,
+            SpallCliError::AuthResolution { .. } => EXIT_USAGE,
         }
     }
 }

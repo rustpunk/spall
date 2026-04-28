@@ -13,90 +13,115 @@ use spall_config::auth::{ApiKeyLocation, AuthConfig, AuthKind, ResolvedAuth};
 ///
 /// 1. `--spall-auth` CLI override
 /// 2. `auth.token` inline in per-API TOML (warn on use)
-/// 3. `auth.token_url` (`keyring://` / `env://`) — stub, gated on `hasp` feature
-/// 4. `auth.token_env` env var override
-/// 5. Global `SPALL_<API>_TOKEN` env var (Wave 1–2 compat)
-/// 6. OAuth2 interactive flow — session token only (stub)
-/// 7. Interactive password prompt for Basic
-#[must_use]
+/// 3. `auth.token_url` (`keyring://` / `env://`) — requires `hasp` feature
+/// 4. `auth.password_url` for Basic auth — requires `hasp` feature
+/// 5. `auth.token_env` env var override
+/// 6. Global `SPALL_<API>_TOKEN` env var (Wave 1–2 compat)
+/// 7. OAuth2 interactive flow — session token only (stub)
+/// 8. Interactive password prompt for Basic
 pub fn resolve(
     api_name: &str,
     auth_config: Option<&AuthConfig>,
     cli_auth: Option<&str>,
-) -> Option<ResolvedAuth> {
+) -> Result<Option<ResolvedAuth>, crate::SpallCliError> {
     // 1. CLI override.
     if let Some(raw) = cli_auth {
-        return Some(parse_cli_auth(raw));
+        return Ok(Some(parse_cli_auth(raw)));
     }
 
-    let cfg = auth_config?;
+    let cfg = match auth_config {
+        Some(c) => c,
+        None => return Ok(None),
+    };
     let kind = cfg.kind.unwrap_or(AuthKind::Bearer);
 
     // 2. Inline token (warn on use).
     if let Some(token) = &cfg.token {
         eprintln!("Warning: inline auth token in config is insecure. Use an env var or keyring instead.");
-        return resolve_from_config_and_token(cfg, kind, token);
+        return Ok(resolve_from_config_and_token(cfg, kind, token));
     }
 
     // 3. token_url (keyring:// / env://) — requires `hasp`.
     #[cfg(feature = "hasp")]
     if let Some(url) = &cfg.token_url {
-        // TODO(hasp): resolve via hasp::get(url)
-        let _ = url;
+        let secret = hasp::get(url).map_err(|e| map_hasp_error(api_name, e))?;
+        return Ok(resolve_from_config_and_token(cfg, kind, secret.expose_secret()));
     }
 
-    // 4. Basic password_env takes precedence over generic token_env.
+    // 4. Basic password_url takes precedence over password_env.
+    #[cfg(feature = "hasp")]
+    if kind == AuthKind::Basic {
+        if let Some(url) = &cfg.password_url {
+            let password = hasp::get(url).map_err(|e| map_hasp_error(api_name, e))?;
+            if let Some(username) = &cfg.username {
+                return Ok(Some(ResolvedAuth::Basic {
+                    username: username.clone(),
+                    password,
+                }));
+            }
+        }
+    }
+
+    // 5. Basic password_env takes precedence over generic token_env.
     if kind == AuthKind::Basic {
         if let Some(env_name) = &cfg.password_env {
             if let Ok(password) = std::env::var(env_name) {
                 if !password.is_empty() {
                     if let Some(username) = &cfg.username {
-                        return Some(ResolvedAuth::Basic {
+                        return Ok(Some(ResolvedAuth::Basic {
                             username: username.clone(),
                             password: SecretString::new(password.into()),
-                        });
+                        }));
                     }
                 }
             }
         }
     }
 
-    // 5. token_env.
+    // 6. token_env.
     if let Some(env_name) = &cfg.token_env {
         if let Ok(token) = std::env::var(env_name) {
             if !token.is_empty() {
-                return resolve_from_config_and_token(cfg, kind, &token);
+                return Ok(resolve_from_config_and_token(cfg, kind, &token));
             }
         }
     }
 
-    // 6. Global SPALL_<API>_TOKEN.
+    // 7. Global SPALL_<API>_TOKEN.
     let default_env = spall_config::auth::default_token_env(api_name);
     if let Ok(token) = std::env::var(&default_env) {
         if !token.is_empty() {
-            return resolve_from_config_and_token(cfg, kind, &token);
+            return Ok(resolve_from_config_and_token(cfg, kind, &token));
         }
     }
 
-    // 7. OAuth2 session token (stub — no session persistence yet).
+    // 8. OAuth2 client_secret_url (future-proofing; full PKCE flow not yet implemented).
+    #[cfg(feature = "hasp")]
     if kind == AuthKind::OAuth2 {
-        return None;
+        if let Some(_url) = &cfg.client_secret_url {
+            // TODO(Wave 3+): integrate into full OAuth2 PKCE flow.
+        }
     }
 
-    // 8. Interactive password prompt for Basic.
+    // 9. OAuth2 session token (stub — no session persistence yet).
+    if kind == AuthKind::OAuth2 {
+        return Ok(None);
+    }
+
+    // 9. Interactive password prompt for Basic.
     if kind == AuthKind::Basic {
         if let Some(username) = &cfg.username {
             eprint!("Password for {} (Basic auth): ", username);
             if let Ok(password) = rpassword::read_password() {
-                return Some(ResolvedAuth::Basic {
+                return Ok(Some(ResolvedAuth::Basic {
                     username: username.clone(),
                     password: SecretString::new(password.into()),
-                });
+                }));
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Apply a resolved auth value to the request.
@@ -125,6 +150,15 @@ pub fn apply(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Map a `hasp::Error` into a `SpallCliError`.
+#[cfg(feature = "hasp")]
+fn map_hasp_error(api_name: &str, e: hasp::Error) -> crate::SpallCliError {
+    crate::SpallCliError::AuthResolution {
+        api: api_name.to_string(),
+        message: e.to_string(),
+    }
+}
 
 fn parse_cli_auth(raw: &str) -> ResolvedAuth {
     if let Some(token) = raw.strip_prefix("Bearer ") {
@@ -220,5 +254,86 @@ fn resolve_from_config_and_token(
         AuthKind::OAuth2 => {
             Some(ResolvedAuth::OAuth2(SecretString::new(token.to_string().into())))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_override_bearer() {
+        let cfg = AuthConfig {
+            kind: Some(AuthKind::Bearer),
+            ..Default::default()
+        };
+        let result = resolve("test", Some(&cfg), Some("Bearer abc123")).unwrap();
+        assert!(matches!(
+            result,
+            Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "abc123"
+        ));
+    }
+
+    #[test]
+    fn cli_override_basic_shorthand() {
+        let cfg = AuthConfig {
+            kind: Some(AuthKind::Basic),
+            ..Default::default()
+        };
+        let result = resolve("test", Some(&cfg), Some("alice:secret")).unwrap();
+        assert!(
+            matches!(
+                result,
+                Some(ResolvedAuth::Basic { ref username, ref password })
+                if username == "alice" && password.expose_secret() == "secret"
+            )
+        );
+    }
+
+    #[test]
+    fn inline_token_warns_and_resolves() {
+        let cfg = AuthConfig {
+            kind: Some(AuthKind::Bearer),
+            token: Some("tkn".to_string()),
+            ..Default::default()
+        };
+        let result = resolve("test", Some(&cfg), None).unwrap();
+        assert!(matches!(
+            result,
+            Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "tkn"
+        ));
+    }
+
+    #[test]
+    fn token_env_resolves() {
+        let var = "SPALL_AUTH_TEST_TOKEN";
+        std::env::set_var(var, "env-tkn");
+        let cfg = AuthConfig {
+            kind: Some(AuthKind::Bearer),
+            token_env: Some(var.to_string()),
+            ..Default::default()
+        };
+        let result = resolve("test", Some(&cfg), None).unwrap();
+        assert!(matches!(
+            result,
+            Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "env-tkn"
+        ));
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn no_auth_config_returns_none() {
+        let result = resolve("test", None, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[cfg(feature = "hasp")]
+    #[test]
+    fn map_hasp_error_produces_auth_resolution() {
+        let err = hasp::Error::NotFound("env://MISSING".to_string());
+        let mapped = super::map_hasp_error("github", err);
+        let msg = format!("{}", mapped);
+        assert!(msg.contains("github"));
+        assert!(msg.contains("not found"));
     }
 }

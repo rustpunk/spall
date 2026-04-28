@@ -32,13 +32,25 @@ jmespath = "0.5"
 chrono = "0.4"
 base64 = "0.22"
 rpassword = "7"
+hasp = { path = "../../hasp/crates/hasp", default-features = false, features = ["env", "keyring", "file"], optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
 
 [features]
-hasp = []
+default = ["hasp"]
+hasp = ["dep:hasp"]
+hasp-full = [
+    "hasp",
+    "hasp/aws-sm",
+    "hasp/aws-ssm",
+    "hasp/vault",
+    "hasp/op",
+    "hasp/bw",
+    "hasp/gcp-sm",
+    "hasp/azure-kv",
+]
 
 [lints.rust]
 unused = "allow"

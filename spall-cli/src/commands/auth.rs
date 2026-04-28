@@ -23,7 +23,7 @@ async fn handle_status(matches: &ArgMatches) -> Result<()> {
         .find(api_name)
         .ok_or_else(|| crate::SpallCliError::Usage(format!("Unknown API: {}", api_name)))?;
 
-    let resolved = crate::auth::resolve(api_name, entry.auth.as_ref(), None);
+    let resolved = crate::auth::resolve(api_name, entry.auth.as_ref(), None)?;
 
     if let Some(auth) = resolved {
         eprintln!("Auth for '{}': kind = {}", api_name, auth.kind_label());

@@ -57,7 +57,7 @@ base_url = "https://staging.petstore.io"
 
 [auth]
 kind = "Bearer"
-token_env = "PETSTORE_TOKEN"
+token_url = "env://PETSTORE_TOKEN"
 
 [default_headers]
 X-Client = "spall-cli"
@@ -71,6 +71,8 @@ base_url = "https://staging.petstore.io"
 base_url = "https://petstore.io"
 ```
 
+The `auth` table supports inline tokens, environment variables, and `hasp` secret URLs (`env://`, `file://`, `keyring://`). See [Authentication](../usage/authentication.md) for the full priority chain and URL scheme reference.
+
 ### Per-API fields
 
 | Field | Type | Description |
@@ -78,7 +80,7 @@ base_url = "https://petstore.io"
 | `source` | string | Spec file path or URL (required) |
 | `base_url` | string | Override the spec's server URL |
 | `proxy` | string | HTTP/SOCKS proxy URL for this API |
-| `auth` | table | Auth configuration (see [Authentication](../usage/authentication.md)) |
+| `auth` | table | Auth configuration (tokens, env vars, `hasp` secret URLs) |
 | `default_headers` | table | Headers added to every request |
 | `profiles` | table | Named environment overlays |
 
