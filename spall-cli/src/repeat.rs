@@ -90,9 +90,9 @@ pub async fn replay(
     eprintln!("HTTP {} — {} bytes in {:?}", status, body.len(), duration);
 
     if status.is_client_error() {
-        std::process::exit(crate::EXIT_HTTP_4XX);
+        return Err(crate::SpallCliError::Http4xx(status.as_u16()));
     } else if status.is_server_error() {
-        std::process::exit(crate::EXIT_HTTP_5XX);
+        return Err(crate::SpallCliError::Http5xx(status.as_u16()));
     }
 
     Ok(())

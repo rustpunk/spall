@@ -286,23 +286,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn yaml_roundtrip_from_json() {
+    fn yaml_roundtrip_from_json() -> Result<(), String> {
         let value = serde_json::json!({"name": "test", "count": 42});
-        let yaml = spall_core::yaml::to_string(&value).unwrap();
+        let yaml = spall_core::yaml::to_string(&value)?;
         assert!(yaml.contains("name: test"));
         assert!(yaml.contains("count: 42"));
+        Ok(())
     }
 
     #[test]
-    fn table_mode_non_array_fallback() {
+    fn table_mode_non_array_fallback() -> io::Result<()> {
         let value = serde_json::json!("hello");
         // Should not panic; falls back internally.
-        print_table(&value).unwrap();
+        print_table(&value)?;
+        Ok(())
     }
 
     #[test]
-    fn csv_mode_non_array_fallback() {
+    fn csv_mode_non_array_fallback() -> io::Result<()> {
         let value = serde_json::json!("hello");
-        print_csv(&value).unwrap();
+        print_csv(&value)?;
+        Ok(())
     }
 }

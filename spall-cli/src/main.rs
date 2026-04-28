@@ -56,6 +56,15 @@ If this API requires a VPN, ensure you're connected."))]
 
     #[error("HTTP client error: {0}")]
     HttpClient(String),
+
+    #[error("HTTP {0} client error")]
+    Http4xx(u16),
+
+    #[error("HTTP {0} server error")]
+    Http5xx(u16),
+
+    #[error("Validation failed")]
+    ValidationFailed,
 }
 
 impl SpallCliError {
@@ -67,6 +76,9 @@ impl SpallCliError {
             SpallCliError::Network(_) => EXIT_NETWORK,
             SpallCliError::Cache(_) => EXIT_USAGE,
             SpallCliError::HttpClient(_) => EXIT_NETWORK,
+            SpallCliError::Http4xx(_) => EXIT_HTTP_4XX,
+            SpallCliError::Http5xx(_) => EXIT_HTTP_5XX,
+            SpallCliError::ValidationFailed => EXIT_VALIDATION,
         }
     }
 }

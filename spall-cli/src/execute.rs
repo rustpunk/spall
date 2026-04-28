@@ -106,7 +106,7 @@ pub async fn execute_operation(
     if let Err(errors) = crate::validate::preflight_validate(op, phase2_matches) {
         eprintln!("Validation failed:");
         eprintln!("{}", crate::validate::format_errors(&errors));
-        std::process::exit(crate::EXIT_VALIDATION);
+        return Err(crate::SpallCliError::ValidationFailed);
     }
 
     let start = Instant::now();
@@ -180,9 +180,9 @@ pub async fn execute_operation(
                 crate::output::emit_response(&body_bytes, mode, save_path)
                     .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
                 if status.is_client_error() {
-                    std::process::exit(crate::EXIT_HTTP_4XX);
+                    return Err(crate::SpallCliError::Http4xx(status.as_u16()));
                 } else {
-                    std::process::exit(crate::EXIT_HTTP_5XX);
+                    return Err(crate::SpallCliError::Http5xx(status.as_u16()));
                 }
             }
 
@@ -314,9 +314,9 @@ pub async fn execute_operation(
         }
 
         if status.is_client_error() {
-            std::process::exit(crate::EXIT_HTTP_4XX);
+            return Err(crate::SpallCliError::Http4xx(status.as_u16()));
         } else if status.is_server_error() {
-            std::process::exit(crate::EXIT_HTTP_5XX);
+            return Err(crate::SpallCliError::Http5xx(status.as_u16()));
         }
     }
 
