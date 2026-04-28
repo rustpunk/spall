@@ -32,7 +32,7 @@ jmespath = "0.5"
 chrono = "0.4"
 base64 = "0.22"
 rpassword = "7"
-hasp = { path = "../../hasp/crates/hasp", default-features = false, features = ["env", "keyring", "file"], optional = true }
+hasp = { git = "https://github.com/rustpunk/hasp", default-features = false, features = ["env", "keyring", "file"], optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"
