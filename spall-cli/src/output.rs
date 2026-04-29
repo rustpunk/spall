@@ -1,11 +1,11 @@
 //! Response formatting, TTY detection, and output modes.
 
 use is_terminal::IsTerminal;
+use std::io::{self, Write};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
-use std::io::{self, Write};
 
 /// Output mode for formatting responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +47,7 @@ impl OutputMode {
 }
 
 /// Write response body to stdout or a file.
-pub fn emit_response(
-    body: &[u8],
-    mode: OutputMode,
-    save_path: Option<&str>,
-) -> io::Result<()> {
+pub fn emit_response(body: &[u8], mode: OutputMode, save_path: Option<&str>) -> io::Result<()> {
     if let Some(path) = save_path {
         std::fs::write(path, body)?;
         eprintln!("Response saved to {}", path);
@@ -65,8 +61,10 @@ pub fn emit_response(
                 return emit_json_value(&value, mode, save_path);
             }
             // Fall back: if not valid JSON, warn and stream raw.
-            eprintln!("Warning: expected JSON for {} output, got non-JSON body. Falling back to raw.",
-                mode_name(mode));
+            eprintln!(
+                "Warning: expected JSON for {} output, got non-JSON body. Falling back to raw.",
+                mode_name(mode)
+            );
             io::stdout().write_all(body)?;
             return Ok(());
         }
@@ -131,19 +129,20 @@ pub fn emit_json_value(
             let raw = serde_json::to_vec(value).unwrap_or_default();
             io::stdout().write_all(&raw)?;
         }
-        OutputMode::Yaml => {
-            match spall_core::yaml::to_string(value) {
-                Ok(yaml) => {
-                    io::stdout().write_all(yaml.as_bytes())?;
-                }
-                Err(e) => {
-                    eprintln!("Warning: YAML serialization failed ({}). Falling back to pretty JSON.", e);
-                    let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
-                    io::stdout().write_all(pretty.as_bytes())?;
-                    io::stdout().write_all(b"\n")?;
-                }
+        OutputMode::Yaml => match spall_core::yaml::to_string(value) {
+            Ok(yaml) => {
+                io::stdout().write_all(yaml.as_bytes())?;
             }
-        }
+            Err(e) => {
+                eprintln!(
+                    "Warning: YAML serialization failed ({}). Falling back to pretty JSON.",
+                    e
+                );
+                let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
+                io::stdout().write_all(pretty.as_bytes())?;
+                io::stdout().write_all(b"\n")?;
+            }
+        },
         OutputMode::Table => {
             print_table(value)?;
         }
@@ -299,12 +298,10 @@ fn print_csv(value: &serde_json::Value) -> io::Result<()> {
         if let Some(obj) = row.as_object() {
             let record: Vec<String> = headers
                 .iter()
-                .map(|key| {
-                    match obj.get(key) {
-                        Some(serde_json::Value::String(s)) => s.clone(),
-                        Some(v) => v.to_string(),
-                        None => String::new(),
-                    }
+                .map(|key| match obj.get(key) {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(v) => v.to_string(),
+                    None => String::new(),
                 })
                 .collect();
             writer.write_record(&record)?;

@@ -110,7 +110,10 @@ mod tests {
     fn budget_rejects_deep_nesting() {
         let yaml = format!("{}1{}\n", "[".repeat(400), "]".repeat(400));
         let res: Result<serde_json::Value, _> = from_str(&yaml);
-        assert!(res.is_err(), "expected budget error on 400-level flow nesting");
+        assert!(
+            res.is_err(),
+            "expected budget error on 400-level flow nesting"
+        );
     }
 
     #[test]
@@ -133,7 +136,10 @@ g: &g [*f,*f,*f,*f,*f,*f,*f,*f,*f,*f]
 h: &h [*g,*g,*g,*g,*g,*g,*g,*g,*g,*g]
 "#;
         let res: Result<serde_json::Value, _> = from_str(yaml);
-        assert!(res.is_err(), "expected budget error on billion-laughs alias bomb");
+        assert!(
+            res.is_err(),
+            "expected budget error on billion-laughs alias bomb"
+        );
     }
 
     #[test]

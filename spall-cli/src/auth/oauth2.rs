@@ -17,7 +17,10 @@ pub async fn fetch_client_credentials(
     client_id: &str,
     client_secret: Option<&str>,
 ) -> Result<SecretString, crate::SpallCliError> {
-    let mut params = vec![("grant_type", "client_credentials"), ("client_id", client_id)];
+    let mut params = vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", client_id),
+    ];
     if let Some(secret) = client_secret {
         params.push(("client_secret", secret));
     }
@@ -32,11 +35,16 @@ pub async fn fetch_client_credentials(
         .map_err(|e| crate::SpallCliError::Network(e.to_string()))?;
     let resp = client
         .post(token_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
         .body(body)
         .send()
         .await
-        .map_err(|e| crate::SpallCliError::Network(format!("OAuth2 token request failed: {}", e)))?;
+        .map_err(|e| {
+            crate::SpallCliError::Network(format!("OAuth2 token request failed: {}", e))
+        })?;
 
     if !resp.status().is_success() {
         return Err(crate::SpallCliError::Network(format!(
@@ -49,9 +57,9 @@ pub async fn fetch_client_credentials(
         crate::SpallCliError::Network(format!("Failed to parse OAuth2 token response: {}", e))
     })?;
 
-    let token = json["access_token"]
-        .as_str()
-        .ok_or_else(|| crate::SpallCliError::Usage("OAuth2 response missing access_token".to_string()))?;
+    let token = json["access_token"].as_str().ok_or_else(|| {
+        crate::SpallCliError::Usage("OAuth2 response missing access_token".to_string())
+    })?;
 
     Ok(SecretString::new(token.to_string().into()))
 }

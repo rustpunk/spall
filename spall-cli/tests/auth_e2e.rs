@@ -6,8 +6,7 @@ use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 fn minimal_spec(port: u16) -> String {
@@ -195,10 +194,7 @@ async fn cli_auth_override_bearer() {
     std::fs::write(&spec_path, &spec).unwrap();
 
     setup_api(
-        &temp,
-        "testapi",
-        &spec_path,
-        "", // no auth config
+        &temp, "testapi", &spec_path, "", // no auth config
     );
 
     wiremock::Mock::given(method("GET"))

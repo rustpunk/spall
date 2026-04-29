@@ -15,7 +15,9 @@ pub async fn replay(
         Some(id) => history
             .get(id)
             .map_err(|e| crate::SpallCliError::Usage(format!("History DB error: {}", e)))?
-            .ok_or_else(|| crate::SpallCliError::Usage(format!("No history entry with ID {}", id)))?,
+            .ok_or_else(|| {
+                crate::SpallCliError::Usage(format!("No history entry with ID {}", id))
+            })?,
         None => {
             let rows = history
                 .list(1)

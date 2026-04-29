@@ -2,12 +2,11 @@
 
 use std::process::Command;
 use tempfile::TempDir;
-use wiremock::{MockServer, ResponseTemplate};
 use wiremock::matchers::{method, path};
+use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 fn minimal_spec(port: u16) -> String {
@@ -48,16 +47,19 @@ async fn url_spec_is_fetched_and_api_works() {
 
     wiremock::Mock::given(method("GET"))
         .and(path("/openapi.json"))
-        .respond_with(ResponseTemplate::new(200)
-            .set_body_string(&spec)
-            .insert_header("content-type", "application/json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(&spec)
+                .insert_header("content-type", "application/json"),
+        )
         .mount(&mock)
         .await;
 
     wiremock::Mock::given(method("GET"))
         .and(path("/items"))
-        .respond_with(ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!({"items": [1, 2, 3]})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": [1, 2, 3]})),
+        )
         .mount(&mock)
         .await;
 
@@ -74,7 +76,13 @@ async fn url_spec_is_fetched_and_api_works() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "expected success. stdout: {}\nstderr: {}", stdout, stderr
+        "expected success. stdout: {}\nstderr: {}",
+        stdout,
+        stderr
     );
-    assert!(stdout.contains("items"), "expected 'items' in output, got: {}", stdout);
+    assert!(
+        stdout.contains("items"),
+        "expected 'items' in output, got: {}",
+        stdout
+    );
 }

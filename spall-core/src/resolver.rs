@@ -104,16 +104,9 @@ pub fn resolve_spec(raw: &OpenAPI, _source: &str) -> Result<ResolvedSpec, SpallC
                     .collect()
             };
 
-            let security = resolve_security(
-                raw.security.as_deref(),
-                op.security.as_deref(),
-            );
+            let security = resolve_security(raw.security.as_deref(), op.security.as_deref());
 
-            let parameters = merge_parameters(
-                &path_params,
-                &op.parameters,
-                raw,
-            )?;
+            let parameters = merge_parameters(&path_params, &op.parameters, raw)?;
 
             let request_body = op
                 .request_body
@@ -139,7 +132,8 @@ pub fn resolve_spec(raw: &OpenAPI, _source: &str) -> Result<ResolvedSpec, SpallC
                 responses,
                 security,
                 tags: op.tags.clone(),
-                extensions: op.extensions
+                extensions: op
+                    .extensions
                     .iter()
                     .map(|(k, v)| (k.clone(), SpallValue::from(v)))
                     .collect(),
@@ -188,17 +182,30 @@ fn resolve_one_parameter(
     spec: &OpenAPI,
 ) -> Result<ResolvedParameter, SpallCoreError> {
     let p = match p_ref {
-        ReferenceOr::Reference { reference } => {
-            resolve_parameter_ref(reference, spec)?.ok_or_else(|| SpallCoreError::UnresolvedRef {
+        ReferenceOr::Reference { reference } => resolve_parameter_ref(reference, spec)?
+            .ok_or_else(|| SpallCoreError::UnresolvedRef {
                 path: reference.clone(),
                 context: "parameter".to_string(),
-            })?
-        }
+            })?,
         ReferenceOr::Item(item) => item.clone(),
     };
 
-    let (location, name, required, deprecated, description, style_str, explode, schema_ref, extensions) = match &p {
-        Parameter::Query { parameter_data, style, .. } => (
+    let (
+        location,
+        name,
+        required,
+        deprecated,
+        description,
+        style_str,
+        explode,
+        schema_ref,
+        extensions,
+    ) = match &p {
+        Parameter::Query {
+            parameter_data,
+            style,
+            ..
+        } => (
             ParameterLocation::Query,
             &parameter_data.name,
             parameter_data.required,
@@ -207,12 +214,17 @@ fn resolve_one_parameter(
             serde_json::to_string(style).unwrap_or_else(|_| "\"form\"".to_string()),
             parameter_data.explode.unwrap_or(true),
             extract_schema_ref(&parameter_data.format),
-            parameter_data.extensions
+            parameter_data
+                .extensions
                 .iter()
                 .map(|(k, v)| (k.clone(), SpallValue::from(v)))
                 .collect(),
         ),
-        Parameter::Header { parameter_data, style, .. } => (
+        Parameter::Header {
+            parameter_data,
+            style,
+            ..
+        } => (
             ParameterLocation::Header,
             &parameter_data.name,
             parameter_data.required,
@@ -221,12 +233,17 @@ fn resolve_one_parameter(
             serde_json::to_string(style).unwrap_or_else(|_| "\"simple\"".to_string()),
             parameter_data.explode.unwrap_or(false),
             extract_schema_ref(&parameter_data.format),
-            parameter_data.extensions
+            parameter_data
+                .extensions
                 .iter()
                 .map(|(k, v)| (k.clone(), SpallValue::from(v)))
                 .collect(),
         ),
-        Parameter::Path { parameter_data, style, .. } => (
+        Parameter::Path {
+            parameter_data,
+            style,
+            ..
+        } => (
             ParameterLocation::Path,
             &parameter_data.name,
             true, // path params are always required
@@ -235,12 +252,17 @@ fn resolve_one_parameter(
             serde_json::to_string(style).unwrap_or_else(|_| "\"simple\"".to_string()),
             parameter_data.explode.unwrap_or(false),
             extract_schema_ref(&parameter_data.format),
-            parameter_data.extensions
+            parameter_data
+                .extensions
                 .iter()
                 .map(|(k, v)| (k.clone(), SpallValue::from(v)))
                 .collect(),
         ),
-        Parameter::Cookie { parameter_data, style, .. } => (
+        Parameter::Cookie {
+            parameter_data,
+            style,
+            ..
+        } => (
             ParameterLocation::Cookie,
             &parameter_data.name,
             parameter_data.required,
@@ -249,7 +271,8 @@ fn resolve_one_parameter(
             serde_json::to_string(style).unwrap_or_else(|_| "\"form\"".to_string()),
             parameter_data.explode.unwrap_or(false),
             extract_schema_ref(&parameter_data.format),
-            parameter_data.extensions
+            parameter_data
+                .extensions
                 .iter()
                 .map(|(k, v)| (k.clone(), SpallValue::from(v)))
                 .collect(),
@@ -303,9 +326,7 @@ fn resolve_one_parameter(
     })
 }
 
-fn extract_schema_ref(
-    fmt: &openapiv3::ParameterSchemaOrContent,
-) -> Option<&ReferenceOr<Schema>> {
+fn extract_schema_ref(fmt: &openapiv3::ParameterSchemaOrContent) -> Option<&ReferenceOr<Schema>> {
     match fmt {
         openapiv3::ParameterSchemaOrContent::Schema(s_ref) => Some(s_ref),
         openapiv3::ParameterSchemaOrContent::Content(_) => None,
@@ -536,11 +557,8 @@ pub fn resolve_schema(
                 None => true,
             };
             for (prop_name, prop_ref) in &o.properties {
-                let resolved = resolve_schema(&deref_boxed_ref(prop_ref),
-                    spec,
-                    visited,
-                    depth + 1,
-                )?;
+                let resolved =
+                    resolve_schema(&deref_boxed_ref(prop_ref), spec, visited, depth + 1)?;
                 properties.insert(prop_name.clone(), resolved);
             }
         }
@@ -562,12 +580,8 @@ pub fn resolve_schema(
                 None => true,
             };
             for (prop_name, prop_ref) in &any.properties {
-                let resolved = resolve_schema(
-                    &deref_boxed_ref(prop_ref),
-                    spec,
-                    visited,
-                    depth + 1,
-                )?;
+                let resolved =
+                    resolve_schema(&deref_boxed_ref(prop_ref), spec, visited, depth + 1)?;
                 properties.insert(prop_name.clone(), resolved);
             }
             if let Some(ref item_ref) = &any.items {
@@ -662,15 +676,12 @@ fn resolve_media_type(
                 (
                     k.clone(),
                     match v {
-                        ReferenceOr::Reference { reference } => {
-                            SpallValue::Str(reference.clone())
-                        }
-                        ReferenceOr::Item(ex) => {
-                            ex.value
-                                .as_ref()
-                                .map(SpallValue::from)
-                                .unwrap_or(SpallValue::Null)
-                        }
+                        ReferenceOr::Reference { reference } => SpallValue::Str(reference.clone()),
+                        ReferenceOr::Item(ex) => ex
+                            .value
+                            .as_ref()
+                            .map(SpallValue::from)
+                            .unwrap_or(SpallValue::Null),
                     },
                 )
             })
@@ -678,10 +689,7 @@ fn resolve_media_type(
     })
 }
 
-fn resolve_response(
-    resp: Response,
-    spec: &OpenAPI,
-) -> Result<ResolvedResponse, SpallCoreError> {
+fn resolve_response(resp: Response, spec: &OpenAPI) -> Result<ResolvedResponse, SpallCoreError> {
     let mut content = IndexMap::new();
     for (ct, mt) in resp.content {
         content.insert(ct, resolve_media_type(&mt, spec)?);
@@ -750,10 +758,7 @@ fn resolve_response(
 // Concrete $ref resolution helpers
 // ---------------------------------------------------------------------------
 
-fn resolve_schema_ref(
-    path: &str,
-    spec: &OpenAPI,
-) -> Result<Option<Schema>, SpallCoreError> {
+fn resolve_schema_ref(path: &str, spec: &OpenAPI) -> Result<Option<Schema>, SpallCoreError> {
     let components = match spec.components.as_ref() {
         Some(c) => c,
         None => return Ok(None),
@@ -769,10 +774,7 @@ fn resolve_schema_ref(
     }
 }
 
-fn resolve_parameter_ref(
-    path: &str,
-    spec: &OpenAPI,
-) -> Result<Option<Parameter>, SpallCoreError> {
+fn resolve_parameter_ref(path: &str, spec: &OpenAPI) -> Result<Option<Parameter>, SpallCoreError> {
     let components = match spec.components.as_ref() {
         Some(c) => c,
         None => return Ok(None),

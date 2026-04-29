@@ -37,7 +37,9 @@ pub fn resolve(
 
     // 2. Inline token (warn on use).
     if let Some(token) = &cfg.token {
-        eprintln!("Warning: inline auth token in config is insecure. Use an env var or keyring instead.");
+        eprintln!(
+            "Warning: inline auth token in config is insecure. Use an env var or keyring instead."
+        );
         return Ok(resolve_from_config_and_token(cfg, kind, token));
     }
 
@@ -45,7 +47,11 @@ pub fn resolve(
     #[cfg(feature = "hasp")]
     if let Some(url) = &cfg.token_url {
         let secret = hasp::get(url).map_err(|e| map_hasp_error(api_name, e))?;
-        return Ok(resolve_from_config_and_token(cfg, kind, secret.expose_secret()));
+        return Ok(resolve_from_config_and_token(
+            cfg,
+            kind,
+            secret.expose_secret(),
+        ));
     }
 
     // 4. Basic password_url takes precedence over password_env.
@@ -134,7 +140,10 @@ pub fn apply(
         ResolvedAuth::Bearer(token) => bearer::apply(token, headers),
         ResolvedAuth::ApiKey { key, location } => {
             apikey::apply(
-                &apikey::ApiKeyConfig { key: key.clone(), location: location.clone() },
+                &apikey::ApiKeyConfig {
+                    key: key.clone(),
+                    location: location.clone(),
+                },
                 headers,
                 query_pairs,
             );
@@ -206,7 +215,9 @@ fn resolve_from_config_and_token(
     token: &str,
 ) -> Option<ResolvedAuth> {
     match kind {
-        AuthKind::Bearer => Some(ResolvedAuth::Bearer(SecretString::new(token.to_string().into()))),
+        AuthKind::Bearer => Some(ResolvedAuth::Bearer(SecretString::new(
+            token.to_string().into(),
+        ))),
         AuthKind::ApiKey => {
             let location = match cfg.location.as_deref() {
                 Some("query") => ApiKeyLocation::Query {
@@ -248,12 +259,14 @@ fn resolve_from_config_and_token(
                 })
             } else {
                 // Can't resolve Basic without username — fall back to Bearer.
-                Some(ResolvedAuth::Bearer(SecretString::new(token.to_string().into())))
+                Some(ResolvedAuth::Bearer(SecretString::new(
+                    token.to_string().into(),
+                )))
             }
         }
-        AuthKind::OAuth2 => {
-            Some(ResolvedAuth::OAuth2(SecretString::new(token.to_string().into())))
-        }
+        AuthKind::OAuth2 => Some(ResolvedAuth::OAuth2(SecretString::new(
+            token.to_string().into(),
+        ))),
     }
 }
 
@@ -281,13 +294,11 @@ mod tests {
             ..Default::default()
         };
         let result = resolve("test", Some(&cfg), Some("alice:secret")).unwrap();
-        assert!(
-            matches!(
-                result,
-                Some(ResolvedAuth::Basic { ref username, ref password })
-                if username == "alice" && password.expose_secret() == "secret"
-            )
-        );
+        assert!(matches!(
+            result,
+            Some(ResolvedAuth::Basic { ref username, ref password })
+            if username == "alice" && password.expose_secret() == "secret"
+        ));
     }
 
     #[test]

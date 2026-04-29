@@ -16,9 +16,7 @@ impl Default for Paginator {
 
 impl Paginator {
     /// Extract the `rel=next` URL from an HTTP `Link` header.
-    pub fn next_url(&self,
-        headers: &HeaderMap,
-    ) -> Option<String> {
+    pub fn next_url(&self, headers: &HeaderMap) -> Option<String> {
         let link = headers.get("link")?.to_str().ok()?;
         parse_link_header(link)
             .into_iter()
@@ -30,10 +28,7 @@ impl Paginator {
     ///
     /// - If every page is an array, all elements are flattened into one array.
     /// - If a page is not an array, it is pushed as a single item.
-    pub fn concat_results(
-        &self,
-        pages: Vec<serde_json::Value>,
-    ) -> serde_json::Value {
+    pub fn concat_results(&self, pages: Vec<serde_json::Value>) -> serde_json::Value {
         let mut results = Vec::new();
         for page in pages {
             if let Some(arr) = page.as_array() {
@@ -81,7 +76,10 @@ mod tests {
         let parsed = parse_link_header(link);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].0, "next");
-        assert_eq!(parsed[0].1, "https://api.github.com/repos?per_page=100&page=2");
+        assert_eq!(
+            parsed[0].1,
+            "https://api.github.com/repos?per_page=100&page=2"
+        );
         assert_eq!(parsed[1].0, "last");
     }
 
@@ -97,10 +95,7 @@ mod tests {
     #[test]
     fn concat_arrays_flattens() {
         let paginator = Paginator::default();
-        let pages = vec![
-            serde_json::json!([1, 2]),
-            serde_json::json!([3, 4]),
-        ];
+        let pages = vec![serde_json::json!([1, 2]), serde_json::json!([3, 4])];
         let result = paginator.concat_results(pages);
         assert_eq!(result, serde_json::json!([1, 2, 3, 4]));
     }
@@ -108,10 +103,7 @@ mod tests {
     #[test]
     fn concat_mixed_wraps_non_array() {
         let paginator = Paginator::default();
-        let pages = vec![
-            serde_json::json!([1, 2]),
-            serde_json::json!({"meta": true}),
-        ];
+        let pages = vec![serde_json::json!([1, 2]), serde_json::json!({"meta": true})];
         let result = paginator.concat_results(pages);
         assert_eq!(result, serde_json::json!([1, 2, {"meta": true}]));
     }

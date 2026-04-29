@@ -5,10 +5,7 @@ use jmespath::ToJmespath;
 /// Evaluate a JMESPath expression against a JSON value.
 ///
 /// On error, returns the original message string so callers can warn and fall back.
-pub fn filter_response(
-    expr: &str,
-    value: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
+pub fn filter_response(expr: &str, value: &serde_json::Value) -> Result<serde_json::Value, String> {
     let parsed = jmespath::compile(expr).map_err(|e| format!("{}", e))?;
     let jmes_input = value
         .to_jmespath()
@@ -16,8 +13,7 @@ pub fn filter_response(
     let result = parsed
         .search(jmes_input)
         .map_err(|e| format!("JMESPath search error: {}", e))?;
-    serde_json::to_value(&*result)
-        .map_err(|e| format!("JMESPath serde error: {}", e))
+    serde_json::to_value(&*result).map_err(|e| format!("JMESPath serde error: {}", e))
 }
 
 #[cfg(test)]

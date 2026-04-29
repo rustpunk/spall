@@ -10,65 +10,77 @@ use indexmap::IndexMap;
 
 /// Build a clap `Command` tree from a resolved spec for a given API.
 pub fn build_operations_cmd(api_name: &str, spec: &ResolvedSpec) -> Command {
-    let light_ops: Vec<LightOp> = spec.operations.iter().map(|op| {
-        let ext = CliExtensions::from_operation(op);
-        LightOp {
+    let light_ops: Vec<LightOp> = spec
+        .operations
+        .iter()
+        .map(|op| {
+            let ext = CliExtensions::from_operation(op);
+            LightOp {
+                operation_id: &op.operation_id,
+                cli_name: ext.cli_name,
+                hidden: ext.hidden,
+                group: ext.group,
+                summary: op.summary.as_deref(),
+                deprecated: op.deprecated,
+                tags: &op.tags,
+                params: op
+                    .parameters
+                    .iter()
+                    .map(|p| {
+                        let p_ext = CliExtensions::from_parameter(p);
+                        LightParam {
+                            name: &p.name,
+                            cli_name: p_ext.cli_name,
+                            hidden: p_ext.hidden,
+                            location: p.location,
+                            required: p.required,
+                            description: p.description.as_deref(),
+                            schema: Some(&p.schema),
+                        }
+                    })
+                    .collect(),
+                has_body: op.request_body.is_some(),
+                body_required: op
+                    .request_body
+                    .as_ref()
+                    .map(|b| b.required)
+                    .unwrap_or(false),
+            }
+        })
+        .collect();
+    build_root_cmd(api_name, &spec.title, &spec.version, &light_ops)
+}
+
+/// Build a clap `Command` tree from a lightweight cached index.
+pub fn build_operations_cmd_from_index(api_name: &str, index: &SpecIndex) -> Command {
+    let light_ops: Vec<LightOp> = index
+        .operations
+        .iter()
+        .map(|op| LightOp {
             operation_id: &op.operation_id,
-            cli_name: ext.cli_name,
-            hidden: ext.hidden,
-            group: ext.group,
+            cli_name: None,
+            hidden: false,
+            group: None,
             summary: op.summary.as_deref(),
             deprecated: op.deprecated,
             tags: &op.tags,
             params: op
                 .parameters
                 .iter()
-                .map(|p| {
-                    let p_ext = CliExtensions::from_parameter(p);
-                    LightParam {
-                        name: &p.name,
-                        cli_name: p_ext.cli_name,
-                        hidden: p_ext.hidden,
-                        location: p.location,
-                        required: p.required,
-                        description: p.description.as_deref(),
-                        schema: Some(&p.schema),
-                    }
+                .map(|p| LightParam {
+                    name: &p.name,
+                    cli_name: None,
+                    hidden: false,
+                    location: p.location,
+                    required: p.required,
+                    description: None,
+                    schema: None,
                 })
                 .collect(),
-            has_body: op.request_body.is_some(),
-            body_required: op.request_body.as_ref().map(|b| b.required).unwrap_or(false),
-        }
-    }).collect();
-    build_root_cmd(api_name, &spec.title, &spec.version, &light_ops)
-}
-
-/// Build a clap `Command` tree from a lightweight cached index.
-pub fn build_operations_cmd_from_index(api_name: &str, index: &SpecIndex) -> Command {
-    let light_ops: Vec<LightOp> = index.operations.iter().map(|op| LightOp {
-        operation_id: &op.operation_id,
-        cli_name: None,
-        hidden: false,
-        group: None,
-        summary: op.summary.as_deref(),
-        deprecated: op.deprecated,
-        tags: &op.tags,
-        params: op
-            .parameters
-            .iter()
-            .map(|p| LightParam {
-                name: &p.name,
-                cli_name: None,
-                hidden: false,
-                location: p.location,
-                required: p.required,
-                description: None,
-                schema: None,
-            })
-            .collect(),
-        has_body: op.has_request_body,
-        body_required: op.request_body_required,
-    }).collect();
+            has_body: op.has_request_body,
+            body_required: op.request_body_required,
+        })
+        .collect();
     build_root_cmd(api_name, &index.title, &index.version, &light_ops)
 }
 
@@ -100,8 +112,7 @@ struct LightOp<'a> {
 }
 
 fn build_root_cmd(api_name: &str, title: &str, version: &str, ops: &[LightOp]) -> Command {
-    let mut root = Command::new(api_name.to_string())
-        .about(format!("{} API ({})", title, version));
+    let mut root = Command::new(api_name.to_string()).about(format!("{} API ({})", title, version));
 
     let groups = group_by_tag(ops);
 
@@ -114,12 +125,14 @@ fn build_root_cmd(api_name: &str, title: &str, version: &str, ops: &[LightOp]) -
 
     let mut seen_root: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (tag, tag_ops) in &groups {
-        let mut tag_cmd = Command::new(tag.clone())
-            .about(format!("{} operations", tag));
+        let mut tag_cmd = Command::new(tag.clone()).about(format!("{} operations", tag));
 
         for op in tag_ops {
             tag_cmd = tag_cmd.subcommand(build_op_cmd(op));
-            let display = op.cli_name.clone().unwrap_or_else(|| op.operation_id.to_string());
+            let display = op
+                .cli_name
+                .clone()
+                .unwrap_or_else(|| op.operation_id.to_string());
             if seen_root.insert(display) {
                 root = root.subcommand(build_op_cmd(op));
             }
@@ -132,9 +145,11 @@ fn build_root_cmd(api_name: &str, title: &str, version: &str, ops: &[LightOp]) -
 }
 
 fn build_op_cmd(op: &LightOp) -> Command {
-    let cmd_name = op.cli_name.clone().unwrap_or_else(|| op.operation_id.to_string());
-    let mut cmd = Command::new(cmd_name.clone())
-        .about(op.summary.unwrap_or_default().to_string());
+    let cmd_name = op
+        .cli_name
+        .clone()
+        .unwrap_or_else(|| op.operation_id.to_string());
+    let mut cmd = Command::new(cmd_name.clone()).about(op.summary.unwrap_or_default().to_string());
 
     if op.deprecated {
         cmd = cmd.before_help("[DEPRECATED] This operation is deprecated.");
@@ -276,7 +291,8 @@ fn group_by_tag<'a>(ops: &'a [LightOp<'a>]) -> IndexMap<String, Vec<&'a LightOp<
         if op.hidden {
             continue;
         }
-        let tag = op.group
+        let tag = op
+            .group
             .clone()
             .or_else(|| op.tags.first().cloned())
             .unwrap_or_else(|| "default".to_string());

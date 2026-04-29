@@ -4,17 +4,12 @@ use clap::ArgMatches;
 use miette::Result;
 
 /// Handle `spall history list|show|clear`.
-pub fn handle_history(
-    matches: &ArgMatches,
-    cache_dir: &std::path::Path,
-) -> Result<()> {
+pub fn handle_history(matches: &ArgMatches, cache_dir: &std::path::Path) -> Result<()> {
     match matches.subcommand() {
         Some(("list" | "", _)) => handle_list(cache_dir),
         Some(("show", sub)) => handle_show(sub, cache_dir),
         Some(("clear", _)) => handle_clear(cache_dir),
-        _ => {
-            handle_list(cache_dir)
-        }
+        _ => handle_list(cache_dir),
     }
 }
 
@@ -107,8 +102,7 @@ fn handle_clear(cache_dir: &std::path::Path) -> Result<()> {
 }
 
 fn format_timestamp(ts: u64) -> String {
-    let dt = chrono::DateTime::from_timestamp(ts as i64, 0)
-        .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+    let dt = chrono::DateTime::from_timestamp(ts as i64, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH);
     dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
 

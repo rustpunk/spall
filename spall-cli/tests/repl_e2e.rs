@@ -5,8 +5,7 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 fn minimal_spec(port: u16) -> String {
@@ -72,9 +71,9 @@ async fn repl_dispatches_api_command() {
     setup_api_config(&temp, &spec_path);
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-        serde_json::json!({"result": "ok"})
-        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": "ok"})),
+        )
         .mount(&mock)
         .await;
 
@@ -130,13 +129,11 @@ async fn repl_dispatches_api_command() {
         "REPL exited with non-zero status. stderr: {}",
         {
             let mut stderr_child = child.stderr.take().map(std::io::BufReader::new);
-            stderr_child
-                .as_mut()
-                .map_or_else(String::new, |r| {
-                    let mut buf = String::new();
-                    let _ = r.read_to_string(&mut buf);
-                    buf
-                })
+            stderr_child.as_mut().map_or_else(String::new, |r| {
+                let mut buf = String::new();
+                let _ = r.read_to_string(&mut buf);
+                buf
+            })
         }
     );
 
@@ -192,13 +189,11 @@ async fn repl_special_commands() {
         "REPL exited with non-zero status. stderr: {}",
         {
             let mut stderr_child = child.stderr.take().map(std::io::BufReader::new);
-            stderr_child
-                .as_mut()
-                .map_or_else(String::new, |r| {
-                    let mut buf = String::new();
-                    let _ = r.read_to_string(&mut buf);
-                    buf
-                })
+            stderr_child.as_mut().map_or_else(String::new, |r| {
+                let mut buf = String::new();
+                let _ = r.read_to_string(&mut buf);
+                buf
+            })
         }
     );
     assert!(

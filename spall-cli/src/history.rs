@@ -1,6 +1,6 @@
 //! SQLite-backed request/response history.
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::path::Path;
 
 /// An in-memory representation of a recorded request.
@@ -36,9 +36,7 @@ impl History {
     }
 
     /// Record a request/response pair.
-    pub fn record(&self,
-        record: &RequestRecord,
-    ) -> Result<(), rusqlite::Error> {
+    pub fn record(&self, record: &RequestRecord) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "INSERT INTO requests
              (timestamp, api, operation, method, url, status_code, duration_ms)
@@ -73,9 +71,7 @@ impl History {
     }
 
     /// List the most recent requests (newest first).
-    pub fn list(&self,
-        limit: usize,
-    ) -> Result<Vec<HistoryRow>, rusqlite::Error> {
+    pub fn list(&self, limit: usize) -> Result<Vec<HistoryRow>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, timestamp, api, operation, method, url, status_code, duration_ms
              FROM requests
@@ -98,9 +94,7 @@ impl History {
     }
 
     /// Get full details for a single request, including headers.
-    pub fn get(&self,
-        id: i64,
-    ) -> Result<Option<FullRequest>, rusqlite::Error> {
+    pub fn get(&self, id: i64) -> Result<Option<FullRequest>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, timestamp, api, operation, method, url, status_code, duration_ms
              FROM requests WHERE id = ?1",
@@ -123,17 +117,17 @@ impl History {
             None => return Ok(None),
         };
 
-        let req_headers: Vec<(String, String)> = self.conn.prepare(
-            "SELECT key, value FROM request_headers WHERE request_id = ?1",
-        )?.query_map(params![id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?.collect::<Result<_, _>>()?;
+        let req_headers: Vec<(String, String)> = self
+            .conn
+            .prepare("SELECT key, value FROM request_headers WHERE request_id = ?1")?
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
 
-        let resp_headers: Vec<(String, String)> = self.conn.prepare(
-            "SELECT key, value FROM response_headers WHERE request_id = ?1",
-        )?.query_map(params![id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?.collect::<Result<_, _>>()?;
+        let resp_headers: Vec<(String, String)> = self
+            .conn
+            .prepare("SELECT key, value FROM response_headers WHERE request_id = ?1")?
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
 
         Ok(Some(FullRequest {
             row,

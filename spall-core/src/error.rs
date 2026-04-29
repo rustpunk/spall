@@ -4,10 +4,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum SpallCoreError {
     #[error("spec parse failed: {message} (url: {url})")]
-    SpecParse {
-        message: String,
-        url: String,
-    },
+    SpecParse { message: String, url: String },
 
     #[error("unresolved $ref: {path}")]
     UnresolvedRef { path: String, context: String },

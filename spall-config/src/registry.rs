@@ -48,11 +48,11 @@ pub struct ProfileConfig {
 
 impl ApiRegistry {
     /// Test-friendly constructor from pre-built entries.
-    pub fn from_entries(
-        entries: Vec<ApiEntry>,
-        defaults: crate::sources::GlobalDefaults,
-    ) -> Self {
-        Self { apis: entries, defaults }
+    pub fn from_entries(entries: Vec<ApiEntry>, defaults: crate::sources::GlobalDefaults) -> Self {
+        Self {
+            apis: entries,
+            defaults,
+        }
     }
 
     /// Build the registry from config sources.
@@ -68,7 +68,8 @@ impl ApiRegistry {
         // Priority: api_files > inline > scanned.  Lower-priority entries
         // with duplicate names are discarded.
         let mut seen = std::collections::HashSet::new();
-        let mut apis: Vec<ApiEntry> = Vec::with_capacity(api_files.len() + inline.len() + scanned.len());
+        let mut apis: Vec<ApiEntry> =
+            Vec::with_capacity(api_files.len() + inline.len() + scanned.len());
 
         for e in api_files {
             if seen.insert(e.name.clone()) {
@@ -86,14 +87,14 @@ impl ApiRegistry {
             }
         }
 
-        Ok(ApiRegistry { apis, defaults: global.defaults })
+        Ok(ApiRegistry {
+            apis,
+            defaults: global.defaults,
+        })
     }
 
     /// Persist a new API to the registry by creating `~/.config/spall/apis/{name}.toml`.
-    pub fn add_api(
-        name: &str,
-        source: &str,
-    ) -> Result<(), SpallConfigError> {
+    pub fn add_api(name: &str, source: &str) -> Result<(), SpallConfigError> {
         validate_name(name)?;
         let dir = crate::sources::config_dir().join("apis");
         std::fs::create_dir_all(&dir)?;
@@ -106,7 +107,9 @@ impl ApiRegistry {
 
     /// Remove an API's config file from `~/.config/spall/apis/`.
     pub fn remove_api(name: &str) -> Result<(), SpallConfigError> {
-        let path = crate::sources::config_dir().join("apis").join(format!("{}.toml", name));
+        let path = crate::sources::config_dir()
+            .join("apis")
+            .join(format!("{}.toml", name));
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
@@ -123,11 +126,7 @@ impl ApiRegistry {
     /// Returns a cloned `ApiEntry` with profile values applied on top of the
     /// base configuration. Profile headers replace base headers with the same
     /// key, and profile `base_url` / `auth` override the base values.
-    pub fn resolve_profile(
-        &self,
-        api_name: &str,
-        profile_name: Option<&str>,
-    ) -> Option<ApiEntry> {
+    pub fn resolve_profile(&self, api_name: &str, profile_name: Option<&str>) -> Option<ApiEntry> {
         let mut entry = self.find(api_name)?.clone();
         if let Some(name) = profile_name {
             if let Some(profile) = entry.profiles.get(name) {
@@ -158,8 +157,8 @@ fn validate_name(name: &str) -> Result<(), SpallConfigError> {
     // Reject names that start with a dash or are empty.
     if name.is_empty() {
         return Err(SpallConfigError::InvalidApiName(
-            "API name cannot be empty".to_string()),
-        );
+            "API name cannot be empty".to_string(),
+        ));
     }
     if name.starts_with('-') {
         return Err(SpallConfigError::InvalidApiName(

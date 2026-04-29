@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 const RAW_CACHE_TTL_SECS: u64 = 3600;
 
 /// Load raw spec bytes. For URLs, checks TTL cache and conditional GET.
-pub async fn load_raw(source: &str, cache_dir: &Path, proxy_url: Option<&str>) -> Result<Vec<u8>, SpallCliError> {
+pub async fn load_raw(
+    source: &str,
+    cache_dir: &Path,
+    proxy_url: Option<&str>,
+) -> Result<Vec<u8>, SpallCliError> {
     if source.starts_with("http://") || source.starts_with("https://") {
         fetch_url(source, cache_dir, proxy_url).await
     } else {
@@ -14,7 +18,11 @@ pub async fn load_raw(source: &str, cache_dir: &Path, proxy_url: Option<&str>) -
 }
 
 /// Force network re-fetch of a URL source, update raw cache, invalidate IR cache.
-pub async fn refresh(source: &str, cache_dir: &Path, proxy_url: Option<&str>) -> Result<Vec<u8>, SpallCliError> {
+pub async fn refresh(
+    source: &str,
+    cache_dir: &Path,
+    proxy_url: Option<&str>,
+) -> Result<Vec<u8>, SpallCliError> {
     if !source.starts_with("http://") && !source.starts_with("https://") {
         return Err(SpallCliError::Usage(format!(
             "refresh only applies to remote specs: {}",
@@ -26,7 +34,11 @@ pub async fn refresh(source: &str, cache_dir: &Path, proxy_url: Option<&str>) ->
     Ok(bytes)
 }
 
-async fn fetch_url(source: &str, cache_dir: &Path, proxy_url: Option<&str>) -> Result<Vec<u8>, SpallCliError> {
+async fn fetch_url(
+    source: &str,
+    cache_dir: &Path,
+    proxy_url: Option<&str>,
+) -> Result<Vec<u8>, SpallCliError> {
     if let Some(bytes) = read_raw_cache(source, cache_dir) {
         if let Ok(meta_bytes) = std::fs::read(raw_meta_path(source, cache_dir)) {
             if let Ok(meta) = postcard::from_bytes::<RawMeta>(&meta_bytes) {
@@ -80,7 +92,11 @@ async fn conditional_get(
     }
 }
 
-async fn fetch_url_force(source: &str, cache_dir: &Path, proxy_url: Option<&str>) -> Result<Vec<u8>, SpallCliError> {
+async fn fetch_url_force(
+    source: &str,
+    cache_dir: &Path,
+    proxy_url: Option<&str>,
+) -> Result<Vec<u8>, SpallCliError> {
     let client = crate::http::build_fetch_client(proxy_url)
         .map_err(|e| SpallCliError::Network(e.to_string()))?;
     match client.get(source).send().await {
@@ -94,9 +110,7 @@ async fn fetch_url_force(source: &str, cache_dir: &Path, proxy_url: Option<&str>
             write_raw_cache(source, cache_dir, &bytes, etag.as_deref())?;
             Ok(bytes)
         }
-        Ok(resp) => {
-            stale_fallback(source, cache_dir, format!("HTTP {}", resp.status())).await
-        }
+        Ok(resp) => stale_fallback(source, cache_dir, format!("HTTP {}", resp.status())).await,
         Err(e) => stale_fallback(source, cache_dir, e.to_string()).await,
     }
 }
@@ -139,20 +153,16 @@ fn write_raw_cache(
         fetched_at: now_secs(),
         expires_at: now_secs() + RAW_CACHE_TTL_SECS,
     };
-    let meta_bytes = postcard::to_allocvec(&meta)
-        .map_err(|e| SpallCliError::Cache(e.to_string()))?;
+    let meta_bytes =
+        postcard::to_allocvec(&meta).map_err(|e| SpallCliError::Cache(e.to_string()))?;
     atomic_write(&raw_path(source, cache_dir), bytes)?;
     atomic_write(&raw_meta_path(source, cache_dir), &meta_bytes)?;
     Ok(())
 }
 
-fn write_raw_meta(
-    source: &str,
-    cache_dir: &Path,
-    meta: &RawMeta,
-) -> Result<(), SpallCliError> {
-    let meta_bytes = postcard::to_allocvec(meta)
-        .map_err(|e| SpallCliError::Cache(e.to_string()))?;
+fn write_raw_meta(source: &str, cache_dir: &Path, meta: &RawMeta) -> Result<(), SpallCliError> {
+    let meta_bytes =
+        postcard::to_allocvec(meta).map_err(|e| SpallCliError::Cache(e.to_string()))?;
     atomic_write(&raw_meta_path(source, cache_dir), &meta_bytes)?;
     Ok(())
 }

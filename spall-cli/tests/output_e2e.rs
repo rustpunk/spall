@@ -2,12 +2,11 @@
 
 use std::process::Command;
 use tempfile::TempDir;
-use wiremock::{MockServer, ResponseTemplate};
 use wiremock::matchers::{method, path};
+use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 fn setup_config_dir(temp: &TempDir, spec_path: &str) {
@@ -61,11 +60,10 @@ async fn json_array_produces_table() {
 
     wiremock::Mock::given(method("GET"))
         .and(path("/items"))
-        .respond_with(ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!([
-                {"name": "alpha", "count": 1},
-                {"name": "beta", "count": 2}
-            ])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"name": "alpha", "count": 1},
+            {"name": "beta", "count": 2}
+        ])))
         .mount(&mock)
         .await;
 
@@ -75,11 +73,18 @@ async fn json_array_produces_table() {
         .output()
         .expect("failed to run spall");
 
-    assert!(output.status.success(),
-        "expected success, stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("alpha"), "missing alpha in table: {}", stdout);
+    assert!(
+        stdout.contains("alpha"),
+        "missing alpha in table: {}",
+        stdout
+    );
     assert!(stdout.contains("beta"), "missing beta in table: {}", stdout);
     assert!(stdout.contains("┌"), "expected table borders: {}", stdout);
 }
@@ -96,11 +101,10 @@ async fn json_array_produces_csv() {
 
     wiremock::Mock::given(method("GET"))
         .and(path("/items"))
-        .respond_with(ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!([
-                {"name": "alpha", "count": 1},
-                {"name": "beta", "count": 2}
-            ])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"name": "alpha", "count": 1},
+            {"name": "beta", "count": 2}
+        ])))
         .mount(&mock)
         .await;
 
@@ -110,8 +114,11 @@ async fn json_array_produces_csv() {
         .output()
         .expect("failed to run spall");
 
-    assert!(output.status.success(),
-        "expected success, stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("alpha"), "missing alpha in csv: {}", stdout);

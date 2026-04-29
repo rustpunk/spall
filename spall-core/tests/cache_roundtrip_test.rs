@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use spall_core::ir::{
-    HttpMethod, ResolvedMediaType, ResolvedOperation, ResolvedRequestBody, ResolvedResponse,
-    ResolvedSchema, ResolvedSpec, ResolvedServer, ResolvedParameter, ParameterLocation,
+    HttpMethod, ParameterLocation, ResolvedMediaType, ResolvedOperation, ResolvedParameter,
+    ResolvedRequestBody, ResolvedResponse, ResolvedSchema, ResolvedServer, ResolvedSpec,
 };
 use spall_core::value::SpallValue;
 
@@ -16,10 +16,10 @@ fn make_spec_with_values(title: &str) -> ResolvedSpec {
         SpallValue::Object({
             let mut m = IndexMap::new();
             m.insert("key".into(), SpallValue::F64(3.14));
-            m.insert("arr".into(), SpallValue::Array(vec![
-                SpallValue::I64(-1),
-                SpallValue::I64(0),
-            ]));
+            m.insert(
+                "arr".into(),
+                SpallValue::Array(vec![SpallValue::I64(-1), SpallValue::I64(0)]),
+            );
             m
         }),
     );
@@ -29,10 +29,7 @@ fn make_spec_with_values(title: &str) -> ResolvedSpec {
         format: None,
         description: None,
         default: Some(SpallValue::Str("defaultval".into())),
-        enum_values: vec![
-            SpallValue::Str("a".into()),
-            SpallValue::Str("b".into()),
-        ],
+        enum_values: vec![SpallValue::Str("a".into()), SpallValue::Str("b".into())],
         nullable: false,
         read_only: false,
         write_only: false,
@@ -113,9 +110,12 @@ fn make_spec_with_values(title: &str) -> ResolvedSpec {
             security: vec![],
             tags: vec![],
             extensions,
-            servers: vec![]
+            servers: vec![],
         }],
-        servers: vec![ResolvedServer { url: "https://example.com".into(), description: None }],
+        servers: vec![ResolvedServer {
+            url: "https://example.com".into(),
+            description: None,
+        }],
     }
 }
 
@@ -135,7 +135,10 @@ fn cache_roundtrip_all_spallvalue_variants() {
     assert_eq!(op.extensions.len(), 5);
 
     // Spot-check specific variants
-    assert_eq!(op.extensions.get("x-custom").unwrap().as_str(), Some("hello"));
+    assert_eq!(
+        op.extensions.get("x-custom").unwrap().as_str(),
+        Some("hello")
+    );
     assert_eq!(op.extensions.get("x-null").unwrap(), &SpallValue::Null);
 
     let nested = op.extensions.get("x-nested").unwrap();
@@ -154,7 +157,10 @@ fn cache_roundtrip_all_spallvalue_variants() {
     let body = op.request_body.as_ref().unwrap();
     let mt = body.content.get("application/json").unwrap();
     assert!(mt.example.is_some());
-    assert_eq!(mt.examples.get("default").unwrap().as_str(), Some("example1"));
+    assert_eq!(
+        mt.examples.get("default").unwrap().as_str(),
+        Some("example1")
+    );
 }
 
 #[test]
@@ -173,8 +179,8 @@ fn petstore_parsed_spec_roundtrips_via_postcard() {
         return;
     }
 
-    let spec = spall_core::loader::load_spec_from_bytes(&raw, "petstore.json")
-        .expect("parse petstore");
+    let spec =
+        spall_core::loader::load_spec_from_bytes(&raw, "petstore.json").expect("parse petstore");
 
     let tmp = tempfile::tempdir().unwrap();
     spall_core::cache::write_cache(
@@ -186,7 +192,6 @@ fn petstore_parsed_spec_roundtrips_via_postcard() {
     .expect("write cache");
 
     let loaded =
-        spall_core::cache::load_or_resolve("petstore.json", &raw, tmp.path())
-            .expect("load cache");
+        spall_core::cache::load_or_resolve("petstore.json", &raw, tmp.path()).expect("load cache");
     assert_eq!(loaded.title, spec.title);
 }

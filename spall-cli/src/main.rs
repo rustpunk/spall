@@ -1,5 +1,6 @@
 //! spall-cli: Binary entry point. Two-phase clap parse and dispatch.
 
+mod auth;
 mod chain;
 mod commands;
 mod completions;
@@ -16,7 +17,6 @@ mod preview;
 mod repeat;
 mod repl;
 mod validate;
-mod auth;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use miette::Diagnostic;
@@ -36,8 +36,10 @@ pub const EXIT_VALIDATION: i32 = 10;
 #[derive(Error, Diagnostic, Debug)]
 pub enum SpallCliError {
     #[error("Failed to load spec for '{api}'")]
-    #[diagnostic(help("Check the URL or run `spall api refresh {api}`.
-If this API requires a VPN, ensure you're connected."))]
+    #[diagnostic(help(
+        "Check the URL or run `spall api refresh {api}`.
+If this API requires a VPN, ensure you're connected."
+    ))]
     SpecLoadFailed {
         api: String,
         source: String,
@@ -146,16 +148,18 @@ pub async fn run_with_args(
             Some(("history", sub)) => {
                 // "spall history show 42 --spall-repeat"
                 if let Some(("show", show_sub)) = sub.subcommand() {
-                    show_sub.get_one::<String>("id").and_then(|s| s.parse().ok())
+                    show_sub
+                        .get_one::<String>("id")
+                        .and_then(|s| s.parse().ok())
                 } else {
                     None
                 }
             }
             _ => None,
         };
-        return crate::repeat::replay(cache_dir,
-            entry_id,
-        ).await.map_err(Into::into);
+        return crate::repeat::replay(cache_dir, entry_id)
+            .await
+            .map_err(Into::into);
     }
 
     match phase1_matches.subcommand() {
@@ -167,7 +171,8 @@ pub async fn run_with_args(
         }
         Some(("auth", sub)) => commands::auth::handle_auth(sub).await,
         Some(("completions", sub)) => {
-            let shell = sub.get_one::<String>("shell")
+            let shell = sub
+                .get_one::<String>("shell")
                 .ok_or_else(|| SpallCliError::Usage("shell argument required".to_string()))?;
             let script = completions::generate_completions(shell)?;
             println!("{}", script);
@@ -180,20 +185,23 @@ pub async fn run_with_args(
             handle_api_operation(api_name, remaining, registry, &phase1_matches, cache_dir).await
         }
         None => {
-            phase1.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
+            phase1
+                .print_help()
+                .map_err(|e| SpallCliError::Usage(e.to_string()))?;
             println!();
             Ok(())
         }
     }
 }
 
-async fn handle_complete(
-    matches: &ArgMatches,
-    registry: &ApiRegistry,
-) -> miette::Result<()> {
-    let api_name = matches.get_one::<String>("api")
+async fn handle_complete(matches: &ArgMatches, registry: &ApiRegistry) -> miette::Result<()> {
+    let api_name = matches
+        .get_one::<String>("api")
         .ok_or_else(|| SpallCliError::Usage("API name required".to_string()))?;
-    let word = matches.get_one::<String>("word").map(|s| s.as_str()).unwrap_or("");
+    let word = matches
+        .get_one::<String>("word")
+        .map(|s| s.as_str())
+        .unwrap_or("");
 
     let entry = match registry.resolve_profile(api_name, None) {
         Some(e) => e,
@@ -210,8 +218,7 @@ async fn handle_complete(
     let raw = match fetch::load_raw(&entry.source, &cache_dir, proxy.as_deref()).await {
         Ok(b) => b,
         Err(_) => {
-            if let Some(index) = spall_core::cache::load_cached_index(&entry.source, &cache_dir
-            ) {
+            if let Some(index) = spall_core::cache::load_cached_index(&entry.source, &cache_dir) {
                 for op in &index.operations {
                     if op.operation_id.starts_with(word) {
                         println!("{}", op.operation_id);
@@ -222,8 +229,7 @@ async fn handle_complete(
         }
     };
 
-    let spec = match spall_core::cache::load_or_resolve(&entry.source, &raw, &cache_dir
-    ) {
+    let spec = match spall_core::cache::load_or_resolve(&entry.source, &raw, &cache_dir) {
         Ok(s) => s,
         Err(_) => return Ok(()),
     };
@@ -277,7 +283,9 @@ async fn show_api_help(
                 for arg in spall_global_args() {
                     phase2 = phase2.arg(arg);
                 }
-                phase2.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
+                phase2
+                    .print_help()
+                    .map_err(|e| SpallCliError::Usage(e.to_string()))?;
                 println!();
                 return Ok(());
             } else {
@@ -291,15 +299,10 @@ async fn show_api_help(
         }
     };
 
-    let spec = match spall_core::cache::load_or_resolve(
-        &entry.source,
-        &raw,
-        cache_dir,
-    ) {
+    let spec = match spall_core::cache::load_or_resolve(&entry.source, &raw, cache_dir) {
         Ok(spec) => spec,
         Err(e) => {
-            if let Some(index) = spall_core::cache::load_cached_index(&entry.source, cache_dir
-            ) {
+            if let Some(index) = spall_core::cache::load_cached_index(&entry.source, cache_dir) {
                 eprintln!(
                     "⚠  Could not load spec for '{}'. Showing cached operation list from {}.",
                     api_name, index.cached_at
@@ -309,7 +312,9 @@ async fn show_api_help(
                 for arg in spall_global_args() {
                     phase2 = phase2.arg(arg);
                 }
-                phase2.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
+                phase2
+                    .print_help()
+                    .map_err(|e| SpallCliError::Usage(e.to_string()))?;
                 println!();
                 return Ok(());
             } else {
@@ -327,7 +332,9 @@ async fn show_api_help(
     for arg in spall_global_args() {
         phase2 = phase2.arg(arg);
     }
-    phase2.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
+    phase2
+        .print_help()
+        .map_err(|e| SpallCliError::Usage(e.to_string()))?;
     println!();
     Ok(())
 }
@@ -340,7 +347,9 @@ async fn handle_api_operation(
     phase1_matches: &ArgMatches,
     cache_dir: &std::path::Path,
 ) -> miette::Result<()> {
-    let profile = phase1_matches.get_one::<String>("profile").map(|s| s.as_str());
+    let profile = phase1_matches
+        .get_one::<String>("profile")
+        .map(|s| s.as_str());
     let entry = registry
         .resolve_profile(api_name, profile)
         .ok_or_else(|| SpallCliError::Usage(format!("Unknown API: {}", api_name)))?;
@@ -359,12 +368,13 @@ async fn handle_api_operation(
             cause: spall_core::error::SpallCoreError::InvalidSource(e.to_string()),
         })?;
 
-    let spec = spall_core::cache::load_or_resolve(&entry.source, &raw, cache_dir)
-        .map_err(|e| SpallCliError::SpecLoadFailed {
+    let spec = spall_core::cache::load_or_resolve(&entry.source, &raw, cache_dir).map_err(|e| {
+        SpallCliError::SpecLoadFailed {
             api: api_name.to_string(),
             source: entry.source.clone(),
             cause: e,
-        })?;
+        }
+    })?;
 
     let mut phase2 = spall_core::command::build_operations_cmd(api_name, &spec);
     for arg in spall_global_args() {
@@ -398,34 +408,47 @@ async fn handle_api_operation(
     // Phase 2 structure may be flat (single tag) or nested (multiple tags).
     // Try direct operation match first.
     if let Some(op) = spec.operations.iter().find(|o| o.operation_id == tag_or_op) {
-        return execute::execute_operation(op, &spec, &entry, op_matches, phase1_matches, cache_dir, &registry.defaults)
-            .await
-            .map_err(Into::into);
+        return execute::execute_operation(
+            op,
+            &spec,
+            &entry,
+            op_matches,
+            phase1_matches,
+            cache_dir,
+            &registry.defaults,
+        )
+        .await
+        .map_err(Into::into);
     }
 
     // If not found directly, look for a tag subcommand.
     if let Some(_tag_matches) = phase2_matches.subcommand_matches(tag_or_op) {
         let (op_name, inner_matches) = _tag_matches.subcommand().ok_or_else(|| {
-            SpallCliError::Usage("No operation specified. Use --help to list operations.".to_string())
+            SpallCliError::Usage(
+                "No operation specified. Use --help to list operations.".to_string(),
+            )
         })?;
 
         let op = spec
             .operations
             .iter()
             .find(|o| o.operation_id == op_name)
-            .ok_or_else(|| {
-                SpallCliError::Usage(format!("Unknown operation: {}", op_name))
-            })?;
+            .ok_or_else(|| SpallCliError::Usage(format!("Unknown operation: {}", op_name)))?;
 
-        return execute::execute_operation(op, &spec, &entry, inner_matches, phase1_matches, cache_dir, &registry.defaults)
-            .await
-            .map_err(Into::into);
+        return execute::execute_operation(
+            op,
+            &spec,
+            &entry,
+            inner_matches,
+            phase1_matches,
+            cache_dir,
+            &registry.defaults,
+        )
+        .await
+        .map_err(Into::into);
     }
 
-    Err(SpallCliError::Usage(format!(
-        "Unknown operation: {}",
-        tag_or_op
-    )).into())
+    Err(SpallCliError::Usage(format!("Unknown operation: {}", tag_or_op)).into())
 }
 
 /// Build Phase 1 command tree from the API registry.
@@ -443,7 +466,11 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
         .subcommand(
             Command::new("completions")
                 .about("Generate shell completion scripts")
-                .arg(Arg::new("shell").required(true).help("Shell: bash, zsh, or fish")),
+                .arg(
+                    Arg::new("shell")
+                        .required(true)
+                        .help("Shell: bash, zsh, or fish"),
+                ),
         )
         .subcommand(
             Command::new("__complete")
@@ -452,10 +479,7 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
                 .arg(Arg::new("api").required(true).help("API name"))
                 .arg(Arg::new("word").help("Partial word to complete")),
         )
-        .subcommand(
-            Command::new("repl")
-                .about("Start an interactive REPL shell"),
-        )
+        .subcommand(Command::new("repl").about("Start an interactive REPL shell"))
         .args(spall_global_args());
 
     for entry in &registry.apis {
@@ -509,7 +533,11 @@ fn api_management_cmd() -> Command {
             Command::new("add")
                 .about("Register a new API")
                 .arg(Arg::new("name").required(true).help("API name"))
-                .arg(Arg::new("source").required(true).help("Spec file path or URL")),
+                .arg(
+                    Arg::new("source")
+                        .required(true)
+                        .help("Spec file path or URL"),
+                ),
         )
         .subcommand(Command::new("list").about("List registered APIs"))
         .subcommand(

@@ -26,17 +26,15 @@ pub async fn handle_api_management(
 fn handle_add(matches: &ArgMatches) -> Result<()> {
     let name = matches.get_one::<String>("name").unwrap();
     let source = matches.get_one::<String>("source").unwrap();
-    spall_config::registry::ApiRegistry::add_api(name, source).map_err(|e| {
-        crate::SpallCliError::Config(e)
-    })?;
+    spall_config::registry::ApiRegistry::add_api(name, source)
+        .map_err(crate::SpallCliError::Config)?;
     eprintln!("Registered API '{}' from {}", name, source);
     Ok(())
 }
 
 fn handle_list(_matches: &ArgMatches) -> Result<()> {
-    let registry = spall_config::registry::ApiRegistry::load().map_err(|e| {
-        crate::SpallCliError::Config(e)
-    })?;
+    let registry =
+        spall_config::registry::ApiRegistry::load().map_err(crate::SpallCliError::Config)?;
     if registry.apis.is_empty() {
         eprintln!("Registered APIs:\n  (no APIs registered yet)");
     } else {
@@ -50,23 +48,18 @@ fn handle_list(_matches: &ArgMatches) -> Result<()> {
 
 fn handle_remove(matches: &ArgMatches) -> Result<()> {
     let name = matches.get_one::<String>("name").unwrap();
-    spall_config::registry::ApiRegistry::remove_api(name).map_err(|e| {
-        crate::SpallCliError::Config(e)
-    })?;
+    spall_config::registry::ApiRegistry::remove_api(name)
+        .map_err(crate::SpallCliError::Config)?;
     eprintln!("Removed API '{}'", name);
     Ok(())
 }
 
-async fn handle_refresh(
-    matches: &ArgMatches,
-    cache_dir: &std::path::Path,
-) -> Result<()> {
+async fn handle_refresh(matches: &ArgMatches, cache_dir: &std::path::Path) -> Result<()> {
     let all = matches.get_flag("all");
     let name = matches.get_one::<String>("name");
 
-    let registry = spall_config::registry::ApiRegistry::load().map_err(|e| {
-        crate::SpallCliError::Config(e)
-    })?;
+    let registry =
+        spall_config::registry::ApiRegistry::load().map_err(crate::SpallCliError::Config)?;
 
     if all {
         for entry in &registry.apis {
@@ -99,13 +92,15 @@ async fn handle_refresh(
                 .map_err(|e| crate::SpallCliError::Network(e.to_string()))?;
             eprintln!("Refreshed API '{}'", n);
         } else {
-            eprintln!("Warning: refresh only applies to remote specs. '{}' is a file source.", n);
+            eprintln!(
+                "Warning: refresh only applies to remote specs. '{}' is a file source.",
+                n
+            );
         }
     } else {
-        return Err(crate::SpallCliError::Usage(
-            "Provide an API name or use --all".to_string(),
-        )
-        .into());
+        return Err(
+            crate::SpallCliError::Usage("Provide an API name or use --all".to_string()).into(),
+        );
     }
 
     Ok(())
@@ -121,8 +116,8 @@ async fn handle_discover(matches: &ArgMatches) -> Result<()> {
     let discovered = crate::discover::probe(url).await?;
 
     // Check for name collision.
-    let registry = spall_config::registry::ApiRegistry::load()
-        .map_err(crate::SpallCliError::Config)?;
+    let registry =
+        spall_config::registry::ApiRegistry::load().map_err(crate::SpallCliError::Config)?;
     if registry.find(&discovered.name).is_some() {
         return Err(crate::SpallCliError::Usage(format!(
             "API name '{}' already exists. Remove it first or register manually with `spall api add`.",
@@ -130,11 +125,8 @@ async fn handle_discover(matches: &ArgMatches) -> Result<()> {
         )).into());
     }
 
-    spall_config::registry::ApiRegistry::add_api(
-        &discovered.name,
-        &discovered.spec_url,
-    )
-    .map_err(crate::SpallCliError::Config)?;
+    spall_config::registry::ApiRegistry::add_api(&discovered.name, &discovered.spec_url)
+        .map_err(crate::SpallCliError::Config)?;
 
     eprintln!(
         "Discovered and registered '{}' ({}) from {}",

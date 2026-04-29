@@ -17,8 +17,8 @@ async fn handle_status(matches: &ArgMatches) -> Result<()> {
         .get_one::<String>("api")
         .ok_or_else(|| crate::SpallCliError::Usage("API name required".to_string()))?;
 
-    let registry = spall_config::registry::ApiRegistry::load()
-        .map_err(crate::SpallCliError::Config)?;
+    let registry =
+        spall_config::registry::ApiRegistry::load().map_err(crate::SpallCliError::Config)?;
     let entry = registry
         .find(api_name)
         .ok_or_else(|| crate::SpallCliError::Usage(format!("Unknown API: {}", api_name)))?;
@@ -39,8 +39,8 @@ async fn handle_login(matches: &ArgMatches) -> Result<()> {
         .get_one::<String>("api")
         .ok_or_else(|| crate::SpallCliError::Usage("API name required".to_string()))?;
 
-    let registry = spall_config::registry::ApiRegistry::load()
-        .map_err(crate::SpallCliError::Config)?;
+    let registry =
+        spall_config::registry::ApiRegistry::load().map_err(crate::SpallCliError::Config)?;
     let entry = registry
         .find(api_name)
         .ok_or_else(|| crate::SpallCliError::Usage(format!("Unknown API: {}", api_name)))?;
@@ -51,11 +51,15 @@ async fn handle_login(matches: &ArgMatches) -> Result<()> {
             return Err(crate::SpallCliError::Usage(format!(
                 "No auth configuration found for API '{}'",
                 api_name
-            )).into());
+            ))
+            .into());
         }
     };
 
-    match auth_config.kind.unwrap_or(spall_config::auth::AuthKind::Bearer) {
+    match auth_config
+        .kind
+        .unwrap_or(spall_config::auth::AuthKind::Bearer)
+    {
         spall_config::auth::AuthKind::OAuth2 => {
             eprintln!("OAuth2 login stub for '{}'", api_name);
             eprintln!("In Wave 3 Independent, obtain a token manually and pass it via --spall-auth or SPALL_{}_TOKEN.",

@@ -1,5 +1,8 @@
 use spall_core::command::{build_operations_cmd, build_operations_cmd_from_index};
-use spall_core::ir::{HttpMethod, ParamIndex, ParameterLocation, ResolvedOperation, ResolvedSpec, ResolvedServer, SpecIndex, SpecIndexOp};
+use spall_core::ir::{
+    HttpMethod, ParamIndex, ParameterLocation, ResolvedOperation, ResolvedServer, ResolvedSpec,
+    SpecIndex, SpecIndexOp,
+};
 
 fn make_spec(ops: Vec<ResolvedOperation>) -> ResolvedSpec {
     ResolvedSpec {
@@ -40,7 +43,10 @@ fn single_tag_flattened_to_root() {
     ]);
     let cmd = build_operations_cmd("pets", &spec);
     // Should have subcommands directly under root, no "pets" tag subcommand
-    let subs: Vec<String> = cmd.get_subcommands().map(|c| c.get_name().to_string()).collect();
+    let subs: Vec<String> = cmd
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect();
     assert!(subs.contains(&"list-pets".to_string()));
     assert!(subs.contains(&"get-pet".to_string()));
     assert!(!subs.contains(&"pets".to_string()));
@@ -53,7 +59,10 @@ fn multi_tag_grouping() {
         make_op("get-user", vec!["users"]),
     ]);
     let cmd = build_operations_cmd("api", &spec);
-    let subs: Vec<String> = cmd.get_subcommands().map(|c| c.get_name().to_string()).collect();
+    let subs: Vec<String> = cmd
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect();
     assert!(subs.contains(&"pets".to_string()));
     assert!(subs.contains(&"users".to_string()));
     assert!(subs.contains(&"list-pets".to_string())); // also registered at root
@@ -101,7 +110,9 @@ fn path_arg_ids() {
     let spec = make_spec(vec![op]);
     let cmd = build_operations_cmd("pets", &spec);
     let op_cmd = cmd.find_subcommand("get-pet").unwrap();
-    let arg = op_cmd.get_arguments().find(|a| a.get_id().as_str() == "path-petId");
+    let arg = op_cmd
+        .get_arguments()
+        .find(|a| a.get_id().as_str() == "path-petId");
     assert!(arg.is_some());
 }
 
@@ -146,7 +157,9 @@ fn query_flag_ids() {
     let spec = make_spec(vec![op]);
     let cmd = build_operations_cmd("pets", &spec);
     let op_cmd = cmd.find_subcommand("list-pets").unwrap();
-    let arg = op_cmd.get_arguments().find(|a| a.get_id().as_str() == "query-limit");
+    let arg = op_cmd
+        .get_arguments()
+        .find(|a| a.get_id().as_str() == "query-limit");
     assert!(arg.is_some());
 }
 
@@ -209,9 +222,15 @@ fn body_args_mutually_exclusive() {
     let cmd = build_operations_cmd("pets", &spec);
     let op_cmd = cmd.find_subcommand("create-pet").unwrap();
 
-    let data_arg = op_cmd.get_arguments().find(|a| a.get_id().as_str() == "data");
-    let form_arg = op_cmd.get_arguments().find(|a| a.get_id().as_str() == "form");
-    let field_arg = op_cmd.get_arguments().find(|a| a.get_id().as_str() == "field");
+    let data_arg = op_cmd
+        .get_arguments()
+        .find(|a| a.get_id().as_str() == "data");
+    let form_arg = op_cmd
+        .get_arguments()
+        .find(|a| a.get_id().as_str() == "form");
+    let field_arg = op_cmd
+        .get_arguments()
+        .find(|a| a.get_id().as_str() == "field");
 
     assert!(data_arg.is_some());
     assert!(form_arg.is_some());
@@ -225,27 +244,27 @@ fn index_based_builder_produces_same_structure() {
         base_url: "https://example.com".to_string(),
         version: "1.0.0".to_string(),
         cached_at: "0".to_string(),
-        operations: vec![
-            SpecIndexOp {
-                operation_id: "list".to_string(),
-                method: HttpMethod::Get,
-                path_template: "/list".to_string(),
-                summary: Some("List things".to_string()),
-                tags: vec!["things".to_string()],
-                deprecated: false,
-                parameters: vec![ParamIndex {
-                    name: "q".to_string(),
-                    location: ParameterLocation::Query,
-                    required: false,
-                }],
-                has_request_body: false,
-                request_body_required: false,
-            },
-        ],
+        operations: vec![SpecIndexOp {
+            operation_id: "list".to_string(),
+            method: HttpMethod::Get,
+            path_template: "/list".to_string(),
+            summary: Some("List things".to_string()),
+            tags: vec!["things".to_string()],
+            deprecated: false,
+            parameters: vec![ParamIndex {
+                name: "q".to_string(),
+                location: ParameterLocation::Query,
+                required: false,
+            }],
+            has_request_body: false,
+            request_body_required: false,
+        }],
     };
 
     let cmd = build_operations_cmd_from_index("idx", &index);
     let op_cmd = cmd.find_subcommand("list").unwrap();
-    let arg = op_cmd.get_arguments().find(|a| a.get_id().as_str() == "query-q");
+    let arg = op_cmd
+        .get_arguments()
+        .find(|a| a.get_id().as_str() == "query-q");
     assert!(arg.is_some());
 }

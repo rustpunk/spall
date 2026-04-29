@@ -44,7 +44,10 @@ fn resolve_profile_applies_overlay() {
     };
     let registry = ApiRegistry::from_entries(vec![entry], Default::default());
     let resolved = registry.resolve_profile("api", Some("staging")).unwrap();
-    assert_eq!(resolved.base_url.as_deref(), Some("https://staging.example.com"));
+    assert_eq!(
+        resolved.base_url.as_deref(),
+        Some("https://staging.example.com")
+    );
 }
 
 #[test]
@@ -61,5 +64,8 @@ fn resolve_profile_no_profile() {
     };
     let registry = ApiRegistry::from_entries(vec![entry], Default::default());
     let resolved = registry.resolve_profile("api", None).unwrap();
-    assert_eq!(resolved.base_url.as_deref(), Some("https://prod.example.com"));
+    assert_eq!(
+        resolved.base_url.as_deref(),
+        Some("https://prod.example.com")
+    );
 }

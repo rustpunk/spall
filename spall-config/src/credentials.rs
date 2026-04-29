@@ -17,9 +17,7 @@ pub struct CredentialResolver {
 impl CredentialResolver {
     /// Resolve the best available credential for this API.
     #[must_use]
-    pub fn resolve(&self,
-        _cli_auth: Option<&str>,
-    ) -> Option<Credential> {
+    pub fn resolve(&self, _cli_auth: Option<&str>) -> Option<Credential> {
         // TODO(Wave 1): check env vars. Wave 3: keyring, config.
         todo!("CredentialResolver::resolve")
     }
@@ -28,7 +26,10 @@ impl CredentialResolver {
     ///
     /// Hyphens become underscores, and the name is uppercased.
     pub fn env_var_name(&self) -> String {
-        format!("SPALL_{}_TOKEN", self.api_name.to_uppercase().replace('-', "_"))
+        format!(
+            "SPALL_{}_TOKEN",
+            self.api_name.to_uppercase().replace('-', "_")
+        )
     }
 }
 

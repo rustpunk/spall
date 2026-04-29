@@ -195,13 +195,21 @@ impl ResolvedOperation {
             summary: self.summary.clone(),
             tags: self.tags.clone(),
             deprecated: self.deprecated,
-            parameters: self.parameters.iter().map(|p| ParamIndex {
-                name: p.name.clone(),
-                location: p.location,
-                required: p.required,
-            }).collect(),
+            parameters: self
+                .parameters
+                .iter()
+                .map(|p| ParamIndex {
+                    name: p.name.clone(),
+                    location: p.location,
+                    required: p.required,
+                })
+                .collect(),
             has_request_body: self.request_body.is_some(),
-            request_body_required: self.request_body.as_ref().map(|b| b.required).unwrap_or(false),
+            request_body_required: self
+                .request_body
+                .as_ref()
+                .map(|b| b.required)
+                .unwrap_or(false),
         }
     }
 }

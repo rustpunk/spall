@@ -36,10 +36,7 @@ pub fn validate_param(value: &str, schema: &ResolvedSchema) -> Result<(), Valida
         if !matched {
             return Err(ValidationError {
                 pointer: "/param".to_string(),
-                message: format!(
-                    "value '{}' not in enum: {:?}",
-                    value, schema.enum_values
-                ),
+                message: format!("value '{}' not in enum: {:?}", value, schema.enum_values),
             });
         }
     }
@@ -78,7 +75,11 @@ pub fn validate_param(value: &str, schema: &ResolvedSchema) -> Result<(), Valida
             } else {
                 return Err(ValidationError {
                     pointer: "/param".to_string(),
-                    message: format!("expected JSON {}, got '{}'", schema.type_name.as_deref().unwrap_or("value"), value),
+                    message: format!(
+                        "expected JSON {}, got '{}'",
+                        schema.type_name.as_deref().unwrap_or("value"),
+                        value
+                    ),
                 });
             }
         }
@@ -137,19 +138,13 @@ fn validate_value(
                 if value.as_f64().map(|f| f.fract() != 0.0).unwrap_or(false) {
                     errors.push(ValidationError {
                         pointer: pointer.to_string(),
-                        message: format!(
-                            "expected integer, got {}",
-                            json_type_name(value)
-                        ),
+                        message: format!("expected integer, got {}", json_type_name(value)),
                     });
                 }
             } else {
                 errors.push(ValidationError {
                     pointer: pointer.to_string(),
-                    message: format!(
-                        "expected integer, got {}",
-                        json_type_name(value)
-                    ),
+                    message: format!("expected integer, got {}", json_type_name(value)),
                 });
             }
         }
@@ -161,20 +156,14 @@ fn validate_value(
             } else {
                 errors.push(ValidationError {
                     pointer: pointer.to_string(),
-                    message: format!(
-                        "expected number, got {}",
-                        json_type_name(value)
-                    ),
+                    message: format!("expected number, got {}", json_type_name(value)),
                 });
             }
         }
         Some("boolean") if !value.is_boolean() => {
             errors.push(ValidationError {
                 pointer: pointer.to_string(),
-                message: format!(
-                    "expected boolean, got {}",
-                    json_type_name(value)
-                ),
+                message: format!("expected boolean, got {}", json_type_name(value)),
             });
         }
         Some("array") => {
@@ -183,10 +172,7 @@ fn validate_value(
                     if arr.len() < min {
                         errors.push(ValidationError {
                             pointer: pointer.to_string(),
-                            message: format!(
-                                "array length {} < min_items {}",
-                                arr.len(), min
-                            ),
+                            message: format!("array length {} < min_items {}", arr.len(), min),
                         });
                     }
                 }
@@ -194,10 +180,7 @@ fn validate_value(
                     if arr.len() > max {
                         errors.push(ValidationError {
                             pointer: pointer.to_string(),
-                            message: format!(
-                                "array length {} > max_items {}",
-                                arr.len(), max
-                            ),
+                            message: format!("array length {} > max_items {}", arr.len(), max),
                         });
                     }
                 }
@@ -240,10 +223,7 @@ fn validate_value(
                         if !schema.properties.contains_key(key) {
                             errors.push(ValidationError {
                                 pointer: format!("{}/{}", pointer, key),
-                                message: format!(
-                                    "additional property '{}' not allowed",
-                                    key
-                                ),
+                                message: format!("additional property '{}' not allowed", key),
                             });
                         }
                     }
@@ -264,16 +244,17 @@ fn validate_value(
     errors
 }
 
-fn check_string(value: &str, schema: &ResolvedSchema, pointer: &str) -> Result<(), ValidationError> {
+fn check_string(
+    value: &str,
+    schema: &ResolvedSchema,
+    pointer: &str,
+) -> Result<(), ValidationError> {
     if let Some(ref pattern) = schema.pattern {
         if let Ok(re) = compiled_regex(pattern) {
             if !re.is_match(value) {
                 return Err(ValidationError {
                     pointer: pointer.to_string(),
-                    message: format!(
-                        "value '{}' does not match pattern '{}'",
-                        value, pattern
-                    ),
+                    message: format!("value '{}' does not match pattern '{}'", value, pattern),
                 });
             }
         }
@@ -282,10 +263,7 @@ fn check_string(value: &str, schema: &ResolvedSchema, pointer: &str) -> Result<(
         if value.len() < min {
             return Err(ValidationError {
                 pointer: pointer.to_string(),
-                message: format!(
-                    "string length {} < min_length {}",
-                    value.len(), min
-                ),
+                message: format!("string length {} < min_length {}", value.len(), min),
             });
         }
     }
@@ -293,10 +271,7 @@ fn check_string(value: &str, schema: &ResolvedSchema, pointer: &str) -> Result<(
         if value.len() > max {
             return Err(ValidationError {
                 pointer: pointer.to_string(),
-                message: format!(
-                    "string length {} > max_length {}",
-                    value.len(), max
-                ),
+                message: format!("string length {} > max_length {}", value.len(), max),
             });
         }
     }
@@ -338,10 +313,7 @@ fn check_number(value: f64, schema: &ResolvedSchema, pointer: &str) -> Result<()
             if rem > f64::EPSILON && (multiple - rem) > f64::EPSILON {
                 return Err(ValidationError {
                     pointer: pointer.to_string(),
-                    message: format!(
-                        "value {} is not a multiple of {}",
-                        value, multiple
-                    ),
+                    message: format!("value {} is not a multiple of {}", value, multiple),
                 });
             }
         }

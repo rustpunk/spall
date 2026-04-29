@@ -4,8 +4,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 #[tokio::test]
@@ -34,10 +33,7 @@ async fn discover_via_link_header() {
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/openapi.json"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200)
-                .set_body_json(spec),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(spec))
         .mount(&mock)
         .await;
 
@@ -48,11 +44,7 @@ async fn discover_via_link_header() {
         .expect("failed to run spall");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        stderr
-    );
+    assert!(output.status.success(), "stderr: {}", stderr);
     assert!(
         stderr.contains("my-test-api") || stderr.contains("My Test API"),
         "Expected discovery output, got stderr: {}",
@@ -67,5 +59,9 @@ async fn discover_via_link_header() {
         .expect("failed to run spall");
 
     let list_stderr = String::from_utf8_lossy(&list.stderr);
-    assert!(list_stderr.contains("my-test-api"), "Expected API in list: {}", list_stderr);
+    assert!(
+        list_stderr.contains("my-test-api"),
+        "Expected API in list: {}",
+        list_stderr
+    );
 }

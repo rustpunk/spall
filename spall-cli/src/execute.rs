@@ -1,9 +1,11 @@
-use clap::ArgMatches;
 use crate::matches::MergedMatches;
+use clap::ArgMatches;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE};
 use secrecy::ExposeSecret;
 use spall_config::registry::ApiEntry;
-use spall_core::ir::{HttpMethod, ParameterLocation, ResolvedOperation, ResolvedRequestBody, ResolvedSpec};
+use spall_core::ir::{
+    HttpMethod, ParameterLocation, ResolvedOperation, ResolvedRequestBody, ResolvedSpec,
+};
 
 use std::io::Read;
 use std::time::Instant;
@@ -40,7 +42,8 @@ pub async fn execute_operation(
     // Default headers from config
     for (k, v) in &entry.default_headers {
         headers.insert(
-            HeaderName::from_bytes(k.as_bytes()).unwrap_or_else(|_| HeaderName::from_static("x-unknown")),
+            HeaderName::from_bytes(k.as_bytes())
+                .unwrap_or_else(|_| HeaderName::from_static("x-unknown")),
             HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
         );
     }
@@ -51,8 +54,10 @@ pub async fn execute_operation(
         for h in values {
             if let Some((k, v)) = h.split_once(':') {
                 headers.insert(
-                    HeaderName::from_bytes(k.trim().as_bytes()).unwrap_or_else(|_| HeaderName::from_static("x-unknown")),
-                    HeaderValue::from_str(v.trim()).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+                    HeaderName::from_bytes(k.trim().as_bytes())
+                        .unwrap_or_else(|_| HeaderName::from_static("x-unknown")),
+                    HeaderValue::from_str(v.trim())
+                        .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
                 );
             }
         }
@@ -69,7 +74,11 @@ pub async fn execute_operation(
         }
     }
     if !cookies.is_empty() {
-        headers.insert(COOKIE, HeaderValue::from_str(&cookies.join("; ")).unwrap_or_else(|_| HeaderValue::from_static("")));
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&cookies.join("; "))
+                .unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
     }
 
     // Query params
@@ -85,11 +94,7 @@ pub async fn execute_operation(
 
     // Authentication (Wave 3 provider dispatch)
     let cli_auth = combined.get_one::<String>("spall-auth");
-    let auth = crate::auth::resolve(
-        &entry.name,
-        entry.auth.as_ref(),
-        cli_auth.as_deref(),
-    )?;
+    let auth = crate::auth::resolve(&entry.name, entry.auth.as_ref(), cli_auth.as_deref())?;
     if let Some(a) = auth {
         crate::auth::apply(&a, &mut headers, &mut query_pairs);
     }
@@ -99,7 +104,8 @@ pub async fn execute_operation(
     if let Some(ref content_type) = body_data.content_type {
         headers.insert(
             reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_str(content_type).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+            HeaderValue::from_str(content_type)
+                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
         );
     }
 
@@ -113,12 +119,12 @@ pub async fn execute_operation(
     let start = Instant::now();
 
     let mut http_config = crate::http::config_from_matches(phase1_matches, phase2_matches);
-    let resolved_proxy = crate::http::resolve_proxy(entry, defaults, phase1_matches, phase2_matches);
+    let resolved_proxy =
+        crate::http::resolve_proxy(entry, defaults, phase1_matches, phase2_matches);
     http_config.proxy = resolved_proxy;
 
-    let client = crate::http::build_http_client(&http_config).map_err(|e| {
-        crate::SpallCliError::HttpClient(e.to_string())
-    })?;
+    let client = crate::http::build_http_client(&http_config)
+        .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
 
     // Dry run
     if combined.get_flag("spall-dry-run") {
@@ -129,12 +135,7 @@ pub async fn execute_operation(
     // Preview (Phase D)
     if combined.get_flag("spall-preview") {
         let body_slice = body_data.body.as_deref();
-        crate::preview::print_preview(
-            &op.method.to_string(),
-            &url,
-            &headers,
-            body_slice,
-        );
+        crate::preview::print_preview(&op.method.to_string(), &url, &headers, body_slice);
         return Ok(());
     }
 
@@ -148,7 +149,7 @@ pub async fn execute_operation(
     if paginate {
         if body_data.multipart.is_some() {
             return Err(crate::SpallCliError::Usage(
-                "Cannot use --spall-paginate with multipart uploads".to_string()
+                "Cannot use --spall-paginate with multipart uploads".to_string(),
             ));
         }
 
@@ -163,11 +164,16 @@ pub async fn execute_operation(
                 op.method,
                 &current_url,
                 headers.clone(),
-                if page_num == 0 { body_data.body.clone() } else { None },
+                if page_num == 0 {
+                    body_data.body.clone()
+                } else {
+                    None
+                },
                 None,
                 &query_pairs,
                 retry_count,
-            ).await?;
+            )
+            .await?;
 
             if first_status.is_none() {
                 first_status = Some(status);
@@ -187,10 +193,13 @@ pub async fn execute_operation(
                 }
             }
 
-            let body_json = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                .map_err(|e| crate::SpallCliError::Usage(format!(
-                    "Pagination requires JSON responses: {}", e
-                )))?;
+            let body_json =
+                serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|e| {
+                    crate::SpallCliError::Usage(format!(
+                        "Pagination requires JSON responses: {}",
+                        e
+                    ))
+                })?;
             pages.push(body_json);
 
             if let Some(next) = paginator.next_url(&resp_headers) {
@@ -236,7 +245,10 @@ pub async fn execute_operation(
                         .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
                 }
                 Err(e) => {
-                    eprintln!("Warning: filter failed ({}). Falling back to unfiltered.", e);
+                    eprintln!(
+                        "Warning: filter failed ({}). Falling back to unfiltered.",
+                        e
+                    );
                     crate::output::emit_json_value(&final_value, mode, save_path)
                         .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
                 }
@@ -255,7 +267,8 @@ pub async fn execute_operation(
             body_data.multipart,
             &query_pairs,
             retry_count,
-        ).await?;
+        )
+        .await?;
 
         // Record history
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -282,7 +295,8 @@ pub async fn execute_operation(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json");
             if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                let warnings = crate::validate::response_validate(op, status.as_u16(), ct, &json_val);
+                let warnings =
+                    crate::validate::response_validate(op, status.as_u16(), ct, &json_val);
                 if !warnings.is_empty() {
                     eprintln!("Warning: response body did not match schema:");
                     eprintln!("{}", crate::validate::format_errors(&warnings));
@@ -299,7 +313,10 @@ pub async fn execute_operation(
                             .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
                     }
                     Err(e) => {
-                        eprintln!("Warning: filter failed ({}). Falling back to unfiltered.", e);
+                        eprintln!(
+                            "Warning: filter failed ({}). Falling back to unfiltered.",
+                            e
+                        );
                         crate::output::emit_response(&body_bytes, mode, save_path)
                             .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
                     }
@@ -341,7 +358,11 @@ async fn send_one(
     query_pairs: &[(String, String)],
     retry_count: u8,
 ) -> Result<(reqwest::StatusCode, HeaderMap, Vec<u8>), crate::SpallCliError> {
-    let max_attempts = if multipart.is_some() { 1 } else { retry_count + 1 };
+    let max_attempts = if multipart.is_some() {
+        1
+    } else {
+        retry_count + 1
+    };
     for attempt in 0..max_attempts {
         let mut req_builder = match method {
             HttpMethod::Get => client.get(url),
@@ -370,7 +391,9 @@ async fn send_one(
             Ok(r) => {
                 let status = r.status();
                 let hdrs = r.headers().clone();
-                let bytes = r.bytes().await
+                let bytes = r
+                    .bytes()
+                    .await
                     .map_err(|e| crate::SpallCliError::Network(e.to_string()))?
                     .to_vec();
                 return Ok((status, hdrs, bytes));
@@ -384,7 +407,9 @@ async fn send_one(
             }
         }
     }
-    Err(crate::SpallCliError::Network("request failed after retries".to_string()))
+    Err(crate::SpallCliError::Network(
+        "request failed after retries".to_string(),
+    ))
 }
 
 /// Resolve a `next` URL from a Link header against the current request URL.
@@ -394,8 +419,9 @@ fn resolve_next_url(current: &str, next: &str) -> Result<String, crate::SpallCli
     } else {
         let base = reqwest::Url::parse(current)
             .map_err(|e| crate::SpallCliError::Network(format!("Invalid current URL: {}", e)))?;
-        let resolved = base.join(next)
-            .map_err(|e| crate::SpallCliError::Network(format!("Invalid next URL '{}': {}", next, e)))?;
+        let resolved = base.join(next).map_err(|e| {
+            crate::SpallCliError::Network(format!("Invalid next URL '{}': {}", next, e))
+        })?;
         Ok(resolved.to_string())
     }
 }
@@ -519,13 +545,9 @@ fn resolve_body(
             if let Some((key, rest)) = val.split_once('=') {
                 if let Some(path) = rest.strip_prefix('@') {
                     let content = std::fs::read(path).map_err(|e| {
-                        crate::SpallCliError::Usage(format!(
-                            "Failed to read file {}: {}",
-                            path, e
-                        ))
+                        crate::SpallCliError::Usage(format!("Failed to read file {}: {}", path, e))
                     })?;
-                    let part = reqwest::multipart::Part::bytes(content)
-                        .file_name(path.to_string());
+                    let part = reqwest::multipart::Part::bytes(content).file_name(path.to_string());
                     form = form.part(key.to_string(), part);
                 } else {
                     form = form.text(key.to_string(), rest.to_string());

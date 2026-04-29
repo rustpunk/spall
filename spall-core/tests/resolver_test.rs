@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use openapiv3::{
-    OpenAPI, Operation, PathItem, QueryStyle, ReferenceOr, Schema, SchemaData,
-    SchemaKind, Server, StringType, Type,
+    OpenAPI, Operation, PathItem, QueryStyle, ReferenceOr, Schema, SchemaData, SchemaKind, Server,
+    StringType, Type,
 };
 use spall_core::resolver::{merge_parameters, resolve_security, resolve_spec};
 
@@ -72,10 +72,11 @@ fn ref_resolution_one_level() {
         })),
     };
 
-    spec.components.as_mut().unwrap().schemas.insert(
-        "Foo".to_string(),
-        ReferenceOr::Item(schema),
-    );
+    spec.components
+        .as_mut()
+        .unwrap()
+        .schemas
+        .insert("Foo".to_string(), ReferenceOr::Item(schema));
 
     let resolved = resolve_spec(&spec, "test").unwrap();
     assert_eq!(resolved.title, "ref-test");
@@ -105,10 +106,11 @@ fn ref_cycle_detected() {
         },
     };
 
-    spec.components.as_mut().unwrap().schemas.insert(
-        "SelfRef".to_string(),
-        ReferenceOr::Item(schema),
-    );
+    spec.components
+        .as_mut()
+        .unwrap()
+        .schemas
+        .insert("SelfRef".to_string(), ReferenceOr::Item(schema));
 
     let resolved = resolve_spec(&spec, "test").unwrap();
     // Should not panic; cycle is handled gracefully
@@ -149,10 +151,7 @@ fn ref_depth_limit() {
                 })),
             })
         };
-        spec.components.as_mut().unwrap().schemas.insert(
-            name,
-            next,
-        );
+        spec.components.as_mut().unwrap().schemas.insert(name, next);
     }
 
     let resolved = resolve_spec(&spec, "test").unwrap();
@@ -226,14 +225,12 @@ fn security_inheritance_from_root() {
 #[test]
 fn server_resolution_priority() {
     let mut spec = minimal_spec("server-test");
-    spec.servers = vec![
-        Server {
-            url: "https://spec.com".to_string(),
-            description: None,
-            variables: Some(IndexMap::new()),
-            extensions: IndexMap::new(),
-        },
-    ];
+    spec.servers = vec![Server {
+        url: "https://spec.com".to_string(),
+        description: None,
+        variables: Some(IndexMap::new()),
+        extensions: IndexMap::new(),
+    }];
 
     let mut path = PathItem {
         servers: vec![Server {
@@ -256,7 +253,9 @@ fn server_resolution_priority() {
         ..Default::default()
     });
 
-    spec.paths.paths.insert("/test".to_string(), ReferenceOr::Item(path));
+    spec.paths
+        .paths
+        .insert("/test".to_string(), ReferenceOr::Item(path));
     let resolved = resolve_spec(&spec, "test").unwrap();
 
     assert_eq!(resolved.operations.len(), 1);

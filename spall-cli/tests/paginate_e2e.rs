@@ -2,12 +2,11 @@
 
 use std::process::Command;
 use tempfile::TempDir;
-use wiremock::{MockServer, ResponseTemplate};
 use wiremock::matchers::{method, path};
+use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 fn setup_config_dir(temp: &TempDir, spec_path: &str) {
@@ -62,26 +61,35 @@ async fn paginate_concatenates_three_pages() {
     wiremock::Mock::given(method("GET"))
         .and(path("/items"))
         .and(wiremock::matchers::query_param_is_missing("page"))
-        .respond_with(ResponseTemplate::new(200)
-            .insert_header("link", format!("<http://localhost:{}/items?page=2>; rel=\"next\"", port))
-            .set_body_json(serde_json::json!([{"name": "a"}])))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header(
+                    "link",
+                    format!("<http://localhost:{}/items?page=2>; rel=\"next\"", port),
+                )
+                .set_body_json(serde_json::json!([{"name": "a"}])),
+        )
         .mount(&mock)
         .await;
 
     wiremock::Mock::given(method("GET"))
         .and(path("/items"))
         .and(wiremock::matchers::query_param("page", "2"))
-        .respond_with(ResponseTemplate::new(200)
-            .insert_header("link", format!("<http://localhost:{}/items?page=3>; rel=\"next\"", port))
-            .set_body_json(serde_json::json!([{"name": "b"}])))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header(
+                    "link",
+                    format!("<http://localhost:{}/items?page=3>; rel=\"next\"", port),
+                )
+                .set_body_json(serde_json::json!([{"name": "b"}])),
+        )
         .mount(&mock)
         .await;
 
     wiremock::Mock::given(method("GET"))
         .and(path("/items"))
         .and(wiremock::matchers::query_param("page", "3"))
-        .respond_with(ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!([{"name": "c"}])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{"name": "c"}])))
         .mount(&mock)
         .await;
 
@@ -91,8 +99,11 @@ async fn paginate_concatenates_three_pages() {
         .output()
         .expect("failed to run spall");
 
-    assert!(output.status.success(),
-        "expected success, stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     // Should contain all three items in a single JSON array.

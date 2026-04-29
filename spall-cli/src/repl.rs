@@ -1,7 +1,7 @@
 //! Interactive REPL shell for spall.
 
+use rustyline::{error::ReadlineError, DefaultEditor};
 use std::path::Path;
-use rustyline::{DefaultEditor, error::ReadlineError};
 
 /// Run the spall interactive REPL.
 pub async fn run(
@@ -131,7 +131,13 @@ async fn run_piped(
     registry: &spall_config::registry::ApiRegistry,
     cache_dir: &std::path::Path,
 ) -> Result<(), crate::SpallCliError> {
-    eprintln!("Pipe syntax detected with {} stages: {:?}", stages.len(), stages);
-    eprintln!("Piped execution is not yet implemented — response capture from run_with_args is required.");
+    eprintln!(
+        "Pipe syntax detected with {} stages: {:?}",
+        stages.len(),
+        stages
+    );
+    eprintln!(
+        "Piped execution is not yet implemented — response capture from run_with_args is required."
+    );
     Ok(())
 }

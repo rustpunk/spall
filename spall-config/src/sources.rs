@@ -82,7 +82,9 @@ pub fn config_dir() -> PathBuf {
 /// Expand a leading `~` to the user's home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(path))
+        dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path))
     } else {
         PathBuf::from(path)
     }
@@ -119,12 +121,19 @@ pub fn load_global_config() -> Result<GlobalConfig, SpallConfigError> {
         })
         .collect();
 
-    let spec_dirs = cfg.spec_dirs.into_iter().map(|s| expand_tilde(&s)).collect();
+    let spec_dirs = cfg
+        .spec_dirs
+        .into_iter()
+        .map(|s| expand_tilde(&s))
+        .collect();
 
     let defaults = GlobalDefaults {
         output: cfg.defaults.as_ref().and_then(|d| d.output.clone()),
         color: cfg.defaults.as_ref().and_then(|d| d.color.clone()),
-        proxy: cfg.defaults.as_ref().and_then(|d| d.proxy.as_ref().and_then(|p| p.url.clone())),
+        proxy: cfg
+            .defaults
+            .as_ref()
+            .and_then(|d| d.proxy.as_ref().and_then(|p| p.url.clone())),
     };
 
     Ok(GlobalConfig {
@@ -158,35 +167,39 @@ pub fn scan_api_configs() -> Result<Vec<ApiEntry>, SpallConfigError> {
                 let mut auth = cfg.auth;
                 if let Some(ref mut a) = auth {
                     if a.token_url.is_none() {
-                        if let (Some(svc), Some(usr)) = (a.keyring_service.clone(), a.keyring_user.clone()) {
+                        if let (Some(svc), Some(usr)) =
+                            (a.keyring_service.clone(), a.keyring_user.clone())
+                        {
                             a.token_url = Some(format!("keyring://{}/{}", svc, usr));
                         }
                     }
                 }
 
-                let profiles: std::collections::HashMap<String, crate::registry::ProfileConfig> = cfg
-                    .profile
-                    .into_iter()
-                    .map(|(name, p)| {
-                        let mut profile_auth = p.auth;
-                        if let Some(ref mut a) = profile_auth {
-                            if a.token_url.is_none() {
-                                if let (Some(svc), Some(usr)) = (a.keyring_service.clone(), a.keyring_user.clone()) {
-                                    a.token_url = Some(format!("keyring://{}/{}", svc, usr));
+                let profiles: std::collections::HashMap<String, crate::registry::ProfileConfig> =
+                    cfg.profile
+                        .into_iter()
+                        .map(|(name, p)| {
+                            let mut profile_auth = p.auth;
+                            if let Some(ref mut a) = profile_auth {
+                                if a.token_url.is_none() {
+                                    if let (Some(svc), Some(usr)) =
+                                        (a.keyring_service.clone(), a.keyring_user.clone())
+                                    {
+                                        a.token_url = Some(format!("keyring://{}/{}", svc, usr));
+                                    }
                                 }
                             }
-                        }
-                        (
-                            name,
-                            crate::registry::ProfileConfig {
-                                base_url: p.base_url,
-                                headers: p.headers.into_iter().collect(),
-                                auth: profile_auth,
-                                proxy: p.proxy,
-                            },
-                        )
-                    })
-                    .collect();
+                            (
+                                name,
+                                crate::registry::ProfileConfig {
+                                    base_url: p.base_url,
+                                    headers: p.headers.into_iter().collect(),
+                                    auth: profile_auth,
+                                    proxy: p.proxy,
+                                },
+                            )
+                        })
+                        .collect();
 
                 entries.push(ApiEntry {
                     name,

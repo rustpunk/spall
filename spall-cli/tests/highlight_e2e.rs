@@ -2,12 +2,11 @@
 
 use std::process::Command;
 use tempfile::TempDir;
-use wiremock::{MockServer, ResponseTemplate};
 use wiremock::matchers::{method, path};
+use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 fn setup_config_dir(temp: &TempDir, spec_path: &str) {
@@ -58,8 +57,10 @@ async fn pretty_json_contains_ansi_escape_codes() {
 
     wiremock::Mock::given(method("GET"))
         .and(path("/obj"))
-        .respond_with(ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!({"name": "test", "count": 42})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name": "test", "count": 42})),
+        )
         .mount(&mock)
         .await;
 
@@ -70,11 +71,22 @@ async fn pretty_json_contains_ansi_escape_codes() {
         .output()
         .expect("failed to run spall");
 
-    assert!(output.status.success(),
-        "expected success, stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("test"), "missing 'test' in output: {}", stdout);
+    assert!(
+        stdout.contains("test"),
+        "missing 'test' in output: {}",
+        stdout
+    );
     // Assert syntect injected ANSI escape codes
-    assert!(stdout.contains("\x1b["), "expected ANSI escape codes in pretty JSON output: {}", stdout);
+    assert!(
+        stdout.contains("\x1b["),
+        "expected ANSI escape codes in pretty JSON output: {}",
+        stdout
+    );
 }

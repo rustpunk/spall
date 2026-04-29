@@ -108,7 +108,9 @@ pub fn response_validate(
         .unwrap_or(content_type)
         .trim();
 
-    let Some(mt) = response.content.get(ct_clean)
+    let Some(mt) = response
+        .content
+        .get(ct_clean)
         .or_else(|| response.content.get("application/json"))
         .or_else(|| response.content.values().next())
     else {
@@ -132,9 +134,6 @@ pub fn format_errors(errors: &[ValidationError]) -> String {
 }
 
 /// Validate a raw CLI argument value against a schema for ad-hoc use.
-pub fn validate_value_raw(
-    value: &str,
-    schema: &ResolvedSchema,
-) -> Result<(), ValidationError> {
+pub fn validate_value_raw(value: &str, schema: &ResolvedSchema) -> Result<(), ValidationError> {
     validate_param(value, schema)
 }

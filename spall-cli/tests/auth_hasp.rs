@@ -6,8 +6,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 fn minimal_spec(port: u16) -> String {
@@ -94,7 +93,10 @@ async fn bearer_auth_from_file_via_hasp() {
         &temp,
         "testapi",
         &spec_path,
-        &format!("\n[auth]\nkind = \"bearer\"\ntoken_url = \"{}\"\n", file_url),
+        &format!(
+            "\n[auth]\nkind = \"bearer\"\ntoken_url = \"{}\"\n",
+            file_url
+        ),
     );
 
     wiremock::Mock::given(method("GET"))

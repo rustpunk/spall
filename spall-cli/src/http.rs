@@ -1,5 +1,5 @@
-use reqwest::{Client, ClientBuilder, Proxy, redirect::Policy};
 use crate::matches::MergedMatches;
+use reqwest::{redirect::Policy, Client, ClientBuilder, Proxy};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -43,7 +43,10 @@ impl Default for HttpConfig {
 
 /// Build `HttpConfig` from clap matches, checking Phase 1 then Phase 2.
 pub fn config_from_matches(p1: &clap::ArgMatches, p2: &clap::ArgMatches) -> HttpConfig {
-    let m = MergedMatches { phase1: p1, phase2: p2 };
+    let m = MergedMatches {
+        phase1: p1,
+        phase2: p2,
+    };
     let mut cfg = HttpConfig::default();
 
     if let Some(timeout) = m.get_one::<u64>("spall-timeout") {
@@ -107,7 +110,10 @@ pub fn resolve_proxy(
     p1: &clap::ArgMatches,
     p2: &clap::ArgMatches,
 ) -> Option<String> {
-    let m = MergedMatches { phase1: p1, phase2: p2 };
+    let m = MergedMatches {
+        phase1: p1,
+        phase2: p2,
+    };
 
     if m.get_flag("spall-no-proxy") {
         return None;
@@ -142,16 +148,8 @@ fn env_proxy() -> Option<String> {
     std::env::var("HTTPS_PROXY")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("HTTP_PROXY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            std::env::var("ALL_PROXY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
+        .or_else(|| std::env::var("HTTP_PROXY").ok().filter(|s| !s.is_empty()))
+        .or_else(|| std::env::var("ALL_PROXY").ok().filter(|s| !s.is_empty()))
 }
 
 /// Build a `reqwest::Client` from `HttpConfig`.
@@ -174,8 +172,7 @@ pub fn build_http_client(config: &HttpConfig) -> Result<Client, reqwest::Error> 
     // TODO: CA cert, client cert + key.
 
     if let Some(proxy_url) = &config.proxy {
-        let proxy = Proxy::all(proxy_url)?
-            .no_proxy(reqwest::NoProxy::from_env());
+        let proxy = Proxy::all(proxy_url)?.no_proxy(reqwest::NoProxy::from_env());
         builder = builder.proxy(proxy);
     }
 
@@ -192,8 +189,7 @@ pub fn build_fetch_client(proxy_url: Option<&str>) -> Result<Client, reqwest::Er
         .redirect(Policy::limited(5));
 
     if let Some(url) = proxy_url {
-        let proxy = Proxy::all(url)?
-            .no_proxy(reqwest::NoProxy::from_env());
+        let proxy = Proxy::all(url)?.no_proxy(reqwest::NoProxy::from_env());
         builder = builder.proxy(proxy);
     }
 

@@ -6,8 +6,7 @@ use wiremock::matchers::method;
 use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 fn setup_api_config(temp: &TempDir, spec_path: &str) {
@@ -85,7 +84,11 @@ async fn repeat_replays_most_recent_request() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("call"), "Expected replay output, got: {}", stdout);
+    assert!(
+        stdout.contains("call"),
+        "Expected replay output, got: {}",
+        stdout
+    );
 }
 
 #[tokio::test]

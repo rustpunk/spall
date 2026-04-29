@@ -62,7 +62,8 @@ pub fn write_cache(
 
     let ir_bytes = postcard::to_allocvec(spec).map_err(|e| SpallCoreError::Cache(e.to_string()))?;
     let index = spec.to_index();
-    let idx_bytes = postcard::to_allocvec(&index).map_err(|e| SpallCoreError::Cache(e.to_string()))?;
+    let idx_bytes =
+        postcard::to_allocvec(&index).map_err(|e| SpallCoreError::Cache(e.to_string()))?;
     let meta = CacheMeta {
         source: source.to_string(),
         raw_hash,
@@ -72,7 +73,8 @@ pub fn write_cache(
             .unwrap_or_default()
             .as_secs(),
     };
-    let meta_bytes = postcard::to_allocvec(&meta).map_err(|e| SpallCoreError::Cache(e.to_string()))?;
+    let meta_bytes =
+        postcard::to_allocvec(&meta).map_err(|e| SpallCoreError::Cache(e.to_string()))?;
 
     atomic_write(&paths.ir, &ir_bytes).map_err(|e| SpallCoreError::Io(e.to_string()))?;
     atomic_write(&paths.idx, &idx_bytes).map_err(|e| SpallCoreError::Io(e.to_string()))?;
@@ -155,7 +157,7 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{HttpMethod, ResolvedOperation, ResolvedSpec, ResolvedServer};
+    use crate::ir::{HttpMethod, ResolvedOperation, ResolvedServer, ResolvedSpec};
 
     fn dummy_spec(title: &str) -> ResolvedSpec {
         ResolvedSpec {
@@ -228,7 +230,8 @@ mod tests {
         // Should fall back to parsing (which will fail because raw isn't valid),
         // but since raw is not valid OpenAPI, load_spec_from_bytes will fail.
         // Instead use valid raw bytes:
-        let raw_valid = b"openapi: 3.0.0\ninfo:\n  title: CorruptRecovered\n  version: '1'\npaths: {}";
+        let raw_valid =
+            b"openapi: 3.0.0\ninfo:\n  title: CorruptRecovered\n  version: '1'\npaths: {}";
         let loaded = load_or_resolve("src3", raw_valid, tmp.path()).unwrap();
         assert_eq!(loaded.title, "CorruptRecovered");
     }

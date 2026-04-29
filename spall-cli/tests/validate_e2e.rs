@@ -2,13 +2,12 @@
 
 use std::process::Command;
 use tempfile::TempDir;
+use wiremock::matchers::method;
 use wiremock::Match;
 use wiremock::{MockServer, ResponseTemplate};
-use wiremock::matchers::method;
 
 fn bin_path() -> String {
-    std::env::var("CARGO_BIN_EXE_spall")
-        .unwrap_or_else(|_| String::from("target/debug/spall"))
+    std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }
 
 fn setup_config_dir(temp: &TempDir, spec_path: &str) {

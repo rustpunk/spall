@@ -49,9 +49,9 @@ mod tests {
     fn sensitive_detection() {
         assert!(is_sensitive(&reqwest::header::AUTHORIZATION));
         assert!(is_sensitive(&reqwest::header::COOKIE));
-        assert!(is_sensitive(
-            &reqwest::header::HeaderName::from_static("x-api-key")
-        ));
+        assert!(is_sensitive(&reqwest::header::HeaderName::from_static(
+            "x-api-key"
+        )));
         assert!(!is_sensitive(&reqwest::header::CONTENT_TYPE));
     }
 }
