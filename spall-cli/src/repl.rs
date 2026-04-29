@@ -27,6 +27,14 @@ pub async fn run(
                     eprintln!("Warning: failed to add history entry: {}", e);
                 }
 
+                if trimmed.contains('|') {
+                    let stages: Vec<&str> = trimmed.split('|').map(|s| s.trim()).collect();
+                    if let Err(e) = run_piped(&stages, registry, cache_dir).await {
+                        eprintln!("Pipe error: {:?}", e);
+                    }
+                    continue;
+                }
+
                 match trimmed {
                     "quit" | "exit" => break,
                     "help" => {
@@ -115,5 +123,15 @@ fn show_history(cache_dir: &Path) -> Result<(), crate::SpallCliError> {
             r.id, ts, r.api, r.operation, r.method, r.url, r.duration_ms
         );
     }
+    Ok(())
+}
+
+async fn run_piped(
+    stages: &[&str],
+    registry: &spall_config::registry::ApiRegistry,
+    cache_dir: &std::path::Path,
+) -> Result<(), crate::SpallCliError> {
+    eprintln!("Pipe syntax detected with {} stages: {:?}", stages.len(), stages);
+    eprintln!("Piped execution is not yet implemented — response capture from run_with_args is required.");
     Ok(())
 }
