@@ -2,9 +2,10 @@ use crate::error::SpallCoreError;
 use crate::ir::ResolvedSpec;
 use crate::resolver::resolve_spec;
 
-/// Load and resolve an OpenAPI spec from a file path or URL.
+/// Load and resolve an OpenAPI spec from a file path.
 ///
-/// Wave 1: supports file paths. URL loading is deferred to Wave 1.5.
+/// For URL sources, the CLI layer (`spall_cli::fetch`) handles HTTP fetching
+/// and passes the resolved bytes to `load_spec_from_bytes` directly.
 pub fn load_spec(source: &str) -> Result<ResolvedSpec, SpallCoreError> {
     let raw = load_raw(source)?;
     load_spec_from_bytes(&raw, source)
@@ -39,13 +40,14 @@ pub fn load_spec_from_bytes(raw: &[u8], source: &str) -> Result<ResolvedSpec, Sp
     resolve_spec(&openapi, source)
 }
 
-/// Load raw spec bytes from a source.
-///
-/// Wave 1: local file system only. Wave 1.5: URL fetching with caching.
+/// Load raw bytes from a local file path.
 pub fn load_raw(source: &str) -> Result<Vec<u8>, SpallCoreError> {
     if source.starts_with("http://") || source.starts_with("https://") {
         return Err(SpallCoreError::InvalidSource(
-            format!("URL sources not yet supported in Wave 1: {}", source),
+            format!(
+                "URL sources require the CLI fetch layer (spall_cli::fetch), not spall_core::loader: {}",
+                source
+            ),
         ));
     }
 
