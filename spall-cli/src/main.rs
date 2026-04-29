@@ -1,5 +1,6 @@
 //! spall-cli: Binary entry point. Two-phase clap parse and dispatch.
 
+mod chain;
 mod commands;
 mod completions;
 mod discover;
@@ -655,5 +656,10 @@ fn spall_global_args() -> Vec<Arg> {
             .long("filter")
             .global(true)
             .help("JMESPath filter expression for JSON responses"),
+        Arg::new("spall-chain")
+            .long("spall-chain")
+            .value_name("EXPR")
+            .global(true)
+            .help("Chain request: capture values from response and feed into another operation (e.g. 'op2 --id $.data.id')"),
     ]
 }
