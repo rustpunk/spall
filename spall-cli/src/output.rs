@@ -1,6 +1,10 @@
 //! Response formatting, TTY detection, and output modes.
 
 use is_terminal::IsTerminal;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+use syntect::util::as_24_bit_terminal_escaped;
 use std::io::{self, Write};
 
 /// Output mode for formatting responses.
@@ -73,7 +77,8 @@ pub fn emit_response(
         OutputMode::Pretty => {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
                 if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-                    io::stdout().write_all(pretty.as_bytes())?;
+                    let highlighted = highlight_json(&pretty);
+                    io::stdout().write_all(highlighted.as_bytes())?;
                     io::stdout().write_all(b"\n")?;
                 } else {
                     io::stdout().write_all(body)?;
@@ -118,7 +123,8 @@ pub fn emit_json_value(
     match mode {
         OutputMode::Pretty => {
             let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
-            io::stdout().write_all(pretty.as_bytes())?;
+            let highlighted = highlight_json(&pretty);
+            io::stdout().write_all(highlighted.as_bytes())?;
             io::stdout().write_all(b"\n")?;
         }
         OutputMode::Raw => {
@@ -147,6 +153,40 @@ pub fn emit_json_value(
     }
 
     Ok(())
+}
+
+/// Highlight a JSON string with syntect using the base16-ocean.dark theme.
+/// Falls back to the plain string if highlighting fails.
+fn highlight_json(json_str: &str) -> String {
+    let ss = SyntaxSet::load_defaults_newlines();
+    let ts = ThemeSet::load_defaults();
+    let syntax = match ss.find_syntax_by_extension("json") {
+        Some(s) => s,
+        None => return json_str.to_string(),
+    };
+    let theme = match ts.themes.get("base16-ocean.dark") {
+        Some(t) => t,
+        None => return json_str.to_string(),
+    };
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut output = String::new();
+    for line in json_str.lines() {
+        let regions = match highlighter.highlight_line(line, &ss) {
+            Ok(r) => r,
+            Err(_) => {
+                output.push_str(line);
+                output.push('\n');
+                continue;
+            }
+        };
+        output.push_str(&as_24_bit_terminal_escaped(&regions[..], false));
+        output.push('\n');
+    }
+    // Remove trailing newline if input didn't end with one, to preserve exact formatting.
+    if !json_str.ends_with('\n') {
+        output.pop();
+    }
+    output
 }
 
 fn mode_name(mode: OutputMode) -> &'static str {

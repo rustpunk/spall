@@ -71,6 +71,7 @@ spall petstore get-pet-by-id 1 --spall-retry 3 --spall-follow
 
 ```bash
 spall --spall-repeat
+spall history show 42 --spall-repeat
 ```
 
 ## Next Steps

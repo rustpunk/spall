@@ -12,6 +12,7 @@ mod output;
 mod paginate;
 mod preview;
 mod repeat;
+mod repl;
 mod validate;
 mod auth;
 
@@ -108,14 +109,23 @@ async fn run() -> miette::Result<()> {
         .unwrap_or_else(|| spall_config::sources::config_dir().join("cache"));
     std::fs::create_dir_all(&cache_dir).ok();
 
+    run_with_args(&args, &registry, &cache_dir).await
+}
+
+/// Run spall with an explicit argument vector. Used by the REPL.
+pub async fn run_with_args(
+    args: &[String],
+    registry: &ApiRegistry,
+    cache_dir: &std::path::Path,
+) -> miette::Result<()> {
     // Fast path: `spall <api> --help` / `spall <api> -h` bypasses Phase 1
     // because Phase 1 stubs have disable_help_flag(true) and would error.
-    if let Some(api_name) = detect_api_help(&registry, &args) {
-        return show_api_help(&registry, &api_name, &cache_dir).await;
+    if let Some(api_name) = detect_api_help(registry, args) {
+        return show_api_help(registry, &api_name, cache_dir).await;
     }
 
-    let mut phase1 = build_phase1(&registry);
-    let phase1_matches = match phase1.clone().try_get_matches_from(&args) {
+    let mut phase1 = build_phase1(registry);
+    let phase1_matches = match phase1.clone().try_get_matches_from(args) {
         Ok(m) => m,
         Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {
             e.print().map_err(|e| SpallCliError::Usage(e.to_string()))?;
@@ -141,16 +151,17 @@ async fn run() -> miette::Result<()> {
             }
             _ => None,
         };
-        return crate::repeat::replay(&cache_dir,
+        return crate::repeat::replay(cache_dir,
             entry_id,
         ).await.map_err(Into::into);
     }
 
     match phase1_matches.subcommand() {
+        Some(("repl", _)) => repl::run(cache_dir, registry).await.map_err(Into::into),
         Some(("api", sub)) => {
-            // --spall-repeat on `api discover` is a no-op, but let’s handle it
+            // --spall-repeat on `api discover` is a no-op, but let's handle it
             // consistently.  If the subcommand is "discover" we ignore the flag.
-            commands::api::handle_api_management(sub, &cache_dir).await
+            commands::api::handle_api_management(sub, cache_dir).await
         }
         Some(("auth", sub)) => commands::auth::handle_auth(sub).await,
         Some(("completions", sub)) => {
@@ -160,11 +171,11 @@ async fn run() -> miette::Result<()> {
             println!("{}", script);
             Ok(())
         }
-        Some(("history", sub)) => commands::history::handle_history(sub, &cache_dir),
-        Some(("__complete", sub)) => handle_complete(sub, &registry).await,
+        Some(("history", sub)) => commands::history::handle_history(sub, cache_dir),
+        Some(("__complete", sub)) => handle_complete(sub, registry).await,
         Some((api_name, api_matches)) => {
             let remaining = execute::collect_remaining_args(api_matches);
-            handle_api_operation(api_name, remaining, &registry, &phase1_matches, &cache_dir).await
+            handle_api_operation(api_name, remaining, registry, &phase1_matches, cache_dir).await
         }
         None => {
             phase1.print_help().map_err(|e| SpallCliError::Usage(e.to_string()))?;
@@ -438,6 +449,10 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
                 .about("Internal completion helper")
                 .arg(Arg::new("api").required(true).help("API name"))
                 .arg(Arg::new("word").help("Partial word to complete")),
+        )
+        .subcommand(
+            Command::new("repl")
+                .about("Start an interactive REPL shell"),
         )
         .args(spall_global_args());
 

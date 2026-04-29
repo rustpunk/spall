@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct SpallConfig {
     #[serde(default)]
     api: Vec<InlineApi>,
@@ -19,12 +20,14 @@ struct SpallConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct InlineApi {
     name: String,
     spec: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct Defaults {
     output: Option<String>,
     color: Option<String>,
@@ -33,11 +36,13 @@ struct Defaults {
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProxyDefaults {
     url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct ApiToml {
     source: String,
     #[serde(default)]
@@ -53,6 +58,7 @@ struct ApiToml {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProfileToml {
     base_url: Option<String>,
     #[serde(default)]
@@ -258,4 +264,47 @@ pub struct GlobalDefaults {
     pub output: Option<String>,
     pub color: Option<String>,
     pub proxy: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reject_unknown_fields_api_toml() {
+        let input = r#"
+source = "petstore.json"
+baseurl = "https://example.com"
+"#;
+        let result = toml::from_str::<ApiToml>(input);
+        assert!(result.is_err(), "expected error for unknown field baseurl");
+    }
+
+    #[test]
+    fn test_reject_unknown_fields_spall_config() {
+        let input = r#"
+unknown_key = "value"
+"#;
+        let result = toml::from_str::<SpallConfig>(input);
+        assert!(result.is_err(), "expected error for unknown top-level key");
+    }
+
+    #[test]
+    fn test_empty_config() {
+        let cfg: SpallConfig = toml::from_str("").expect("empty string should parse");
+        assert!(cfg.api.is_empty());
+    }
+
+    #[test]
+    fn test_defaults_populated() {
+        let input = r#"
+[defaults]
+output = "json"
+color = "auto"
+"#;
+        let cfg: SpallConfig = toml::from_str(input).expect("valid defaults should parse");
+        let defaults = cfg.defaults.expect("defaults should be present");
+        assert_eq!(defaults.output, Some("json".to_string()));
+        assert_eq!(defaults.color, Some("auto".to_string()));
+    }
 }

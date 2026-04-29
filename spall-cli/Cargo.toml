@@ -32,6 +32,9 @@ jmespath = "0.5"
 chrono = "0.4"
 base64 = "0.22"
 rpassword = "7"
+syntect = "5"
+rustyline = "14"
+shlex = "1"
 hasp = { git = "https://github.com/rustpunk/hasp", default-features = false, features = ["env", "keyring", "file"], optional = true }
 
 [dev-dependencies]

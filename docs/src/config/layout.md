@@ -59,7 +59,7 @@ base_url = "https://staging.petstore.io"
 kind = "Bearer"
 token_url = "env://PETSTORE_TOKEN"
 
-[default_headers]
+[headers]
 X-Client = "spall-cli"
 
 [profiles]
@@ -81,10 +81,10 @@ The `auth` table supports inline tokens, environment variables, and `hasp` secre
 | `base_url` | string | Override the spec's server URL |
 | `proxy` | string | HTTP/SOCKS proxy URL for this API |
 | `auth` | table | Auth configuration (tokens, env vars, `hasp` secret URLs) |
-| `default_headers` | table | Headers added to every request |
+| `headers` | table | Headers added to every request |
 | `profiles` | table | Named environment overlays |
 
-## Proxy
+## Cache
 
 Spall manages the `cache/` directory automatically. You should not need to edit these files directly.
 

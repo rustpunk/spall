@@ -36,6 +36,7 @@ impl Default for ApiKeyLocation {
 ///
 /// Not all fields apply to every `AuthKind`; unused fields are ignored.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Auth kind. When omitted the resolver defaults to [`AuthKind::Bearer`].
     #[serde(default)]

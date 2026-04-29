@@ -1,22 +1,5 @@
 # Authentication
 
-Spall supports Bearer tokens, Basic auth, API keys, and OAuth2 pass-through. Auth resolution follows a strict priority chain so that scripts, CI, and interactive sessions can coexist.
-
-## Resolution Priority
-
-When spall needs credentials for an API, it resolves them in this order:
-
-1. `--spall-auth` CLI override
-2. `auth.token` inline in per-API TOML (warns on use)
-3. `auth.token_url` via [hasp](#secret-urls-with-hasp) (`keyring://` / `env://` / `file://`)
-4. `auth.password_url` for Basic auth via [hasp](#secret-urls-with-hasp)
-5. `auth.token_env` / `auth.password_env` environment variables
-6. Global `SPALL_<API>_TOKEN` env var (Wave 1–2 compat)
-7. OAuth2 session token (stub — persistence not yet implemented)
-8. Interactive password prompt for Basic auth (TTY only)
-
-If a configured `hasp` URL fails to resolve, the request **fails fast** with an explicit error rather than falling through to the next source.
-
 ## Quick Pass-Through with `--spall-auth`
 
 For one-off testing, pass a token or credentials directly:
@@ -93,11 +76,11 @@ token_url = "keyring://spall/github-token"
 
 ## Secret URLs with `hasp`
 
-Spall integrates with [`hasp`](https://github.com/rustpunk/hasp) for fetching secrets from multiple backends via URL-style references. This is the **recommended** way to manage credentials:
+Spall integrates with [`hasp`](https://github.com/rustpunk/hasp) for fetching secrets from multiple backends via URL-style references. This is the **recommended** way to manage credentials. The default build includes three backends:
 
 | Field | Auth Kinds | Example URL |
 |-------|------------|-------------|
-| `token_url` | `Bearer`, `ApiKey`, `OAuth2` | `env://MY_TOKEN`, `file:~/.secrets/api.key`, `keyring://spall/api-token` |
+| `token_url` | `Bearer`, `ApiKey`, `OAuth2` | `env://MY_TOKEN`, `file:~/secrets/api.key`, `keyring://spall/api-token` |
 | `password_url` | `Basic` | `env://ALICE_PASSWORD`, `file:/run/secrets/password`, `keyring://spall/alice-pass` |
 | `client_secret_url` | `OAuth2` | `env://CLIENT_SECRET` (PKCE flow stub) |
 
@@ -108,6 +91,12 @@ Spall integrates with [`hasp`](https://github.com/rustpunk/hasp) for fetching se
 | `env://` | `env://VAR_NAME` | CI, Docker, local overrides |
 | `file://` | `file:///absolute/path` or `file:~/relative` | Kubernetes secret mounts, dotfiles |
 | `keyring://` | `keyring://service/entry` | macOS Keychain, GNOME Keyring, Windows Credential Manager |
+
+`hasp` is enabled by default. If you need additional backends (HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, 1Password, Bitwarden), build with the `hasp-full` feature:
+
+```bash
+cargo install spall-cli --features hasp-full
+```
 
 ### Examples
 
@@ -138,20 +127,6 @@ username = "alice"
 password_url = "env://ALICE_PASSWORD"
 ```
 
-### Backend Availability
-
-The default spall binary enables three lightweight `hasp` backends:
-
-- `env://` — zero-cost, perfect for CI.
-- `file://` — for Docker/Kubernetes secret mounts.
-- `keyring://` — for developer workstations.
-
-Enterprise cloud secret managers (HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, 1Password, Bitwarden) are available by building with the `hasp-full` feature:
-
-```bash
-cargo install spall-cli --features hasp-full
-```
-
 ## Inline Tokens (Discouraged)
 
 You can embed a token directly in the config file:
@@ -162,7 +137,7 @@ kind = "Bearer"
 token = "ghp_xxxxxxxx"
 ```
 
-Spall will accept it but prints a warning recommending `token_url` (keyring/env/file) or `token_env` instead.
+Spall will accept it but prints a warning recommending `token_url` or `token_env` instead.
 
 ## Credential Hygiene
 

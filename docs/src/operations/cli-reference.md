@@ -12,6 +12,7 @@ spall [OPTIONS] <COMMAND>
 | `spall auth ...` | Authentication commands |
 | `spall history ...` | Request/response history |
 | `spall completions ...` | Generate shell completion scripts |
+| `spall repl` | Start the interactive REPL shell |
 | `spall <api> <operation> [args]` | Execute an API operation |
 
 ## `spall api`

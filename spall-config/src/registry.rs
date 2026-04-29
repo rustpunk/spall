@@ -47,6 +47,14 @@ pub struct ProfileConfig {
 }
 
 impl ApiRegistry {
+    /// Test-friendly constructor from pre-built entries.
+    pub fn from_entries(
+        entries: Vec<ApiEntry>,
+        defaults: crate::sources::GlobalDefaults,
+    ) -> Self {
+        Self { apis: entries, defaults }
+    }
+
     /// Build the registry from config sources.
     ///
     /// Scans `config.toml`, `apis/*.toml`, and `spec_dirs`.

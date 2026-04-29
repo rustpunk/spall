@@ -37,9 +37,9 @@ After the first parse, spall serializes the resolved spec to a compact binary fo
 Auth resolution follows a strict priority chain so that scripts, CI, and interactive sessions can all coexist:
 
 1. `--spall-auth` CLI override
-2. Per-API config `[auth]` section
-3. Environment variable (`SPALL_<API>_TOKEN`)
-4. Interactive prompt (Basic auth only, TTY)
+2. Per-API config `[auth]` section via `token_url` / `password_url` (`hasp`), `token_env` / `password_env`, or inline `token` (warned)
+3. Legacy global `SPALL_<API>_TOKEN` env var (Wave 1–2 compat)
+4. Interactive password prompt for Basic (TTY)
 
 All credentials are wrapped in `secrecy::SecretString` — they are zeroized on drop and redacted from debug output and history.
 

@@ -15,7 +15,7 @@ Think **Restish, but Rust**.
 - **Two-phase parsing** for fast startup and rich per-operation help.
 - **Schema-aware argument validation** and typed flags.
 - **Colored, formatted response output** with TTY detection.
-- **Request history**, **shell completions**, **pagination**, and **JMESPath filtering**.
+- **Request history**, **shell completions**, **pagination**, **REPL shell**, and **JMESPath filtering**.
 
 ## Quick Usage
 

@@ -18,7 +18,7 @@ spall --version
 
 ## Build from Source
 
-Requires Rust 1.75+.
+Requires Rust 1.80+.
 
 ```bash
 git clone https://github.com/rustpunk/spall.git

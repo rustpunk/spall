@@ -41,6 +41,7 @@ When a profile is active, its values override the base config:
 
 - `base_url` replaces the base config value entirely.
 - `auth` replaces the base config auth entirely.
+- `proxy` replaces the base config proxy value entirely.
 - `headers` are merged: profile headers with the same key override base headers; new keys are appended.
 
 If the requested profile does not exist, spall exits with a usage error.
