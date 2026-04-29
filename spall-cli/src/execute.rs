@@ -1,4 +1,5 @@
 use clap::ArgMatches;
+use crate::matches::MergedMatches;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE};
 use secrecy::ExposeSecret;
 use spall_config::registry::ApiEntry;
@@ -412,28 +413,6 @@ fn determine_output_mode(combined: &MergedMatches) -> crate::output::OutputMode 
 /// Merge Phase 1 and Phase 2 ArgMatches, preferring Phase 2 for overlapping values.
 fn merge_matches<'a>(phase1: &'a ArgMatches, phase2: &'a ArgMatches) -> MergedMatches<'a> {
     MergedMatches { phase1, phase2 }
-}
-
-struct MergedMatches<'a> {
-    phase1: &'a ArgMatches,
-    phase2: &'a ArgMatches,
-}
-
-impl MergedMatches<'_> {
-    fn get_flag(&self, id: &str) -> bool {
-        self.phase2.get_flag(id) || self.phase1.get_flag(id)
-    }
-
-    fn get_one<T: Clone + Send + Sync + 'static>(&self, id: &str) -> Option<T> {
-        self.phase2.get_one::<T>(id).cloned().or_else(|| self.phase1.get_one::<T>(id).cloned())
-    }
-
-    fn get_many<T: Clone + Send + Sync + 'static>(
-        &self,
-        id: &str,
-    ) -> Option<clap::parser::ValuesRef<'_, T>> {
-        self.phase2.get_many::<T>(id).or_else(|| self.phase1.get_many::<T>(id))
-    }
 }
 
 /// Build the full request URL.

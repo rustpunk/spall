@@ -1,4 +1,5 @@
 use reqwest::{Client, ClientBuilder, Proxy, redirect::Policy};
+use crate::matches::MergedMatches;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -42,51 +43,44 @@ impl Default for HttpConfig {
 
 /// Build `HttpConfig` from clap matches, checking Phase 1 then Phase 2.
 pub fn config_from_matches(p1: &clap::ArgMatches, p2: &clap::ArgMatches) -> HttpConfig {
+    let m = MergedMatches { phase1: p1, phase2: p2 };
     let mut cfg = HttpConfig::default();
 
-    let get_timeout = || p2.get_one::<u64>("spall-timeout").or(p1.get_one::<u64>("spall-timeout"));
-    if let Some(timeout) = get_timeout() {
-        cfg.timeout = Duration::from_secs(*timeout);
+    if let Some(timeout) = m.get_one::<u64>("spall-timeout") {
+        cfg.timeout = Duration::from_secs(timeout);
     }
 
-    let get_retry = || p2.get_one::<u8>("spall-retry").or(p1.get_one::<u8>("spall-retry"));
-    if let Some(retry) = get_retry() {
-        cfg.retry = *retry;
+    if let Some(retry) = m.get_one::<u8>("spall-retry") {
+        cfg.retry = retry;
     }
 
-    cfg.follow_redirects = p2.get_flag("spall-follow") || p1.get_flag("spall-follow");
+    cfg.follow_redirects = m.get_flag("spall-follow");
 
-    let get_max = || p2.get_one::<usize>("spall-max-redirects").or(p1.get_one::<usize>("spall-max-redirects"));
-    if let Some(max) = get_max() {
-        cfg.max_redirects = *max;
+    if let Some(max) = m.get_one::<usize>("spall-max-redirects") {
+        cfg.max_redirects = max;
     }
 
-    cfg.insecure = p2.get_flag("spall-insecure") || p1.get_flag("spall-insecure");
+    cfg.insecure = m.get_flag("spall-insecure");
 
-    let get_cert = || p2.get_one::<String>("spall-ca-cert").or(p1.get_one::<String>("spall-ca-cert"));
-    if let Some(cert) = get_cert() {
-        cfg.ca_cert = Some(cert.clone());
+    if let Some(cert) = m.get_one::<String>("spall-ca-cert") {
+        cfg.ca_cert = Some(cert);
     }
 
-    cfg.no_proxy = p2.get_flag("spall-no-proxy") || p1.get_flag("spall-no-proxy");
+    cfg.no_proxy = m.get_flag("spall-no-proxy");
 
-    let get_proxy = || p2.get_one::<String>("spall-proxy").or(p1.get_one::<String>("spall-proxy"));
-    if let Some(proxy) = get_proxy() {
-        cfg.proxy = Some(proxy.clone());
+    if let Some(proxy) = m.get_one::<String>("spall-proxy") {
+        cfg.proxy = Some(proxy);
     }
 
-    let get_server = || p2.get_one::<String>("spall-server").or(p1.get_one::<String>("spall-server"));
-    if let Some(server) = get_server() {
-        cfg.base_url_override = Some(server.clone());
+    if let Some(server) = m.get_one::<String>("spall-server") {
+        cfg.base_url_override = Some(server);
     }
 
-    let get_auth = || p2.get_one::<String>("spall-auth").or(p1.get_one::<String>("spall-auth"));
-    if let Some(auth) = get_auth() {
-        cfg.auth_header = Some(auth.clone());
+    if let Some(auth) = m.get_one::<String>("spall-auth") {
+        cfg.auth_header = Some(auth);
     }
 
-    let get_headers = || p2.get_many::<String>("spall-header").or(p1.get_many::<String>("spall-header"));
-    if let Some(headers) = get_headers() {
+    if let Some(headers) = m.get_many::<String>("spall-header") {
         for h in headers {
             if let Some((k, v)) = h.split_once(':') {
                 cfg.custom_headers
@@ -113,15 +107,14 @@ pub fn resolve_proxy(
     p1: &clap::ArgMatches,
     p2: &clap::ArgMatches,
 ) -> Option<String> {
-    let no_proxy = get_flag_safe(p2, "spall-no-proxy") || get_flag_safe(p1, "spall-no-proxy");
-    if no_proxy {
+    let m = MergedMatches { phase1: p1, phase2: p2 };
+
+    if m.get_flag("spall-no-proxy") {
         return None;
     }
 
-    let cli = get_one_safe::<String>(p2, "spall-proxy")
-        .or_else(|| get_one_safe::<String>(p1, "spall-proxy"));
-    if cli.is_some() {
-        return cli;
+    if let Some(proxy) = m.get_one::<String>("spall-proxy") {
+        return Some(proxy);
     }
 
     if entry.proxy.is_some() {
@@ -137,16 +130,6 @@ pub fn resolve_proxy(
     }
 
     None
-}
-
-fn get_flag_safe(matches: &clap::ArgMatches, id: &str) -> bool {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    catch_unwind(AssertUnwindSafe(|| matches.get_flag(id))).unwrap_or(false)
-}
-
-fn get_one_safe<T: Clone + Send + Sync + 'static>(matches: &clap::ArgMatches, id: &str) -> Option<T> {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    catch_unwind(AssertUnwindSafe(|| matches.get_one::<T>(id).cloned())).ok().flatten()
 }
 
 /// Resolve proxy from environment variables only.

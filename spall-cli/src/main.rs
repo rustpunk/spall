@@ -8,6 +8,7 @@ mod fetch;
 mod filter;
 mod history;
 mod http;
+mod matches;
 mod output;
 mod paginate;
 mod preview;
