@@ -39,6 +39,7 @@ spall [OPTIONS] <COMMAND>
 |------------|-------------|
 | `spall history list` | List recent requests |
 | `spall history show <id>` | Show full request details |
+| `spall history search` | Search history with filters |
 | `spall history clear` | Erase all history |
 
 ## Global Flags
