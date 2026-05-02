@@ -17,9 +17,19 @@ pub struct CredentialResolver {
 impl CredentialResolver {
     /// Resolve the best available credential for this API.
     #[must_use]
-    pub fn resolve(&self, _cli_auth: Option<&str>) -> Option<Credential> {
-        // TODO(Wave 1): check env vars. Wave 3: keyring, config.
-        todo!("CredentialResolver::resolve")
+    pub fn resolve(&self, cli_auth: Option<&str>) -> Option<Credential> {
+        if let Some(raw) = cli_auth {
+            return Some(parse_cli_auth(raw));
+        }
+
+        let env_name = self.env_var_name();
+        if let Ok(token) = std::env::var(&env_name) {
+            if !token.is_empty() {
+                return Some(infer_auth(&token));
+            }
+        }
+
+        None
     }
 
     /// Build the environment variable name for an API token.
@@ -46,4 +56,70 @@ pub enum CredentialKind {
     Bearer,
     Basic,
     ApiKey,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn parse_cli_auth(raw: &str) -> Credential {
+    if let Some(token) = raw.strip_prefix("Bearer ") {
+        return Credential {
+            kind: CredentialKind::Bearer,
+            value: SecretString::new(token.to_string().into()),
+        };
+    }
+
+    if let Some(token) = raw.strip_prefix("Basic ") {
+        if let Ok(decoded) = base64_decode(token) {
+            if let Some((u, p)) = decoded.split_once(':') {
+                return Credential {
+                    kind: CredentialKind::Basic,
+                    value: SecretString::new(format!("{}:{}", u, p).into()),
+                };
+            }
+        }
+        if let Some((u, p)) = token.split_once(':') {
+            return Credential {
+                kind: CredentialKind::Basic,
+                value: SecretString::new(format!("{}:{}", u, p).into()),
+            };
+        }
+    }
+
+    if !raw.contains(' ') && raw.split(':').count() == 2 {
+        if let Some((u, p)) = raw.split_once(':') {
+            return Credential {
+                kind: CredentialKind::Basic,
+                value: SecretString::new(format!("{}:{}", u, p).into()),
+            };
+        }
+    }
+
+    Credential {
+        kind: CredentialKind::Bearer,
+        value: SecretString::new(raw.to_string().into()),
+    }
+}
+
+fn infer_auth(token: &str) -> Credential {
+    if let Some((u, p)) = token.split_once(':') {
+        if !u.is_empty() && !p.is_empty() && !token.contains(' ') {
+            return Credential {
+                kind: CredentialKind::Basic,
+                value: SecretString::new(format!("{}:{}", u, p).into()),
+            };
+        }
+    }
+
+    Credential {
+        kind: CredentialKind::Bearer,
+        value: SecretString::new(token.to_string().into()),
+    }
+}
+
+fn base64_decode(input: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let decoded = STANDARD.decode(input)?;
+    Ok(String::from_utf8(decoded)?)
 }

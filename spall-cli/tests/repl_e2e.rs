@@ -4,6 +4,7 @@ use std::io::{BufRead, Read, Write};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
+#[allow(dead_code)]
 fn bin_path() -> String {
     std::env::var("CARGO_BIN_EXE_spall").unwrap_or_else(|_| String::from("target/debug/spall"))
 }

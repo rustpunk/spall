@@ -3874,9 +3874,11 @@ dependencies = [
 name = "spall-config"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
  "secrecy",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "toml",
 ]

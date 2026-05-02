@@ -20,7 +20,7 @@ mod validate;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use miette::Diagnostic;
-use spall_config::registry::{ApiEntry, ApiRegistry};
+use spall_config::registry::ApiRegistry;
 use thiserror::Error;
 
 /// Exit codes.
@@ -408,7 +408,8 @@ async fn handle_api_operation(
     // Phase 2 structure may be flat (single tag) or nested (multiple tags).
     // Try direct operation match first.
     if let Some(op) = spec.operations.iter().find(|o| o.operation_id == tag_or_op) {
-        return execute::execute_operation(
+        let combined = execute::merge_matches(phase1_matches, op_matches);
+        let res = execute::execute_operation(
             op,
             &spec,
             &entry,
@@ -418,7 +419,22 @@ async fn handle_api_operation(
             &registry.defaults,
         )
         .await
-        .map_err(Into::into);
+        .map_err(miette::Report::from)?;
+        execute::print_operation_result(&res, &combined).map_err(miette::Report::from)?;
+
+        if let Some(chain_expr_str) = combined.get_one::<String>("spall-chain") {
+            let chain = crate::chain::ChainExpr::parse(&chain_expr_str)?;
+            let next_args = chain.resolve(&res.value)?;
+            let fut = Box::pin(handle_api_operation(
+                api_name,
+                next_args,
+                registry,
+                phase1_matches,
+                cache_dir,
+            ));
+            return fut.await;
+        }
+        return Ok(());
     }
 
     // If not found directly, look for a tag subcommand.
@@ -435,7 +451,8 @@ async fn handle_api_operation(
             .find(|o| o.operation_id == op_name)
             .ok_or_else(|| SpallCliError::Usage(format!("Unknown operation: {}", op_name)))?;
 
-        return execute::execute_operation(
+        let combined = execute::merge_matches(phase1_matches, inner_matches);
+        let res = execute::execute_operation(
             op,
             &spec,
             &entry,
@@ -445,7 +462,22 @@ async fn handle_api_operation(
             &registry.defaults,
         )
         .await
-        .map_err(Into::into);
+        .map_err(miette::Report::from)?;
+        execute::print_operation_result(&res, &combined).map_err(miette::Report::from)?;
+
+        if let Some(chain_expr_str) = combined.get_one::<String>("spall-chain") {
+            let chain = crate::chain::ChainExpr::parse(&chain_expr_str)?;
+            let next_args = chain.resolve(&res.value)?;
+            let fut = Box::pin(handle_api_operation(
+                api_name,
+                next_args,
+                registry,
+                phase1_matches,
+                cache_dir,
+            ));
+            return fut.await;
+        }
+        return Ok(());
     }
 
     Err(SpallCliError::Usage(format!("Unknown operation: {}", tag_or_op)).into())
@@ -521,6 +553,39 @@ fn history_cmd() -> Command {
             Command::new("show")
                 .about("Show request details")
                 .arg(Arg::new("id").required(true).help("Request ID")),
+        )
+        .subcommand(
+            Command::new("search")
+                .about("Search history with filters")
+                .arg(
+                    Arg::new("api")
+                        .long("api")
+                        .help("Filter by API name substring"),
+                )
+                .arg(
+                    Arg::new("status")
+                        .long("status")
+                        .value_parser(clap::value_parser!(u16))
+                        .help("Filter by HTTP status code"),
+                )
+                .arg(
+                    Arg::new("method")
+                        .long("method")
+                        .help("Filter by HTTP method substring"),
+                )
+                .arg(Arg::new("url").long("url").help("Filter by URL substring"))
+                .arg(
+                    Arg::new("since")
+                        .long("since")
+                        .help("Filter since date (YYYY-MM-DD)"),
+                )
+                .arg(
+                    Arg::new("limit")
+                        .long("limit")
+                        .value_parser(clap::value_parser!(usize))
+                        .default_value("20")
+                        .help("Max results to show"),
+                ),
         )
         .subcommand(Command::new("clear").about("Clear history"))
 }

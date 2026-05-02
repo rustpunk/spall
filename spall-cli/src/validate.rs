@@ -134,6 +134,7 @@ pub fn format_errors(errors: &[ValidationError]) -> String {
 }
 
 /// Validate a raw CLI argument value against a schema for ad-hoc use.
+#[allow(dead_code)]
 pub fn validate_value_raw(value: &str, schema: &ResolvedSchema) -> Result<(), ValidationError> {
     validate_param(value, schema)
 }

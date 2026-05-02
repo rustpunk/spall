@@ -93,6 +93,64 @@ impl History {
         rows.collect()
     }
 
+    /// Search recorded requests with optional filters.
+    pub fn search(
+        &self,
+        api_pattern: Option<&str>,
+        status: Option<u16>,
+        method: Option<&str>,
+        url_pattern: Option<&str>,
+        since_timestamp: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<HistoryRow>, rusqlite::Error> {
+        let mut sql = String::from(
+            "SELECT id, timestamp, api, operation, method, url, status_code, duration_ms
+             FROM requests
+             WHERE 1=1",
+        );
+        if api_pattern.is_some() {
+            sql.push_str(" AND api LIKE ?1");
+        }
+        if status.is_some() {
+            sql.push_str(" AND status_code = ?2");
+        }
+        if method.is_some() {
+            sql.push_str(" AND method LIKE ?3");
+        }
+        if url_pattern.is_some() {
+            sql.push_str(" AND url LIKE ?4");
+        }
+        if since_timestamp.is_some() {
+            sql.push_str(" AND timestamp >= ?5");
+        }
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?6");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![
+                api_pattern.map(|s| format!("%{}%", s)),
+                status.map(|s| s as i32),
+                method.map(|s| format!("%{}%", s)),
+                url_pattern.map(|s| format!("%{}%", s)),
+                since_timestamp.map(|s| s as i64),
+                limit as i64,
+            ],
+            |row| {
+                Ok(HistoryRow {
+                    id: row.get(0)?,
+                    timestamp: row.get::<_, i64>(1)? as u64,
+                    api: row.get(2)?,
+                    operation: row.get(3)?,
+                    method: row.get(4)?,
+                    url: row.get(5)?,
+                    status_code: row.get::<_, i32>(6)? as u16,
+                    duration_ms: row.get::<_, i64>(7)? as u64,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
     /// Get full details for a single request, including headers.
     pub fn get(&self, id: i64) -> Result<Option<FullRequest>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(

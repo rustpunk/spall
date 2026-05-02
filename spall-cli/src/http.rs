@@ -1,5 +1,5 @@
 use crate::matches::MergedMatches;
-use reqwest::{redirect::Policy, Client, ClientBuilder, Proxy};
+use reqwest::{redirect::Policy, Client, Proxy};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ pub struct HttpConfig {
     pub proxy: Option<String>,
     pub no_proxy: bool,
     pub base_url_override: Option<String>,
+    #[allow(dead_code)]
     pub default_headers: HashMap<String, String>,
     pub user_agent: String,
     pub auth_header: Option<String>,
@@ -197,6 +198,7 @@ pub fn build_fetch_client(proxy_url: Option<&str>) -> Result<Client, reqwest::Er
 }
 
 /// Retry configuration.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     pub max_retries: u8,

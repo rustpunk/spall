@@ -3,6 +3,27 @@
 use rustyline::{error::ReadlineError, DefaultEditor};
 use std::path::Path;
 
+/// Per-stage REPL pipe failure with actionable diagnostics.
+#[derive(Debug, thiserror::Error)]
+enum PipeError {
+    #[error("Pipe failed at stage {stage}: parse error\n  Expression: {expr}\n  Reason:     {reason}\n  To debug:   spall chain validate '{expr}'")]
+    Parse {
+        stage: usize,
+        expr: String,
+        reason: String,
+    },
+    #[error("Pipe failed at stage {stage}: jmespath error\n  Expression: {expr}\n  Reason:     {reason}\n  To debug:   echo '{{}}' | spall jmespath '{expr}'")]
+    JmesPath {
+        stage: usize,
+        expr: String,
+        reason: String,
+    },
+    #[error("Pipe failed at stage {stage}: no response from previous stage to feed into next stage\n  To debug:   ensure stage {} succeeded and returned JSON", stage - 1)]
+    NoPreviousResponse { stage: usize },
+    #[error("Pipe failed at stage {stage}: request error\n  Reason:     {reason}")]
+    Http { stage: usize, reason: String },
+}
+
 /// Run the spall interactive REPL.
 pub async fn run(
     cache_dir: &Path,
@@ -30,7 +51,7 @@ pub async fn run(
                 if trimmed.contains('|') {
                     let stages: Vec<&str> = trimmed.split('|').map(|s| s.trim()).collect();
                     if let Err(e) = run_piped(&stages, registry, cache_dir).await {
-                        eprintln!("Pipe error: {:?}", e);
+                        eprintln!("{}", e);
                     }
                     continue;
                 }
@@ -130,14 +151,73 @@ async fn run_piped(
     stages: &[&str],
     registry: &spall_config::registry::ApiRegistry,
     cache_dir: &std::path::Path,
-) -> Result<(), crate::SpallCliError> {
-    eprintln!(
-        "Pipe syntax detected with {} stages: {:?}",
-        stages.len(),
-        stages
-    );
-    eprintln!(
-        "Piped execution is not yet implemented — response capture from run_with_args is required."
-    );
+) -> Result<(), PipeError> {
+    if stages.len() < 2 {
+        return Err(PipeError::Parse {
+            stage: 0,
+            expr: stages.first().unwrap_or(&"").to_string(),
+            reason: "pipe requires at least two stages".to_string(),
+        });
+    }
+
+    // Stage 0: raw execution.
+    let stage0_args = shlex::split(stages[0]).ok_or_else(|| PipeError::Parse {
+        stage: 0,
+        expr: stages[0].to_string(),
+        reason: "unmatched quote in pipe stage 0".to_string(),
+    })?;
+    if stage0_args.is_empty() {
+        return Err(PipeError::Parse {
+            stage: 0,
+            expr: stages[0].to_string(),
+            reason: "empty pipe stage 0".to_string(),
+        });
+    }
+
+    let api_name = &stage0_args[0];
+    let mut full_args = vec!["spall".to_string()];
+    full_args.extend(stage0_args.clone());
+
+    match Box::pin(crate::run_with_args(&full_args, registry, cache_dir)).await {
+        Ok(()) => {}
+        Err(e) => {
+            return Err(PipeError::Http {
+                stage: 0,
+                reason: e.to_string(),
+            });
+        }
+    }
+
+    // Stages 1+ are chain expressions against the previous response.
+    for (i, stage) in stages.iter().skip(1).enumerate() {
+        let stage_num = i + 1;
+        let response = crate::execute::take_last_response()
+            .ok_or(PipeError::NoPreviousResponse { stage: stage_num })?;
+
+        let chain = crate::chain::ChainExpr::parse(stage).map_err(|e| PipeError::Parse {
+            stage: stage_num,
+            expr: stage.to_string(),
+            reason: e.to_string(),
+        })?;
+        let next_args = chain.resolve(&response).map_err(|e| PipeError::JmesPath {
+            stage: stage_num,
+            expr: stage.to_string(),
+            reason: e.to_string(),
+        })?;
+
+        let mut full_args = vec!["spall".to_string(), api_name.to_string()];
+        full_args.extend(next_args);
+
+        match Box::pin(crate::run_with_args(&full_args, registry, cache_dir)).await {
+            Ok(()) => {}
+            Err(e) => {
+                return Err(PipeError::Http {
+                    stage: stage_num,
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+
     Ok(())
 }

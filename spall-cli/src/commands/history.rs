@@ -3,11 +3,12 @@
 use clap::ArgMatches;
 use miette::Result;
 
-/// Handle `spall history list|show|clear`.
+/// Handle `spall history list|show|clear|search`.
 pub fn handle_history(matches: &ArgMatches, cache_dir: &std::path::Path) -> Result<()> {
     match matches.subcommand() {
         Some(("list" | "", _)) => handle_list(cache_dir),
         Some(("show", sub)) => handle_show(sub, cache_dir),
+        Some(("search", sub)) => handle_search(sub, cache_dir),
         Some(("clear", _)) => handle_clear(cache_dir),
         _ => handle_list(cache_dir),
     }
@@ -22,6 +23,50 @@ fn handle_list(cache_dir: &std::path::Path) -> Result<()> {
 
     if rows.is_empty() {
         println!("No history recorded yet.");
+        return Ok(());
+    }
+
+    let records: Vec<HistoryRecord> = rows
+        .into_iter()
+        .map(|r| HistoryRecord {
+            id: r.id,
+            timestamp: format_timestamp(r.timestamp),
+            api: r.api,
+            operation: r.operation,
+            method: r.method,
+            url: r.url,
+            status: r.status_code.to_string(),
+            duration: format!("{}ms", r.duration_ms),
+        })
+        .collect();
+
+    let mut table = tabled::Table::new(&records);
+    table.with(tabled::settings::Style::modern());
+    println!("{}", table);
+    Ok(())
+}
+
+fn handle_search(matches: &ArgMatches, cache_dir: &std::path::Path) -> Result<()> {
+    let history = crate::history::History::open(cache_dir)
+        .map_err(|e| crate::SpallCliError::Usage(format!("History DB error: {}", e)))?;
+
+    let api = matches.get_one::<String>("api").map(|s| s.as_str());
+    let status = matches.get_one::<u16>("status").copied();
+    let method = matches.get_one::<String>("method").map(|s| s.as_str());
+    let url = matches.get_one::<String>("url").map(|s| s.as_str());
+    let since = matches.get_one::<String>("since").and_then(|s| {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .ok()
+            .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp() as u64)
+    });
+    let limit = matches.get_one::<usize>("limit").copied().unwrap_or(20);
+
+    let rows = history
+        .search(api, status, method, url, since, limit)
+        .map_err(|e| crate::SpallCliError::Usage(format!("History DB error: {}", e)))?;
+
+    if rows.is_empty() {
+        println!("No matching history entries.");
         return Ok(());
     }
 

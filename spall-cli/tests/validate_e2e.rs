@@ -3,7 +3,6 @@
 use std::process::Command;
 use tempfile::TempDir;
 use wiremock::matchers::method;
-use wiremock::Match;
 use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
