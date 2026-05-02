@@ -39,6 +39,7 @@ spec_dirs = [
     "~/.config/spall/specs",
 ]
 
+```toml
 [defaults]
 output = "json"    # json | pretty | raw | yaml | table | csv
 color = "auto"     # auto | always | never
@@ -46,6 +47,8 @@ color = "auto"     # auto | always | never
 [defaults.proxy]
 url = "http://proxy:8080"
 ```
+
+**Note:** Spall rejects unknown fields in `config.toml` and per-API `apis/*.toml` files. If you see a deserialization error, check for typos in field names.
 
 ## Per-API Config (`apis/{name}.toml`)
 

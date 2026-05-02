@@ -55,5 +55,4 @@ hasp-full = [
     "hasp/azure-kv",
 ]
 
-[lints.rust]
-unused = "allow"
+

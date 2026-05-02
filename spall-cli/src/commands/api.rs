@@ -48,8 +48,7 @@ fn handle_list(_matches: &ArgMatches) -> Result<()> {
 
 fn handle_remove(matches: &ArgMatches) -> Result<()> {
     let name = matches.get_one::<String>("name").unwrap();
-    spall_config::registry::ApiRegistry::remove_api(name)
-        .map_err(crate::SpallCliError::Config)?;
+    spall_config::registry::ApiRegistry::remove_api(name).map_err(crate::SpallCliError::Config)?;
     eprintln!("Removed API '{}'", name);
     Ok(())
 }

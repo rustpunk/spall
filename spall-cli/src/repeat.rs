@@ -74,7 +74,7 @@ pub async fn replay(
         .map_err(|e| crate::SpallCliError::Network(e.to_string()))?;
 
     let status = resp.status();
-    let resp_headers = resp.headers().clone();
+    let _resp_headers = resp.headers().clone();
     let body = resp
         .bytes()
         .await

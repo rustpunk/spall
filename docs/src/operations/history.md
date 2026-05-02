@@ -16,6 +16,18 @@ Output:
   40  2025-04-25 14:28  GET     404    89ms  github    get-repo
 ```
 
+## Searching History
+
+Filter by API name, status code, method, URL substring, or date:
+
+```bash
+spall history search --api petstore --status 200 --limit 5
+spall history search --method POST --since 2025-04-01
+spall history search --url "/pets/" --limit 10
+```
+
+All filters are optional and combined with AND logic. `--since` accepts dates in `YYYY-MM-DD` format.
+
 ## Viewing a Single Request
 
 ```bash

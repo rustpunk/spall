@@ -47,7 +47,7 @@ async fn repeat_replays_most_recent_request() {
 
     // Seed the mock with two distinct responses so we can tell replay happened.
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let cc = call_count.clone();
+    let _cc = call_count.clone();
 
     wiremock::Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"call": 1})))

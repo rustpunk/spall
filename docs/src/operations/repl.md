@@ -52,6 +52,18 @@ The REPL is useful for:
 - Poking at an API while debugging — no repeated spec fetches.
 - Batch scripting small exploratory sequences without shell function wrappers.
 
+## Request Chaining
+
+The REPL supports pipe syntax to chain requests, passing the JSON response from one stage into the next via JMESPath expressions:
+
+```text
+spall> petstore get-pet-by-id 1 | update-pet --id id --status status
+```
+
+Each stage after the first is a chain expression: `operation --arg jmespath_expr ...`. The response from stage N-1 becomes the input for stage N.
+
+If a pipe stage fails, the REPL prints a structured error showing the stage number, the failing expression, and a debug suggestion.
+
 ## Limitations
 
 - The REPL uses `rustyline` for line editing. Complex multi-line JSON payloads should be written to a file and passed with `@file`.

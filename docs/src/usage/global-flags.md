@@ -43,6 +43,7 @@ All internal spall flags use the `--spall-*` prefix so they never collide with A
 | `--spall-preview` | | Show resolved URL, headers, and body without sending |
 | `--spall-paginate` | | Auto-follow `Link` header pagination |
 | `--spall-repeat` | | Replay the most recent request from history |
+| `--spall-chain` | | JMESPath chain expression for multi-stage requests |
 | `--profile` | | Active config profile (e.g., `staging`, `production`) |
 
 ## Examples

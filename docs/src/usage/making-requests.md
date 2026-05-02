@@ -88,3 +88,4 @@ If an operation is marked `deprecated: true` in the spec, spall prints a `[DEPRE
 - [Request Bodies](request-bodies.md)
 - [Response Output](response-output.md)
 - [Global Flags](global-flags.md)
+- [Chaining Requests](repl.md#request-chaining)

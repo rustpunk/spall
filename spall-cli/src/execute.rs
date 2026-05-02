@@ -1,14 +1,28 @@
 use crate::matches::MergedMatches;
 use clap::ArgMatches;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE};
-use secrecy::ExposeSecret;
 use spall_config::registry::ApiEntry;
 use spall_core::ir::{
     HttpMethod, ParameterLocation, ResolvedOperation, ResolvedRequestBody, ResolvedSpec,
 };
 
 use std::io::Read;
+use std::sync::Mutex;
 use std::time::Instant;
+
+static LAST_RESPONSE: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+
+/// Store the last successful response JSON for pipe/chain consumers.
+pub fn store_last_response(value: serde_json::Value) {
+    if let Ok(mut guard) = LAST_RESPONSE.lock() {
+        *guard = Some(value);
+    }
+}
+
+/// Take (consume) the last stored response JSON.
+pub fn take_last_response() -> Option<serde_json::Value> {
+    LAST_RESPONSE.lock().ok().and_then(|mut g| g.take())
+}
 
 /// Collect remaining arguments after Phase 1 match.
 pub fn collect_remaining_args(matches: &ArgMatches) -> Vec<String> {
@@ -25,6 +39,13 @@ pub fn collect_remaining_args(matches: &ArgMatches) -> Vec<String> {
     }
 }
 
+/// Structured return value from `execute_operation`.
+#[allow(dead_code)]
+pub struct OperationResult {
+    pub status: reqwest::StatusCode,
+    pub value: serde_json::Value,
+}
+
 /// Execute a matched operation.
 pub async fn execute_operation(
     op: &ResolvedOperation,
@@ -34,7 +55,7 @@ pub async fn execute_operation(
     phase1_matches: &ArgMatches,
     cache_dir: &std::path::Path,
     defaults: &spall_config::sources::GlobalDefaults,
-) -> Result<(), crate::SpallCliError> {
+) -> Result<OperationResult, crate::SpallCliError> {
     let url = build_url(op, spec, entry, phase1_matches, phase2_matches)?;
 
     let mut headers = HeaderMap::new();
@@ -129,20 +150,26 @@ pub async fn execute_operation(
     // Dry run
     if combined.get_flag("spall-dry-run") {
         eprintln!("Dry run: {} {}", op.method, url);
-        return Ok(());
+        store_last_response(serde_json::Value::Null);
+        store_last_response(serde_json::Value::Null);
+        return Ok(OperationResult {
+            status: reqwest::StatusCode::OK,
+            value: serde_json::Value::Null,
+        });
     }
 
     // Preview (Phase D)
     if combined.get_flag("spall-preview") {
         let body_slice = body_data.body.as_deref();
         crate::preview::print_preview(&op.method.to_string(), &url, &headers, body_slice);
-        return Ok(());
+        store_last_response(serde_json::Value::Null);
+        return Ok(OperationResult {
+            status: reqwest::StatusCode::OK,
+            value: serde_json::Value::Null,
+        });
     }
 
     let retry_count = combined.get_one::<u8>("spall-retry").unwrap_or(1);
-    let mode = determine_output_mode(&combined);
-    let save_path_owned = combined.get_one::<String>("spall-download");
-    let save_path = save_path_owned.as_deref();
 
     let paginate = combined.get_flag("spall-paginate");
 
@@ -184,8 +211,6 @@ pub async fn execute_operation(
             }
 
             if !status.is_success() {
-                crate::output::emit_response(&body_bytes, mode, save_path)
-                    .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
                 if status.is_client_error() {
                     return Err(crate::SpallCliError::Http4xx(status.as_u16()));
                 } else {
@@ -237,26 +262,12 @@ pub async fn execute_operation(
             duration_ms,
         );
 
-        // Apply filter if requested
-        if let Some(filter_expr) = combined.get_one::<String>("spall-filter") {
-            match crate::filter::filter_response(&filter_expr, &final_value) {
-                Ok(filtered) => {
-                    crate::output::emit_json_value(&filtered, mode, save_path)
-                        .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: filter failed ({}). Falling back to unfiltered.",
-                        e
-                    );
-                    crate::output::emit_json_value(&final_value, mode, save_path)
-                        .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
-                }
-            }
-        } else {
-            crate::output::emit_json_value(&final_value, mode, save_path)
-                .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
-        }
+        store_last_response(final_value.clone());
+        // Return paginated result for caller-side filtering/output
+        Ok(OperationResult {
+            status: reqwest::StatusCode::OK,
+            value: final_value,
+        })
     } else {
         let (status, resp_headers, body_bytes) = send_one(
             &client,
@@ -304,46 +315,28 @@ pub async fn execute_operation(
             }
         }
 
-        // Apply filter if requested
-        if let Some(filter_expr) = combined.get_one::<String>("spall-filter") {
-            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                match crate::filter::filter_response(&filter_expr, &json_val) {
-                    Ok(filtered) => {
-                        crate::output::emit_json_value(&filtered, mode, save_path)
-                            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: filter failed ({}). Falling back to unfiltered.",
-                            e
-                        );
-                        crate::output::emit_response(&body_bytes, mode, save_path)
-                            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
-                    }
-                }
-            } else {
-                eprintln!("Warning: --filter requires JSON response. Falling back to raw.");
-                crate::output::emit_response(&body_bytes, mode, save_path)
-                    .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
-            }
-        } else {
-            crate::output::emit_response(&body_bytes, mode, save_path)
-                .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
-        }
+        let body_json =
+            serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string())
+            });
 
         if status.is_client_error() {
             return Err(crate::SpallCliError::Http4xx(status.as_u16()));
         } else if status.is_server_error() {
             return Err(crate::SpallCliError::Http5xx(status.as_u16()));
         }
-    }
 
-    let duration = start.elapsed();
-    if combined.get_flag("spall-time") || combined.get_flag("spall-verbose") {
-        eprintln!("Duration: {:?}", duration);
-    }
+        let duration = start.elapsed();
+        if combined.get_flag("spall-time") || combined.get_flag("spall-verbose") {
+            eprintln!("Duration: {:?}", duration);
+        }
 
-    Ok(())
+        store_last_response(body_json.clone());
+        Ok(OperationResult {
+            status,
+            value: body_json,
+        })
+    }
 }
 
 /// Send a single HTTP request, with transient-error retry.
@@ -426,6 +419,34 @@ fn resolve_next_url(current: &str, next: &str) -> Result<String, crate::SpallCli
     }
 }
 
+/// Print an operation result to stdout, applying filter and output mode.
+pub fn print_operation_result(
+    res: &OperationResult,
+    combined: &MergedMatches,
+) -> Result<(), crate::SpallCliError> {
+    let mode = determine_output_mode(combined);
+    let save_path_owned = combined.get_one::<String>("spall-download");
+    let save_path = save_path_owned.as_deref();
+
+    if let Some(filter_expr) = combined.get_one::<String>("spall-filter") {
+        match crate::filter::filter_response(&filter_expr, &res.value) {
+            Ok(filtered) => crate::output::emit_json_value(&filtered, mode, save_path)
+                .map_err(|e| crate::SpallCliError::HttpClient(e.to_string())),
+            Err(e) => {
+                eprintln!(
+                    "Warning: filter failed ({}). Falling back to unfiltered.",
+                    e
+                );
+                crate::output::emit_json_value(&res.value, mode, save_path)
+                    .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))
+            }
+        }
+    } else {
+        crate::output::emit_json_value(&res.value, mode, save_path)
+            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))
+    }
+}
+
 fn determine_output_mode(combined: &MergedMatches) -> crate::output::OutputMode {
     if combined.get_flag("spall-verbose") {
         crate::output::OutputMode::Raw
@@ -437,7 +458,7 @@ fn determine_output_mode(combined: &MergedMatches) -> crate::output::OutputMode 
 }
 
 /// Merge Phase 1 and Phase 2 ArgMatches, preferring Phase 2 for overlapping values.
-fn merge_matches<'a>(phase1: &'a ArgMatches, phase2: &'a ArgMatches) -> MergedMatches<'a> {
+pub fn merge_matches<'a>(phase1: &'a ArgMatches, phase2: &'a ArgMatches) -> MergedMatches<'a> {
     MergedMatches { phase1, phase2 }
 }
 
@@ -509,7 +530,7 @@ fn resolve_body(
 
     // --data
     if let Some(values) = phase2_matches.get_many::<String>("data") {
-        let mut parts: Vec<String> = values.cloned().collect();
+        let parts: Vec<String> = values.cloned().collect();
         if let Some(last) = parts.last() {
             let data = if last == "-" {
                 let mut buf = String::new();
