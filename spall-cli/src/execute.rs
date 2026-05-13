@@ -115,7 +115,7 @@ pub async fn execute_operation(
 
     // Authentication (Wave 3 provider dispatch)
     let cli_auth = combined.get_one::<String>("spall-auth");
-    let auth = crate::auth::resolve(&entry.name, entry.auth.as_ref(), cli_auth.as_deref())?;
+    let auth = crate::auth::resolve(&entry.name, entry.auth.as_ref(), cli_auth.as_deref()).await?;
     if let Some(a) = auth {
         crate::auth::apply(&a, &mut headers, &mut query_pairs);
     }
