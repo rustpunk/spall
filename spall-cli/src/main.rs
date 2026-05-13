@@ -716,7 +716,15 @@ fn spall_global_args() -> Vec<Arg> {
         Arg::new("spall-ca-cert")
             .long("spall-ca-cert")
             .global(true)
-            .help("Path to custom CA certificate"),
+            .help("Path to custom CA certificate (PEM or DER)"),
+        Arg::new("spall-cert")
+            .long("spall-cert")
+            .global(true)
+            .help("Path to client certificate PEM (mTLS); requires --spall-key"),
+        Arg::new("spall-key")
+            .long("spall-key")
+            .global(true)
+            .help("Path to client private key PEM (mTLS); requires --spall-cert"),
         Arg::new("spall-no-proxy")
             .long("spall-no-proxy")
             .action(ArgAction::SetTrue)

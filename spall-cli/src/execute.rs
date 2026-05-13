@@ -145,7 +145,7 @@ pub async fn execute_operation(
     http_config.proxy = resolved_proxy;
 
     let client = crate::http::build_http_client(&http_config)
-        .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+        .map_err(crate::SpallCliError::HttpClient)?;
 
     // Dry run
     if combined.get_flag("spall-dry-run") {

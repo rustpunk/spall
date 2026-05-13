@@ -23,7 +23,9 @@ All internal spall flags use the `--spall-*` prefix so they never collide with A
 | `--spall-follow` | `-L` | Follow HTTP redirects (default: off) |
 | `--spall-max-redirects` | | Maximum redirects (default: 10) |
 | `--spall-insecure` | | Skip TLS certificate verification |
-| `--spall-ca-cert` | | Path to custom CA certificate |
+| `--spall-ca-cert` | | Path to custom CA certificate (PEM or DER) |
+| `--spall-cert` | | Path to client certificate PEM (mTLS); requires `--spall-key` |
+| `--spall-key` | | Path to client private key PEM (mTLS); requires `--spall-cert` |
 | `--spall-proxy` | | HTTP/SOCKS proxy URL |
 | `--spall-no-proxy` | | Disable proxy for this request |
 
@@ -67,6 +69,17 @@ spall petstore get-pet-by-id 1 \
 ```bash
 spall petstore get-pet-by-id 1 --spall-retry 3 --spall-follow
 ```
+
+### mTLS to a private API
+
+```bash
+spall corp list-things \
+  --spall-ca-cert ./corp-ca.pem \
+  --spall-cert ./client.pem \
+  --spall-key ./client-key.pem
+```
+
+The CA cert may be PEM or DER. The client cert and key must both be PEM; pass them as separate files.
 
 ### Replay last request
 

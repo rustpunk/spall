@@ -15,7 +15,7 @@ fn make_spec_with_values(title: &str) -> ResolvedSpec {
         "x-nested".into(),
         SpallValue::Object({
             let mut m = IndexMap::new();
-            m.insert("key".into(), SpallValue::F64(3.14));
+            m.insert("key".into(), SpallValue::F64(2.5));
             m.insert(
                 "arr".into(),
                 SpallValue::Array(vec![SpallValue::I64(-1), SpallValue::I64(0)]),
@@ -144,7 +144,7 @@ fn cache_roundtrip_all_spallvalue_variants() {
     let nested = op.extensions.get("x-nested").unwrap();
     match nested {
         SpallValue::Object(m) => {
-            assert_eq!(m.get("key").unwrap(), &SpallValue::F64(3.14));
+            assert_eq!(m.get("key").unwrap(), &SpallValue::F64(2.5));
             match m.get("arr").unwrap() {
                 SpallValue::Array(a) => assert_eq!(a.len(), 2),
                 _ => panic!("expected array"),
@@ -173,7 +173,7 @@ fn petstore_parsed_spec_roundtrips_via_postcard() {
     let raw = std::fs::read(&fixture).unwrap_or_else(|_| {
         // If fixture not present, skip (integration test in CI should download it).
         eprintln!("petstore fixture not found at {:?}, skipping", fixture);
-        return Vec::new();
+        Vec::new()
     });
     if raw.is_empty() {
         return;
