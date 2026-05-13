@@ -35,6 +35,8 @@ rpassword = "7"
 syntect = "5"
 rustyline = "14"
 shlex = "1"
+rand = "0.8"
+sha2 = "0.10"
 hasp = { git = "https://github.com/rustpunk/hasp", default-features = false, features = ["env", "keyring", "file"], optional = true }
 
 [dev-dependencies]

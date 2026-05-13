@@ -115,7 +115,7 @@ pub async fn execute_operation(
 
     // Authentication (Wave 3 provider dispatch)
     let cli_auth = combined.get_one::<String>("spall-auth");
-    let auth = crate::auth::resolve(&entry.name, entry.auth.as_ref(), cli_auth.as_deref())?;
+    let auth = crate::auth::resolve(&entry.name, entry.auth.as_ref(), cli_auth.as_deref()).await?;
     if let Some(a) = auth {
         crate::auth::apply(&a, &mut headers, &mut query_pairs);
     }
@@ -145,7 +145,7 @@ pub async fn execute_operation(
     http_config.proxy = resolved_proxy;
 
     let client = crate::http::build_http_client(&http_config)
-        .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
+        .map_err(crate::SpallCliError::HttpClient)?;
 
     // Dry run
     if combined.get_flag("spall-dry-run") {
@@ -170,6 +170,7 @@ pub async fn execute_operation(
     }
 
     let retry_count = combined.get_one::<u8>("spall-retry").unwrap_or(1);
+    let retry_max_wait = combined.get_one::<u64>("spall-retry-max-wait").unwrap_or(60);
 
     let paginate = combined.get_flag("spall-paginate");
 
@@ -199,6 +200,7 @@ pub async fn execute_operation(
                 None,
                 &query_pairs,
                 retry_count,
+                retry_max_wait,
             )
             .await?;
 
@@ -278,6 +280,7 @@ pub async fn execute_operation(
             body_data.multipart,
             &query_pairs,
             retry_count,
+            retry_max_wait,
         )
         .await?;
 
@@ -326,20 +329,66 @@ pub async fn execute_operation(
             return Err(crate::SpallCliError::Http5xx(status.as_u16()));
         }
 
+        // --spall-follow <rel>: chase one hypermedia link after a successful response.
+        let mut final_value = body_json;
+        if let Some(rel) = combined.get_one::<String>("spall-follow") {
+            let body_ref = if final_value.is_object() || final_value.is_array() {
+                Some(&final_value)
+            } else {
+                None
+            };
+            let links = crate::links::Links::from_response(&resp_headers, body_ref);
+            if let Some(link) = links.rel(rel.as_str()) {
+                let followed_url = resolve_next_url(&url, &link.href)?;
+                if combined.get_flag("spall-verbose") {
+                    eprintln!("Following rel=\"{}\" -> {}", rel, followed_url);
+                }
+                let (fstatus, _fhdrs, fbytes) = send_one(
+                    &client,
+                    HttpMethod::Get,
+                    &followed_url,
+                    headers.clone(),
+                    None,
+                    None,
+                    &[],
+                    retry_count,
+                    retry_max_wait,
+                )
+                .await?;
+                if fstatus.is_client_error() {
+                    return Err(crate::SpallCliError::Http4xx(fstatus.as_u16()));
+                }
+                if fstatus.is_server_error() {
+                    return Err(crate::SpallCliError::Http5xx(fstatus.as_u16()));
+                }
+                final_value = serde_json::from_slice::<serde_json::Value>(&fbytes)
+                    .unwrap_or_else(|_| {
+                        serde_json::Value::String(String::from_utf8_lossy(&fbytes).to_string())
+                    });
+            } else if combined.get_flag("spall-verbose") {
+                eprintln!("No link with rel=\"{}\" found in response", rel);
+            }
+        }
+
         let duration = start.elapsed();
         if combined.get_flag("spall-time") || combined.get_flag("spall-verbose") {
             eprintln!("Duration: {:?}", duration);
         }
 
-        store_last_response(body_json.clone());
+        store_last_response(final_value.clone());
         Ok(OperationResult {
             status,
-            value: body_json,
+            value: final_value,
         })
     }
 }
 
 /// Send a single HTTP request, with transient-error retry.
+///
+/// On `429 Too Many Requests` or `503 Service Unavailable`, honors the
+/// `Retry-After` header (RFC 7231 §7.1.3) — both delta-seconds and HTTP-date
+/// forms — clamped by `retry_max_wait_secs`. If the indicated wait exceeds
+/// the clamp, the response is returned as-is.
 #[allow(clippy::too_many_arguments)]
 async fn send_one(
     client: &reqwest::Client,
@@ -350,6 +399,7 @@ async fn send_one(
     mut multipart: Option<reqwest::multipart::Form>,
     query_pairs: &[(String, String)],
     retry_count: u8,
+    retry_max_wait_secs: u64,
 ) -> Result<(reqwest::StatusCode, HeaderMap, Vec<u8>), crate::SpallCliError> {
     let max_attempts = if multipart.is_some() {
         1
@@ -389,6 +439,19 @@ async fn send_one(
                     .await
                     .map_err(|e| crate::SpallCliError::Network(e.to_string()))?
                     .to_vec();
+
+                // Honor Retry-After on rate-limit / unavailable, if we have a retry budget.
+                let retryable = status.as_u16() == 429 || status.as_u16() == 503;
+                if retryable && attempt + 1 < max_attempts {
+                    if let Some(wait) = parse_retry_after(&hdrs) {
+                        if wait.as_secs() <= retry_max_wait_secs {
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        // Wait exceeds clamp — fall through and return the response.
+                    }
+                }
+
                 return Ok((status, hdrs, bytes));
             }
             Err(e) => {
@@ -403,6 +466,23 @@ async fn send_one(
     Err(crate::SpallCliError::Network(
         "request failed after retries".to_string(),
     ))
+}
+
+/// Parse a `Retry-After` header. Accepts delta-seconds or HTTP-date per RFC 7231 §7.1.3.
+fn parse_retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+    let v = headers.get("retry-after")?.to_str().ok()?.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    // HTTP-date — return delta to the future, or 0 for past dates.
+    let target = chrono::DateTime::parse_from_rfc2822(v).ok()?;
+    let now = chrono::Utc::now();
+    let delta = target.with_timezone(&chrono::Utc) - now;
+    if delta.num_seconds() <= 0 {
+        Some(std::time::Duration::from_secs(0))
+    } else {
+        Some(std::time::Duration::from_secs(delta.num_seconds() as u64))
+    }
 }
 
 /// Resolve a `next` URL from a Link header against the current request URL.

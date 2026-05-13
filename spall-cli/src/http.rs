@@ -12,6 +12,8 @@ pub struct HttpConfig {
     pub max_redirects: usize,
     pub insecure: bool,
     pub ca_cert: Option<String>,
+    pub client_cert: Option<String>,
+    pub client_key: Option<String>,
     pub proxy: Option<String>,
     pub no_proxy: bool,
     pub base_url_override: Option<String>,
@@ -31,6 +33,8 @@ impl Default for HttpConfig {
             max_redirects: 10,
             insecure: false,
             ca_cert: None,
+            client_cert: None,
+            client_key: None,
             proxy: None,
             no_proxy: false,
             base_url_override: None,
@@ -58,7 +62,7 @@ pub fn config_from_matches(p1: &clap::ArgMatches, p2: &clap::ArgMatches) -> Http
         cfg.retry = retry;
     }
 
-    cfg.follow_redirects = m.get_flag("spall-follow");
+    cfg.follow_redirects = m.get_flag("spall-redirect");
 
     if let Some(max) = m.get_one::<usize>("spall-max-redirects") {
         cfg.max_redirects = max;
@@ -68,6 +72,14 @@ pub fn config_from_matches(p1: &clap::ArgMatches, p2: &clap::ArgMatches) -> Http
 
     if let Some(cert) = m.get_one::<String>("spall-ca-cert") {
         cfg.ca_cert = Some(cert);
+    }
+
+    if let Some(cert) = m.get_one::<String>("spall-cert") {
+        cfg.client_cert = Some(cert);
+    }
+
+    if let Some(key) = m.get_one::<String>("spall-key") {
+        cfg.client_key = Some(key);
     }
 
     cfg.no_proxy = m.get_flag("spall-no-proxy");
@@ -154,7 +166,11 @@ fn env_proxy() -> Option<String> {
 }
 
 /// Build a `reqwest::Client` from `HttpConfig`.
-pub fn build_http_client(config: &HttpConfig) -> Result<Client, reqwest::Error> {
+///
+/// Returns a `String` error so file-I/O and certificate-parse failures (which
+/// cannot be expressed as a `reqwest::Error`) share a uniform error channel
+/// with the underlying client-build error.
+pub fn build_http_client(config: &HttpConfig) -> Result<Client, String> {
     let mut builder = Client::builder();
 
     builder = builder.timeout(config.timeout);
@@ -170,14 +186,46 @@ pub fn build_http_client(config: &HttpConfig) -> Result<Client, reqwest::Error> 
         builder = builder.danger_accept_invalid_certs(true);
     }
 
-    // TODO: CA cert, client cert + key.
+    if let Some(path) = &config.ca_cert {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("read --spall-ca-cert '{}': {}", path, e))?;
+        let cert = reqwest::Certificate::from_pem(&bytes)
+            .or_else(|_| reqwest::Certificate::from_der(&bytes))
+            .map_err(|e| format!("parse --spall-ca-cert '{}': {}", path, e))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    match (&config.client_cert, &config.client_key) {
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err("--spall-cert requires --spall-key".to_string());
+        }
+        (None, Some(_)) => {
+            return Err("--spall-key requires --spall-cert".to_string());
+        }
+        (Some(cert_path), Some(key_path)) => {
+            let mut cert_bytes = std::fs::read(cert_path)
+                .map_err(|e| format!("read --spall-cert '{}': {}", cert_path, e))?;
+            let key_bytes = std::fs::read(key_path)
+                .map_err(|e| format!("read --spall-key '{}': {}", key_path, e))?;
+            if !cert_bytes.ends_with(b"\n") {
+                cert_bytes.push(b'\n');
+            }
+            cert_bytes.extend_from_slice(&key_bytes);
+            let identity = reqwest::Identity::from_pem(&cert_bytes)
+                .map_err(|e| format!("parse client identity from '{}' + '{}': {}", cert_path, key_path, e))?;
+            builder = builder.identity(identity);
+        }
+    }
 
     if let Some(proxy_url) = &config.proxy {
-        let proxy = Proxy::all(proxy_url)?.no_proxy(reqwest::NoProxy::from_env());
+        let proxy = Proxy::all(proxy_url)
+            .map_err(|e| format!("invalid --spall-proxy '{}': {}", proxy_url, e))?
+            .no_proxy(reqwest::NoProxy::from_env());
         builder = builder.proxy(proxy);
     }
 
-    builder.build()
+    builder.build().map_err(|e| e.to_string())
 }
 
 /// Build a `reqwest::Client` for non-interactive fetches (spec loading, discovery, etc.).
@@ -211,5 +259,75 @@ impl Default for RetryConfig {
             max_retries: 1,
             base_delay_ms: 500,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_CERT: &[u8] = include_bytes!("../../e2e/fixtures/mtls/cert.pem");
+    const TEST_KEY: &[u8] = include_bytes!("../../e2e/fixtures/mtls/key.pem");
+
+    fn write_temp(bytes: &[u8], suffix: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::Builder::new()
+            .suffix(suffix)
+            .tempfile()
+            .expect("tempfile");
+        f.write_all(bytes).expect("write tempfile");
+        f
+    }
+
+    #[test]
+    fn build_client_with_pem_ca_cert_succeeds() {
+        let cert = write_temp(TEST_CERT, ".pem");
+        let cfg = HttpConfig {
+            ca_cert: Some(cert.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert!(build_http_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn build_client_with_missing_ca_cert_errors() {
+        let cfg = HttpConfig {
+            ca_cert: Some("/nonexistent/ca.pem".to_string()),
+            ..Default::default()
+        };
+        let err = build_http_client(&cfg).expect_err("should fail");
+        assert!(err.contains("--spall-ca-cert"), "msg: {}", err);
+    }
+
+    #[test]
+    fn build_client_with_client_cert_but_no_key_errors() {
+        let cfg = HttpConfig {
+            client_cert: Some("/some/cert.pem".to_string()),
+            ..Default::default()
+        };
+        let err = build_http_client(&cfg).expect_err("should fail");
+        assert!(err.contains("--spall-key"), "msg: {}", err);
+    }
+
+    #[test]
+    fn build_client_with_client_key_but_no_cert_errors() {
+        let cfg = HttpConfig {
+            client_key: Some("/some/key.pem".to_string()),
+            ..Default::default()
+        };
+        let err = build_http_client(&cfg).expect_err("should fail");
+        assert!(err.contains("--spall-cert"), "msg: {}", err);
+    }
+
+    #[test]
+    fn build_client_with_pem_identity_succeeds() {
+        let cert = write_temp(TEST_CERT, ".pem");
+        let key = write_temp(TEST_KEY, ".pem");
+        let cfg = HttpConfig {
+            client_cert: Some(cert.path().to_string_lossy().into_owned()),
+            client_key: Some(key.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert!(build_http_client(&cfg).is_ok());
     }
 }
