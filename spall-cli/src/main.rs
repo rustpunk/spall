@@ -10,6 +10,7 @@ mod fetch;
 mod filter;
 mod history;
 mod http;
+mod links;
 mod matches;
 mod output;
 mod paginate;
@@ -686,12 +687,12 @@ fn spall_global_args() -> Vec<Arg> {
             .value_parser(clap::value_parser!(u8).range(..=3))
             .global(true)
             .help("Retry count for failed requests (default: 1, max: 3)"),
-        Arg::new("spall-follow")
-            .long("spall-follow")
+        Arg::new("spall-redirect")
+            .long("spall-redirect")
             .short('L')
             .action(ArgAction::SetTrue)
             .global(true)
-            .help("Follow HTTP redirects (default: off)"),
+            .help("Follow HTTP 3xx redirects (default: off)"),
         Arg::new("spall-max-redirects")
             .long("spall-max-redirects")
             .default_value("10")
@@ -744,6 +745,17 @@ fn spall_global_args() -> Vec<Arg> {
             .action(ArgAction::SetTrue)
             .global(true)
             .help("Auto-follow Link header pagination"),
+        Arg::new("spall-follow")
+            .long("spall-follow")
+            .global(true)
+            .value_name("REL")
+            .help("After a successful response, follow the hypermedia link with this rel (RFC 5988 / HAL / JSON:API / Siren)"),
+        Arg::new("spall-retry-max-wait")
+            .long("spall-retry-max-wait")
+            .default_value("60")
+            .value_parser(clap::value_parser!(u64))
+            .global(true)
+            .help("Maximum seconds to honor a Retry-After header before giving up (default: 60)"),
         Arg::new("spall-preview")
             .long("spall-preview")
             .action(ArgAction::SetTrue)

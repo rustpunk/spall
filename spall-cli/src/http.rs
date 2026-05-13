@@ -62,7 +62,7 @@ pub fn config_from_matches(p1: &clap::ArgMatches, p2: &clap::ArgMatches) -> Http
         cfg.retry = retry;
     }
 
-    cfg.follow_redirects = m.get_flag("spall-follow");
+    cfg.follow_redirects = m.get_flag("spall-redirect");
 
     if let Some(max) = m.get_one::<usize>("spall-max-redirects") {
         cfg.max_redirects = max;
