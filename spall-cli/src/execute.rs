@@ -6,6 +6,7 @@ use spall_core::ir::{
     HttpMethod, ParameterLocation, ResolvedOperation, ResolvedRequestBody, ResolvedSpec,
 };
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -41,9 +42,221 @@ pub fn collect_remaining_args(matches: &ArgMatches) -> Vec<String> {
 
 /// Structured return value from `execute_operation`.
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct OperationResult {
     pub status: reqwest::StatusCode,
     pub value: serde_json::Value,
+}
+
+/// Structured arguments for `execute_operation_programmatic`.
+///
+/// All fields are owned `String` / `Value`s; no `ArgMatches` lifetimes
+/// leak through. `#[non_exhaustive]` keeps future field additions
+/// non-breaking for downstream callers (the Arazzo runner, future MCP
+/// dispatcher, REPL).
+#[derive(Default, Debug)]
+#[non_exhaustive]
+#[allow(dead_code)] // Wired in by `arazzo_runner` in the next commit.
+pub struct ProgrammaticArgs {
+    /// Path parameters keyed by the parameter `name` from the spec.
+    pub path: BTreeMap<String, String>,
+    /// Query parameters keyed by name.
+    pub query: BTreeMap<String, String>,
+    /// Headers keyed by canonical-case name. Applied **after** auth
+    /// resolution, so callers may override an `Authorization` header set
+    /// by spall's auth chain.
+    pub header: BTreeMap<String, String>,
+    /// Cookie parameters keyed by name.
+    pub cookie: BTreeMap<String, String>,
+    /// Optional request body. Serialized as JSON; `Content-Type:
+    /// application/json` is set unless the caller already supplied a
+    /// `Content-Type` header.
+    pub body: Option<serde_json::Value>,
+    /// CLI-style `--spall-auth` override (e.g. `Bearer xxx`), forwarded
+    /// to `crate::auth::resolve` as the highest-priority source.
+    pub auth_override: Option<String>,
+    /// If `Some`, this server URL overrides the one resolved from
+    /// `ApiEntry::base_url` / operation / spec.
+    pub server_override: Option<String>,
+    /// HTTP client configuration.
+    pub http: crate::http::HttpConfig,
+    /// Retry attempts beyond the first. Default `1`.
+    pub retry_count: u8,
+    /// Cap on `Retry-After` delay in seconds. Default `60`.
+    pub retry_max_wait_secs: u64,
+}
+
+#[allow(dead_code)] // Wired in by `arazzo_runner` in the next commit.
+impl ProgrammaticArgs {
+    /// Construct an empty `ProgrammaticArgs` with sensible retry defaults.
+    #[must_use = "the constructed args are the only output"]
+    pub fn new() -> Self {
+        Self {
+            retry_count: 1,
+            retry_max_wait_secs: 60,
+            ..Self::default()
+        }
+    }
+}
+
+/// Programmatic entry point into spall's request pipeline.
+///
+/// This is the *canonical* execution path for callers that do not have
+/// `clap::ArgMatches` available — the Arazzo workflow runner, future MCP
+/// server, embedded REPL drivers. The clap-driven [`execute_operation`]
+/// shares the same lower-level helpers (`build_url_with_path_args`,
+/// `auth::resolve`/`apply`, `send_one`), so the two paths produce
+/// identical outbound requests for the same inputs.
+///
+/// What this **does**: URL build, header / query / cookie / path / auth
+/// resolution, JSON body serialization, a single retrying `send_one`,
+/// body JSON parse, 4xx/5xx → `Err`.
+///
+/// What this **does NOT do** (these belong in the clap wrapper):
+/// dry-run, preview, preflight validation, pagination, hypermedia
+/// follow, history recording, `store_last_response`, verbose/time
+/// stderr logging, response-schema warning emission.
+#[must_use = "the OperationResult carries the response body"]
+#[allow(dead_code)] // Wired in by `arazzo_runner` in the next commit.
+pub async fn execute_operation_programmatic(
+    op: &ResolvedOperation,
+    spec: &ResolvedSpec,
+    entry: &ApiEntry,
+    args: &ProgrammaticArgs,
+) -> Result<OperationResult, crate::SpallCliError> {
+    let url = build_url_with_path_args(op, spec, entry, args.server_override.as_deref(), &args.path);
+
+    let mut headers = HeaderMap::new();
+
+    // Step 1: default headers from the ApiEntry config.
+    for (k, v) in &entry.default_headers {
+        if let (Ok(name), Ok(value)) =
+            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
+        {
+            headers.insert(name, value);
+        }
+    }
+
+    // Step 2: cookies → COOKIE header.
+    if !args.cookie.is_empty() {
+        let joined = args
+            .cookie
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if let Ok(v) = HeaderValue::from_str(&joined) {
+            headers.insert(COOKIE, v);
+        }
+    }
+
+    // Step 3: query pairs.
+    let mut query_pairs: Vec<(String, String)> = args
+        .query
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    // Step 4: auth resolution + injection.
+    let resolved_auth =
+        crate::auth::resolve(&entry.name, entry.auth.as_ref(), args.auth_override.as_deref())
+            .await?;
+    if let Some(a) = resolved_auth {
+        crate::auth::apply(&a, &mut headers, &mut query_pairs);
+    }
+
+    // Step 5: caller-supplied headers win over the auth chain.
+    for (k, v) in &args.header {
+        if let (Ok(name), Ok(value)) =
+            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
+        {
+            headers.insert(name, value);
+        }
+    }
+
+    // Step 6: body serialization.
+    let body_bytes: Option<Vec<u8>> = if let Some(value) = &args.body {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|e| crate::SpallCliError::Usage(format!("invalid JSON body: {}", e)))?;
+        if !headers.contains_key(reqwest::header::CONTENT_TYPE) {
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+
+    // Step 7: build client + send.
+    let client =
+        crate::http::build_http_client(&args.http).map_err(crate::SpallCliError::HttpClient)?;
+    let (status, _resp_hdrs, body_bytes_resp) = send_one(
+        &client,
+        op.method,
+        &url,
+        headers,
+        body_bytes,
+        None,
+        &query_pairs,
+        args.retry_count,
+        args.retry_max_wait_secs,
+    )
+    .await?;
+
+    // Step 8: surface 4xx/5xx as errors so the caller (Arazzo runner /
+    // MCP dispatcher) can map them onto their own failure types.
+    if status.is_client_error() {
+        return Err(crate::SpallCliError::Http4xx(status.as_u16()));
+    }
+    if status.is_server_error() {
+        return Err(crate::SpallCliError::Http5xx(status.as_u16()));
+    }
+
+    let value = serde_json::from_slice::<serde_json::Value>(&body_bytes_resp).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(&body_bytes_resp).to_string())
+    });
+    Ok(OperationResult { status, value })
+}
+
+/// URL builder shared by the clap-driven and programmatic paths.
+///
+/// `server_override`, when `Some`, supersedes `entry.base_url` and the
+/// per-op / per-spec server lists. `path_args` is consulted for
+/// path-template substitution.
+#[must_use = "the assembled URL is the only output"]
+fn build_url_with_path_args(
+    op: &ResolvedOperation,
+    spec: &ResolvedSpec,
+    entry: &ApiEntry,
+    server_override: Option<&str>,
+    path_args: &BTreeMap<String, String>,
+) -> String {
+    let base = server_override
+        .map(|s| s.to_string())
+        .or_else(|| entry.base_url.clone())
+        .or_else(|| op.servers.first().map(|s| s.url.clone()))
+        .or_else(|| spec.servers.first().map(|s| s.url.clone()))
+        .unwrap_or_else(|| "/".to_string());
+
+    let mut path = op.path_template.clone();
+    for param in &op.parameters {
+        if param.location == ParameterLocation::Path {
+            if let Some(v) = path_args.get(&param.name) {
+                path = path.replace(&format!("{{{}}}", param.name), v);
+                path = path.replace(&format!("{{{}*}}", param.name), v);
+            }
+        }
+    }
+
+    let base_trimmed = base.trim_end_matches('/');
+    let path_trimmed = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{}", path)
+    };
+    format!("{}{}", base_trimmed, path_trimmed)
 }
 
 /// Execute a matched operation.
@@ -390,7 +603,7 @@ pub async fn execute_operation(
 /// forms — clamped by `retry_max_wait_secs`. If the indicated wait exceeds
 /// the clamp, the response is returned as-is.
 #[allow(clippy::too_many_arguments)]
-async fn send_one(
+pub(crate) async fn send_one(
     client: &reqwest::Client,
     method: HttpMethod,
     url: &str,
@@ -542,7 +755,11 @@ pub fn merge_matches<'a>(phase1: &'a ArgMatches, phase2: &'a ArgMatches) -> Merg
     MergedMatches { phase1, phase2 }
 }
 
-/// Build the full request URL.
+/// Build the full request URL from clap matches.
+///
+/// Thin adapter: extracts path-template args and the optional
+/// `--spall-server` override from `ArgMatches`, then delegates to the
+/// shared [`build_url_with_path_args`] used by the programmatic path.
 fn build_url(
     op: &ResolvedOperation,
     spec: &ResolvedSpec,
@@ -550,33 +767,27 @@ fn build_url(
     phase1_matches: &ArgMatches,
     phase2_matches: &ArgMatches,
 ) -> Result<String, crate::SpallCliError> {
-    let base = entry
-        .base_url
-        .clone()
-        .or_else(|| phase2_matches.get_one::<String>("spall-server").cloned())
-        .or_else(|| phase1_matches.get_one::<String>("spall-server").cloned())
-        .or_else(|| op.servers.first().map(|s| s.url.clone()))
-        .or_else(|| spec.servers.first().map(|s| s.url.clone()))
-        .unwrap_or_else(|| "/".to_string());
+    let server_override = phase2_matches
+        .get_one::<String>("spall-server")
+        .cloned()
+        .or_else(|| phase1_matches.get_one::<String>("spall-server").cloned());
 
-    let mut path = op.path_template.clone();
+    let mut path_args: BTreeMap<String, String> = BTreeMap::new();
     for param in &op.parameters {
         if param.location == ParameterLocation::Path {
             let id = format!("path-{}", param.name);
             if let Some(v) = phase2_matches.get_one::<String>(&id) {
-                path = path.replace(&format!("{{{}}}", param.name), v);
-                path = path.replace(&format!("{{{}*}}", param.name), v);
+                path_args.insert(param.name.clone(), v.clone());
             }
         }
     }
-
-    let base_trimmed = base.trim_end_matches('/');
-    let path_trimmed = if path.starts_with('/') {
-        path
-    } else {
-        format!("/{}", path)
-    };
-    Ok(format!("{}{}", base_trimmed, path_trimmed))
+    Ok(build_url_with_path_args(
+        op,
+        spec,
+        entry,
+        server_override.as_deref(),
+        &path_args,
+    ))
 }
 
 struct BodyData {
@@ -752,4 +963,256 @@ fn record_history(
     };
 
     let _ = history.record(&record);
+}
+
+#[cfg(test)]
+mod programmatic_tests {
+    //! Inline integration tests for [`execute_operation_programmatic`].
+    //!
+    //! These guard against drift between the clap-driven path and the
+    //! programmatic path: both must produce the same outbound request
+    //! shape given the same inputs. Each test builds a `ResolvedSpec`
+    //! and `ApiEntry` in-process, points them at a `wiremock` server,
+    //! and asserts the on-wire request matches expectations.
+    use super::*;
+    use indexmap::IndexMap;
+    use spall_config::registry::ApiEntry;
+    use spall_core::ir::{
+        HttpMethod, ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSchema,
+        ResolvedSpec,
+    };
+    use std::collections::HashMap;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn schema_any() -> ResolvedSchema {
+        ResolvedSchema {
+            type_name: None,
+            format: None,
+            description: None,
+            default: None,
+            enum_values: Vec::new(),
+            nullable: false,
+            read_only: false,
+            write_only: false,
+            is_recursive: false,
+            pattern: None,
+            min_length: None,
+            max_length: None,
+            minimum: None,
+            maximum: None,
+            multiple_of: None,
+            exclusive_minimum: false,
+            exclusive_maximum: false,
+            min_items: None,
+            max_items: None,
+            unique_items: false,
+            additional_properties: true,
+            properties: IndexMap::new(),
+            items: None,
+        }
+    }
+
+    fn path_param(name: &str) -> ResolvedParameter {
+        ResolvedParameter {
+            name: name.to_string(),
+            location: ParameterLocation::Path,
+            required: true,
+            deprecated: false,
+            style: String::new(),
+            explode: false,
+            schema: schema_any(),
+            description: None,
+            extensions: IndexMap::new(),
+        }
+    }
+
+    fn make_get_op(op_id: &str, path_template: &str, with_path_param: Option<&str>) -> ResolvedOperation {
+        let parameters = match with_path_param {
+            Some(name) => vec![path_param(name)],
+            None => Vec::new(),
+        };
+        ResolvedOperation {
+            operation_id: op_id.to_string(),
+            method: HttpMethod::Get,
+            path_template: path_template.to_string(),
+            summary: None,
+            description: None,
+            deprecated: false,
+            parameters,
+            request_body: None,
+            responses: IndexMap::new(),
+            security: Vec::new(),
+            tags: Vec::new(),
+            extensions: IndexMap::new(),
+            servers: Vec::new(),
+        }
+    }
+
+    fn make_post_op(op_id: &str, path_template: &str) -> ResolvedOperation {
+        let mut op = make_get_op(op_id, path_template, None);
+        op.method = HttpMethod::Post;
+        op
+    }
+
+    fn make_spec(base_url: &str) -> ResolvedSpec {
+        ResolvedSpec {
+            title: "test".to_string(),
+            version: "1.0.0".to_string(),
+            base_url: base_url.to_string(),
+            operations: Vec::new(),
+            servers: vec![spall_core::ir::ResolvedServer {
+                url: base_url.to_string(),
+                description: None,
+            }],
+        }
+    }
+
+    fn make_entry(name: &str, base_url: &str) -> ApiEntry {
+        ApiEntry {
+            name: name.to_string(),
+            source: format!("{}/openapi.json", base_url),
+            config_path: None,
+            base_url: Some(base_url.to_string()),
+            default_headers: Vec::new(),
+            auth: None,
+            proxy: None,
+            profiles: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn programmatic_get_with_path_query_header_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/items/abc-123"))
+            .and(wiremock::matchers::query_param("filter", "active"))
+            .and(header("x-trace-id", "trace-xyz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "abc-123",
+                "count": 7,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base = server.uri();
+        let spec = make_spec(&base);
+        let entry = make_entry("test", &base);
+        let op = make_get_op("getItem", "/items/{id}", Some("id"));
+
+        let mut args = ProgrammaticArgs::new();
+        args.path.insert("id".to_string(), "abc-123".to_string());
+        args.query
+            .insert("filter".to_string(), "active".to_string());
+        args.header
+            .insert("X-Trace-Id".to_string(), "trace-xyz".to_string());
+
+        let result = execute_operation_programmatic(&op, &spec, &entry, &args)
+            .await
+            .expect("request");
+        assert_eq!(result.status.as_u16(), 200);
+        assert_eq!(result.value, serde_json::json!({"id": "abc-123", "count": 7}));
+    }
+
+    #[tokio::test]
+    async fn programmatic_post_serializes_json_body_and_sets_content_type() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"email": "a@b.test", "n": 3});
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(&body))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base = server.uri();
+        let spec = make_spec(&base);
+        let entry = make_entry("test", &base);
+        let op = make_post_op("login", "/login");
+
+        let mut args = ProgrammaticArgs::new();
+        args.body = Some(body.clone());
+
+        let res = execute_operation_programmatic(&op, &spec, &entry, &args)
+            .await
+            .expect("post");
+        assert_eq!(res.status.as_u16(), 201);
+        assert_eq!(res.value, serde_json::json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn programmatic_caller_header_wins_over_auth_chain() {
+        // Auth is unconfigured on the ApiEntry, so the auth chain returns
+        // None and the caller's Authorization header is the only one set.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .and(header("authorization", "Bearer caller-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"u": 1})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base = server.uri();
+        let spec = make_spec(&base);
+        let entry = make_entry("test", &base);
+        let op = make_get_op("getMe", "/me", None);
+
+        let mut args = ProgrammaticArgs::new();
+        args.header
+            .insert("Authorization".to_string(), "Bearer caller-token".to_string());
+
+        let res = execute_operation_programmatic(&op, &spec, &entry, &args)
+            .await
+            .expect("get");
+        assert_eq!(res.status.as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn programmatic_4xx_returns_http4xx_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/forbidden"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base = server.uri();
+        let spec = make_spec(&base);
+        let entry = make_entry("test", &base);
+        let op = make_get_op("forbidden", "/forbidden", None);
+        let args = ProgrammaticArgs::new();
+
+        let err = execute_operation_programmatic(&op, &spec, &entry, &args)
+            .await
+            .expect_err("expected 4xx error");
+        assert!(matches!(err, crate::SpallCliError::Http4xx(403)));
+    }
+
+    #[tokio::test]
+    async fn programmatic_server_override_supersedes_entry_base() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let real_base = server.uri();
+        let spec = make_spec("http://wrong.invalid");
+        let entry = make_entry("test", "http://also-wrong.invalid");
+        let op = make_get_op("listItems", "/v2/items", None);
+
+        let mut args = ProgrammaticArgs::new();
+        args.server_override = Some(real_base);
+        let res = execute_operation_programmatic(&op, &spec, &entry, &args)
+            .await
+            .expect("get");
+        assert_eq!(res.status.as_u16(), 200);
+    }
 }
