@@ -3,7 +3,7 @@
 //! `spall-core/src/arazzo/expressions.rs` unit tests and by the
 //! `spall-cli` wiremock e2e.
 
-use spall_core::arazzo::ArazzoDocument;
+use spall_core::arazzo::{ActionOrRef, ArazzoDocument, FailureActionOrRef};
 use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> PathBuf {
@@ -90,6 +90,122 @@ workflows:
         src.x_spall_api.as_deref(),
         Some("petstore"),
         "x-spall-api extension must round-trip into SourceDescription.x_spall_api",
+    );
+}
+
+#[test]
+fn with_retry_fixture_parses() {
+    let doc = parse("with-retry.arazzo.yaml");
+    let wf = &doc.workflows[0];
+    assert_eq!(wf.workflow_id, "retryFlow");
+    let step = &wf.steps[0];
+    assert_eq!(step.step_id, "probeStep");
+    let chain = step
+        .on_failure
+        .as_ref()
+        .expect("explicit onFailure should round-trip as Some(vec)");
+    assert_eq!(chain.len(), 1);
+    match &chain[0] {
+        FailureActionOrRef::Inline(a) => {
+            assert_eq!(a.name, "try-again");
+            assert_eq!(a.kind, "retry");
+            assert_eq!(a.retry_after, Some(0.0));
+            assert_eq!(a.retry_limit, Some(2));
+        }
+        FailureActionOrRef::Reference(_) => panic!("expected inline action, got reference"),
+    }
+}
+
+#[test]
+fn with_goto_fixture_parses() {
+    let doc = parse("with-goto.arazzo.yaml");
+    let wf = &doc.workflows[0];
+    assert_eq!(wf.workflow_id, "gotoFlow");
+    // 3 steps, first has onFailure redirect, last is the goto target.
+    let step_ids: Vec<&str> = wf.steps.iter().map(|s| s.step_id.as_str()).collect();
+    assert_eq!(step_ids, vec!["maybeFail", "shouldBeSkipped", "cleanupStep"]);
+    let chain = wf.steps[0]
+        .on_failure
+        .as_ref()
+        .expect("first step has onFailure");
+    match &chain[0] {
+        FailureActionOrRef::Inline(a) => {
+            assert_eq!(a.kind, "goto");
+            assert_eq!(a.step_id.as_deref(), Some("cleanupStep"));
+        }
+        FailureActionOrRef::Reference(_) => panic!("expected inline goto"),
+    }
+    // Steps without onFailure should round-trip as None, NOT Some(vec![]).
+    assert!(wf.steps[1].on_failure.is_none());
+    assert!(wf.steps[2].on_failure.is_none());
+}
+
+#[test]
+fn with_component_actions_fixture_parses() {
+    let doc = parse("with-component-actions.arazzo.yaml");
+    let components = doc.components.as_ref().expect("components block");
+    assert_eq!(components.success_actions.len(), 1);
+    assert_eq!(components.failure_actions.len(), 1);
+    assert_eq!(components.failure_actions["bail"].kind, "end");
+    assert_eq!(components.success_actions["keepGoing"].kind, "end");
+
+    let wf = &doc.workflows[0];
+    let step = &wf.steps[0];
+    let on_failure = step.on_failure.as_ref().expect("step has onFailure");
+    match &on_failure[0] {
+        FailureActionOrRef::Reference(r) => {
+            assert_eq!(r.reference, "$components.failureActions.bail");
+        }
+        FailureActionOrRef::Inline(_) => panic!("expected reference, got inline"),
+    }
+    let on_success = step.on_success.as_ref().expect("step has onSuccess");
+    match &on_success[0] {
+        ActionOrRef::Reference(r) => {
+            assert_eq!(r.reference, "$components.successActions.keepGoing");
+        }
+        ActionOrRef::Inline(_) => panic!("expected reference, got inline"),
+    }
+}
+
+#[test]
+fn explicit_empty_on_failure_round_trips_as_some_empty_vec() {
+    // Regression guard for the Option<Vec<_>> change: `onFailure: []`
+    // in YAML must parse to Some(vec![]) so the runner can distinguish
+    // "opt out of workflow-level fallback" from "no override".
+    let yaml = r#"
+arazzo: "1.0.1"
+info:
+  title: Empty-chain probe
+  version: "1.0.0"
+sourceDescriptions:
+  - name: api
+    url: ./openapi.json
+    type: openapi
+workflows:
+  - workflowId: probe
+    failureActions:
+      - name: bail
+        type: end
+    steps:
+      - stepId: optOut
+        operationId: getThing
+        onFailure: []
+      - stepId: useDefault
+        operationId: getThing
+"#;
+    let doc = spall_core::yaml::from_str::<ArazzoDocument>(yaml)
+        .expect("explicit-empty fixture parses");
+    let wf = &doc.workflows[0];
+    let opt_out = &wf.steps[0];
+    let use_default = &wf.steps[1];
+    assert_eq!(
+        opt_out.on_failure.as_ref().map(|v| v.len()),
+        Some(0),
+        "onFailure: [] must parse as Some(vec![])",
+    );
+    assert!(
+        use_default.on_failure.is_none(),
+        "absent onFailure must parse as None",
     );
 }
 

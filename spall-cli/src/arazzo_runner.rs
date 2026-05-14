@@ -378,11 +378,20 @@ pub struct RunOptions {
 pub const DEFAULT_MAX_STEPS: usize = 10_000;
 
 /// Outcome of a single step.
+///
+/// `failed_via` is `Some("on-failure-end" | "on-failure-goto")` when
+/// the step's HTTP/criteria failure was absorbed by a `failureAction`
+/// chain (the workflow continued via `goto` or terminated via `end`).
+/// `None` means the step body completed normally — either success or
+/// an unhandled failure that bubbled up. Consumers of the JSON output
+/// use this to distinguish "step succeeded" from "step's failure was
+/// caught."
 pub struct StepOutcome {
     pub step_id: String,
     pub status: u16,
     pub outputs: BTreeMap<String, serde_json::Value>,
     pub dry_run: bool,
+    pub failed_via: Option<&'static str>,
 }
 
 /// Outcome of a workflow run.
@@ -686,6 +695,10 @@ async fn run_step_with_actions(
             source: e,
         })?;
 
+    if opts.dry_run {
+        print_action_chain_preview(step, &success_actions, &failure_actions);
+    }
+
     let mut attempt: u32 = 0;
     loop {
         match run_step(step, sources, ctx, opts, http_config).await {
@@ -716,7 +729,12 @@ async fn run_step_with_actions(
                         // resolve instead of erroring with "step never
                         // ran". outputs stays empty because step.outputs
                         // never ran.
-                        step_outcomes.push(synthetic_failure_outcome(step, ctx));
+                        let via = match &flow {
+                            StepFlow::Goto { .. } => "on-failure-goto",
+                            StepFlow::End { .. } => "on-failure-end",
+                            _ => unreachable!(),
+                        };
+                        step_outcomes.push(synthetic_failure_outcome(step, ctx, via));
                         let snapshot = ctx.current_response.clone().unwrap_or_else(|| {
                             spall_core::arazzo::ResponseSnapshot {
                                 status: 0,
@@ -815,10 +833,63 @@ fn is_recoverable_step_error(err: &ArazzoRunError) -> bool {
     )
 }
 
+/// In `--dry-run` mode, print the resolved success / failure action
+/// chains for a step alongside its request preview. Pure-stderr so it
+/// stays out of the workflow's JSON output. No-op when both chains
+/// are empty (the common case for v1 workflows).
+fn print_action_chain_preview(
+    step: &Step,
+    success: &[spall_core::arazzo::Action],
+    failure: &[spall_core::arazzo::FailureAction],
+) {
+    if success.is_empty() && failure.is_empty() {
+        return;
+    }
+    eprintln!("[dry-run] step '{}' resolved actions:", step.step_id);
+    for a in success {
+        eprintln!(
+            "            onSuccess: {} (type={}{}{})",
+            a.name,
+            a.kind,
+            a.step_id
+                .as_deref()
+                .map(|s| format!(", stepId={}", s))
+                .unwrap_or_default(),
+            if a.criteria.is_empty() {
+                String::new()
+            } else {
+                format!(", criteria={}", a.criteria.len())
+            },
+        );
+    }
+    for a in failure {
+        eprintln!(
+            "            onFailure: {} (type={}{}{}{})",
+            a.name,
+            a.kind,
+            a.step_id
+                .as_deref()
+                .map(|s| format!(", stepId={}", s))
+                .unwrap_or_default(),
+            a.retry_after
+                .map(|s| format!(", retryAfter={}s", s))
+                .unwrap_or_default(),
+            if a.criteria.is_empty() {
+                String::new()
+            } else {
+                format!(", criteria={}", a.criteria.len())
+            },
+        );
+    }
+}
+
 /// Outcome record for a step whose failure was absorbed by a
-/// failureAction (`goto` or `end`). The status field carries whatever
-/// the wire actually returned (or 0 when the failure was criteria-only).
-fn synthetic_failure_outcome(step: &Step, ctx: &Context) -> StepOutcome {
+/// failureAction. `failed_via` distinguishes the two absorption paths
+/// so JSON consumers can tell "step succeeded with status N" from
+/// "step's HTTP returned N but a failureAction caught it." The status
+/// field carries whatever the wire actually returned (or 0 when the
+/// failure was criteria-only).
+fn synthetic_failure_outcome(step: &Step, ctx: &Context, via: &'static str) -> StepOutcome {
     let status = ctx
         .current_response
         .as_ref()
@@ -829,6 +900,7 @@ fn synthetic_failure_outcome(step: &Step, ctx: &Context) -> StepOutcome {
         status,
         outputs: BTreeMap::new(),
         dry_run: false,
+        failed_via: Some(via),
     }
 }
 
@@ -914,6 +986,7 @@ async fn run_step(
             status: 0,
             outputs: BTreeMap::new(),
             dry_run: true,
+            failed_via: None,
         });
     }
 
@@ -1017,6 +1090,7 @@ async fn run_step(
         status,
         outputs,
         dry_run: false,
+        failed_via: None,
     })
 }
 
@@ -1176,12 +1250,18 @@ pub fn outcome_to_json(outcome: &RunOutcome) -> serde_json::Value {
         for (k, v) in &s.outputs {
             step_outputs.insert(k.clone(), v.clone());
         }
-        steps.push(serde_json::json!({
-            "stepId": s.step_id,
-            "status": s.status,
-            "dryRun": s.dry_run,
-            "outputs": serde_json::Value::Object(step_outputs),
-        }));
+        let mut obj = serde_json::Map::new();
+        obj.insert("stepId".to_string(), serde_json::json!(s.step_id));
+        obj.insert("status".to_string(), serde_json::json!(s.status));
+        obj.insert("dryRun".to_string(), serde_json::json!(s.dry_run));
+        obj.insert(
+            "outputs".to_string(),
+            serde_json::Value::Object(step_outputs),
+        );
+        if let Some(via) = s.failed_via {
+            obj.insert("failedVia".to_string(), serde_json::json!(via));
+        }
+        steps.push(serde_json::Value::Object(obj));
     }
     serde_json::json!({
         "workflowId": outcome.workflow_id,

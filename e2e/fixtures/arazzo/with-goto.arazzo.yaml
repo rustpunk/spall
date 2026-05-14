@@ -1,0 +1,34 @@
+arazzo: "1.0.1"
+info:
+  title: Goto recovery step on failure
+  version: "1.0.0"
+  summary: "A failing step routes via 'type: goto' to a downstream cleanup step; the intermediate step is skipped."
+sourceDescriptions:
+  - name: api
+    url: ./simple-openapi.json
+    type: openapi
+workflows:
+  - workflowId: gotoFlow
+    steps:
+      - stepId: maybeFail
+        operationId: getItem
+        parameters:
+          - name: id
+            in: path
+            value: "1"
+        onFailure:
+          - name: redirect
+            type: goto
+            stepId: cleanupStep
+      - stepId: shouldBeSkipped
+        operationId: getItem
+        parameters:
+          - name: id
+            in: path
+            value: "2"
+      - stepId: cleanupStep
+        operationId: getItem
+        parameters:
+          - name: id
+            in: path
+            value: "3"

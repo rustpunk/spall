@@ -8,31 +8,45 @@
 //! Wire contract:
 //! - **POST /** with `Content-Type: application/json`. Body is one
 //!   JSON-RPC 2.0 request frame. Response is one JSON-RPC frame as
-//!   `application/json`. Streaming (text/event-stream) is documented
-//!   in the spec for long-running responses; v1 tools are all
-//!   request/response so we never produce SSE. Clients that send
-//!   `Accept: text/event-stream` get JSON anyway — per spec they MUST
-//!   accept both, and the server is free to pick the format.
+//!   `application/json`.
 //! - **`Mcp-Session-Id`** is issued on `initialize` and required on
-//!   every subsequent request. Sessions live for the process's
-//!   lifetime; restarting the server invalidates all sessions
-//!   (this matches FastMCP / mcp-remote behavior; see Inspector #905
-//!   and claude-code #27142 for the failure modes of getting this
-//!   wrong).
-//! - **Origin** validation kicks in when
-//!   `--spall-allowed-origin <origin>` is set (repeatable). A request
-//!   whose `Origin` header isn't in the allowlist gets `403 Forbidden`
-//!   before the body is deserialized — mitigates the DNS-rebinding
-//!   class the spec calls out.
+//!   every subsequent request. Sessions expire after
+//!   [`SESSION_TTL_SECS`] of inactivity; a background task prunes
+//!   expired entries. Expired session IDs receive 400 with a
+//!   re-initialize hint.
+//! - **Origin** validation: when `--spall-allowed-origin <origin>` is
+//!   provided (repeatable), only listed origins succeed. With an
+//!   empty allowlist (the default), localhost Origins and requests
+//!   without an Origin header succeed; remote Origins receive 403.
+//!   Either path rejects before deserializing the body, mitigating
+//!   DNS rebinding.
 //! - **Bind interface** defaults to `127.0.0.1`. The spec recommends
 //!   localhost-only by default; `--spall-bind <addr>` opts into
 //!   exposing the server on other interfaces.
+//! - **Body size** capped at [`MAX_BODY_BYTES`] (16 MiB) via axum's
+//!   `DefaultBodyLimit`; larger requests yield 413.
 //!
-//! Out of scope (file a new issue if needed):
-//! - Streaming responses via SSE (no long-running v1 tools).
-//! - Server-initiated GET event stream for server→client notifications.
-//! - TLS termination (reverse-proxy responsibility per the issue).
-//! - Auth on the HTTP endpoint itself.
+//! ### SSE responses
+//!
+//! The MCP spec allows `text/event-stream` for long-running tool
+//! responses and for server→client notifications (progress, sampling,
+//! roots). spall v1 returns JSON for every reply: tools are all
+//! request/response and there is no GET event channel.
+//!
+//! Adding SSE later is **not** a content-type flip in this handler —
+//! [`super::handle_line`] returns `Option<Value>` synchronously, so
+//! streaming requires changing the dispatcher's signature to be
+//! stream-shaped (`Stream<Item = Value>`), threading progress
+//! callbacks through `handle_tools_call`, and adding a GET route for
+//! the server-pump channel. That is a transport refactor, tracked
+//! separately.
+//!
+//! ### Out of scope (file a new issue if needed)
+//!
+//! - SSE for long-running tools / progress notifications.
+//! - Server-initiated GET event stream.
+//! - TLS termination (reverse-proxy responsibility).
+//! - Auth on the HTTP endpoint itself (reverse-proxy responsibility).
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -48,6 +62,7 @@ use spall_core::ir::ResolvedSpec;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
@@ -59,6 +74,20 @@ use super::{handle_line, AuthProfiles, ToolEntry};
 /// adversarial payloads. The matching configuration lives in
 /// `axum::extract::DefaultBodyLimit`.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Idle timeout for an MCP HTTP session. A session whose
+/// `Mcp-Session-Id` hasn't been seen for this long is expired:
+/// further requests carrying it return `400 Bad Request` with the
+/// re-initialize hint, and the background pruner reclaims its slot
+/// in the session map. One hour matches the FastMCP / Inspector
+/// convention and is long enough for any practical agent session.
+pub const SESSION_TTL_SECS: u64 = 3600;
+
+/// How often the background task scans the session map for expired
+/// entries. Set to TTL / 12 so the worst-case latency between
+/// expiry and reclamation is ~5 minutes — well within the headroom
+/// of a 1-hour TTL.
+const PRUNE_INTERVAL_SECS: u64 = SESSION_TTL_SECS / 12;
 
 /// Header name for the MCP session identifier, per spec.
 const HEADER_SESSION_ID: &str = "mcp-session-id";
@@ -104,9 +133,27 @@ pub async fn run_http(
         spec,
         profiles,
         registry,
-        sessions: RwLock::new(HashSet::new()),
+        sessions: RwLock::new(HashMap::new()),
         allowed_origins: allowed_origins.into_iter().collect(),
     });
+
+    // Spawn the idle-session pruner. Holds a clone of the Arc so the
+    // task lives as long as the server. With the current_thread tokio
+    // runtime, this co-schedules with handle_post; the await on
+    // sleep() always yields, so the pruner can't starve requests.
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let interval = Duration::from_secs(PRUNE_INTERVAL_SECS);
+            let ttl = Duration::from_secs(SESSION_TTL_SECS);
+            loop {
+                tokio::time::sleep(interval).await;
+                let now = Instant::now();
+                let mut sessions = state.sessions.write().await;
+                sessions.retain(|_, last_seen| now.duration_since(*last_seen) < ttl);
+            }
+        });
+    }
 
     // Align the CORS layer with the handler-side Origin allowlist so
     // browser preflight rejection matches the actual POST rejection.
@@ -157,7 +204,11 @@ struct HttpState {
     spec: ResolvedSpec,
     profiles: AuthProfiles,
     registry: IndexMap<String, ToolEntry>,
-    sessions: RwLock<HashSet<String>>,
+    /// Map session-id → instant of last activity. The session-id
+    /// gate in `handle_post` checks both presence AND freshness against
+    /// `SESSION_TTL_SECS`; the background pruner reclaims expired
+    /// slots periodically.
+    sessions: RwLock<HashMap<String, Instant>>,
     allowed_origins: HashSet<String>,
 }
 
@@ -217,15 +268,37 @@ async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, bo
     let is_initialize = method == "initialize";
 
     // Session-id gate: required on everything except `initialize`.
-    // `notifications/initialized` and `ping` need a valid session so
-    // a client can't bypass the handshake by sending a noop first.
+    // `notifications/initialized` and `ping` need a valid session so a
+    // client can't bypass the handshake. Expired sessions (idle past
+    // SESSION_TTL_SECS) get the same 400 with a re-init hint so the
+    // client can recover without restarting.
     if !is_initialize {
         let sid = headers
             .get(HEADER_SESSION_ID)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let sessions = state.sessions.read().await;
-        if !sessions.contains(sid) {
+            .unwrap_or("")
+            .to_string();
+        let ttl = Duration::from_secs(SESSION_TTL_SECS);
+        let now = Instant::now();
+        let valid = {
+            let mut sessions = state.sessions.write().await;
+            match sessions.get(&sid) {
+                Some(last_seen) if now.duration_since(*last_seen) < ttl => {
+                    // Bump the last-seen marker so an active session
+                    // doesn't expire mid-flight.
+                    sessions.insert(sid.clone(), now);
+                    true
+                }
+                Some(_) => {
+                    // Expired — reclaim immediately so the next probe
+                    // sees a clean miss.
+                    sessions.remove(&sid);
+                    false
+                }
+                None => false,
+            }
+        };
+        if !valid {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -233,7 +306,7 @@ async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, bo
                     "id": parsed.get("id").cloned().unwrap_or(Value::Null),
                     "error": {
                         "code": -32600,
-                        "message": "missing or invalid Mcp-Session-Id; call `initialize` first",
+                        "message": "missing, expired, or invalid Mcp-Session-Id; call `initialize` first",
                     },
                 })),
             )
@@ -247,7 +320,7 @@ async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, bo
     let mut headers_out = HeaderMap::new();
     if is_initialize {
         let sid = new_session_id();
-        state.sessions.write().await.insert(sid.clone());
+        state.sessions.write().await.insert(sid.clone(), Instant::now());
         if let Ok(v) = HeaderValue::from_str(&sid) {
             headers_out.insert(
                 HeaderName::from_static(HEADER_SESSION_ID),
