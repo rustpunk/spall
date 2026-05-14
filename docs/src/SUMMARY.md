@@ -29,5 +29,6 @@
 - [CLI Reference](operations/cli-reference.md)
 - [Request History](operations/history.md)
 - [Interactive REPL](operations/repl.md)
+- [Arazzo Workflows](operations/arazzo.md)
 - [Shell Completions](operations/shell-completions.md)
 - [Exit Codes](operations/exit-codes.md)

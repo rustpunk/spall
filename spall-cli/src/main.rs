@@ -1,5 +1,6 @@
 //! spall-cli: Binary entry point. Two-phase clap parse and dispatch.
 
+mod arazzo_runner;
 mod auth;
 mod chain;
 mod commands;
@@ -170,6 +171,7 @@ pub async fn run_with_args(
             // consistently.  If the subcommand is "discover" we ignore the flag.
             commands::api::handle_api_management(sub, cache_dir).await
         }
+        Some(("arazzo", sub)) => commands::arazzo::handle_arazzo(sub, registry, cache_dir).await,
         Some(("auth", sub)) => commands::auth::handle_auth(sub).await,
         Some(("completions", sub)) => {
             let shell = sub
@@ -494,6 +496,7 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
         .about("Break free. Hit the endpoint.")
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand(api_management_cmd())
+        .subcommand(commands::arazzo::arazzo_cmd())
         .subcommand(auth_cmd())
         .subcommand(history_cmd())
         .subcommand(

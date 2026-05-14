@@ -23,9 +23,30 @@ pub async fn handle_api_management(
     }
 }
 
+/// Subcommand names spall registers at the top level. An API stub
+/// registered with one of these names would collide and clap would panic
+/// at command-tree build time on the next launch — so we reject up front.
+const RESERVED_API_NAMES: &[&str] = &[
+    "api",
+    "arazzo",
+    "auth",
+    "completions",
+    "history",
+    "repl",
+    "__complete",
+];
+
 fn handle_add(matches: &ArgMatches) -> Result<()> {
     let name = matches.get_one::<String>("name").unwrap();
     let source = matches.get_one::<String>("source").unwrap();
+    if RESERVED_API_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+        return Err(crate::SpallCliError::Usage(format!(
+            "'{}' is a reserved subcommand name; choose a different API name (reserved: {})",
+            name,
+            RESERVED_API_NAMES.join(", ")
+        ))
+        .into());
+    }
     spall_config::registry::ApiRegistry::add_api(name, source)
         .map_err(crate::SpallCliError::Config)?;
     eprintln!("Registered API '{}' from {}", name, source);
