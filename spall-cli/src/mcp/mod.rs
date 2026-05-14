@@ -32,6 +32,15 @@ const ERR_METHOD_NOT_FOUND: i32 = -32601;
 const ERR_INVALID_PARAMS: i32 = -32602;
 const ERR_PARSE: i32 = -32700;
 
+/// Claude Desktop silently truncates `tools/list` past ~100 entries
+/// (modelcontextprotocol/discussions/537). When the filtered registry
+/// exceeds this hint, `run()` emits a startup warning naming the most
+/// populated tags so the user can craft a `--spall-include` filter.
+const MAX_TOOL_COUNT_HINT: usize = 100;
+
+/// How many tag buckets to surface in the warning text.
+const WARNING_TAG_HISTOGRAM_TOP_N: usize = 5;
+
 /// One tool in the dispatch registry. Built once at startup and never
 /// mutated thereafter.
 ///
@@ -48,16 +57,30 @@ struct ToolEntry {
 
 /// Build the tool registry from `spec` applying the include/exclude tag
 /// filter. Returns tools in spec order (`IndexMap` preserves insertion).
+///
+/// When `max_tools` is `Some(N)` and the filtered count exceeds `N`,
+/// the registry is deterministically truncated to `N` entries before
+/// insertion — order documented in [`truncate_deterministically`].
 fn build_registry(
     spec: &ResolvedSpec,
     include: &[String],
     exclude: &[String],
+    max_tools: Option<usize>,
 ) -> IndexMap<String, ToolEntry> {
+    let filtered: Vec<(usize, &ResolvedOperation)> = spec
+        .operations
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| tag_filter_admits(op, include, exclude))
+        .collect();
+
+    let ordered = match max_tools {
+        Some(cap) if filtered.len() > cap => truncate_deterministically(filtered, cap),
+        _ => filtered,
+    };
+
     let mut out: IndexMap<String, ToolEntry> = IndexMap::new();
-    for (idx, op) in spec.operations.iter().enumerate() {
-        if !tag_filter_admits(op, include, exclude) {
-            continue;
-        }
+    for (idx, op) in ordered {
         let raw = sanitize_tool_name(&op.operation_id);
         let name = unique_name(&raw, &out);
         let description = build_description(op);
@@ -72,6 +95,92 @@ fn build_registry(
         );
     }
     out
+}
+
+/// Returns the first OpenAPI tag for an operation, or the synthetic
+/// `"default"` bucket when it has none. Used as the primary sort key
+/// for deterministic truncation and for tag-histogram bookkeeping.
+fn first_tag(op: &ResolvedOperation) -> &str {
+    op.tags.first().map(String::as_str).unwrap_or("default")
+}
+
+/// Pick the first `cap` operations under a deterministic ordering so
+/// truncation is stable across invocations on the same spec.
+///
+/// Order: alphabetical by first tag (or the synthetic `"default"`),
+/// then by operation index within that tag (spec order). After
+/// truncation the selected ops are re-sorted by index so the resulting
+/// `tools/list` still reads in spec order within the chosen subset.
+fn truncate_deterministically(
+    filtered: Vec<(usize, &ResolvedOperation)>,
+    cap: usize,
+) -> Vec<(usize, &ResolvedOperation)> {
+    let mut entries = filtered;
+    entries.sort_by(|a, b| first_tag(a.1).cmp(first_tag(b.1)).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(cap);
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+/// Build `(tag, count)` pairs for the >100-tools warning. Each op
+/// contributes once to every tag it carries; untagged ops fall into
+/// `"default"`. Sorted by count desc then tag asc, capped at `top_n`.
+fn tag_histogram(
+    registry: &IndexMap<String, ToolEntry>,
+    spec: &ResolvedSpec,
+    top_n: usize,
+) -> Vec<(String, usize)> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in registry.values() {
+        let op = match spec.operations.get(entry.op_index) {
+            Some(op) => op,
+            None => continue,
+        };
+        if op.tags.is_empty() {
+            *counts.entry("default".to_string()).or_insert(0) += 1;
+        } else {
+            for tag in &op.tags {
+                *counts.entry(tag.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(top_n);
+    v
+}
+
+/// Print `tag\tcount\tsample-op-id` TSV for every tag in the filtered
+/// spec, then return. Used by the `--spall-list-tags` early-exit path;
+/// honors the same include/exclude filters the server would apply.
+///
+/// Untagged operations belong to the synthetic tag `"default"`. An op
+/// carrying multiple tags contributes once to each.
+pub fn list_tags(spec: &ResolvedSpec, include: &[String], exclude: &[String]) {
+    let mut buckets: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for op in spec
+        .operations
+        .iter()
+        .filter(|op| tag_filter_admits(op, include, exclude))
+    {
+        if op.tags.is_empty() {
+            let e = buckets
+                .entry("default".to_string())
+                .or_insert_with(|| (0, op.operation_id.clone()));
+            e.0 += 1;
+        } else {
+            for tag in &op.tags {
+                let e = buckets
+                    .entry(tag.clone())
+                    .or_insert_with(|| (0, op.operation_id.clone()));
+                e.0 += 1;
+            }
+        }
+    }
+    println!("tag\tcount\tsample-op-id");
+    for (tag, (count, sample)) in buckets {
+        println!("{}\t{}\t{}", tag, count, sample);
+    }
 }
 
 fn tag_filter_admits(op: &ResolvedOperation, include: &[String], exclude: &[String]) -> bool {
@@ -168,14 +277,28 @@ pub async fn run(
     entry: ApiEntry,
     include: Vec<String>,
     exclude: Vec<String>,
+    max_tools: Option<usize>,
 ) -> Result<(), crate::SpallCliError> {
-    let registry = build_registry(&spec, &include, &exclude);
+    let registry = build_registry(&spec, &include, &exclude, max_tools);
     eprintln!(
         "spall mcp: serving '{}' over stdio ({} tool{})",
         api_name,
         registry.len(),
         if registry.len() == 1 { "" } else { "s" }
     );
+    if registry.len() > MAX_TOOL_COUNT_HINT {
+        let hist = tag_histogram(&registry, &spec, WARNING_TAG_HISTOGRAM_TOP_N)
+            .into_iter()
+            .map(|(t, c)| format!("{}={}", t, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "spall mcp: WARNING {} tools exceeds the ~{}-tool cap most MCP clients (incl. Claude Desktop) silently truncate at; pass --spall-include <tag> or --spall-max-tools <N> to trim.",
+            registry.len(),
+            MAX_TOOL_COUNT_HINT,
+        );
+        eprintln!("spall mcp: top tags by population: {}", hist);
+    }
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -597,9 +720,95 @@ mod tests {
             op("second", &["tagb"]),
             op("third", &["taga"]),
         ]);
-        let reg = build_registry(&spec, &["taga".into()], &[]);
+        let reg = build_registry(&spec, &["taga".into()], &[], None);
         let names: Vec<&str> = reg.keys().map(String::as_str).collect();
         assert_eq!(names, vec!["first", "third"]);
+    }
+
+    #[test]
+    fn truncate_deterministic_picks_same_subset_across_runs() {
+        // Two tags, both populated, with operations interleaved in spec
+        // order. The truncation sort key (tag asc, then op_index asc)
+        // must produce a stable subset regardless of insertion timing.
+        let mut ops = Vec::new();
+        for i in 0..50 {
+            ops.push(op(&format!("alpha-{}", i), &["alpha"]));
+            ops.push(op(&format!("beta-{}", i), &["beta"]));
+        }
+        let spec = spec_of(ops);
+        let first = build_registry(&spec, &[], &[], Some(30));
+        let second = build_registry(&spec, &[], &[], Some(30));
+        let names_a: Vec<&str> = first.keys().map(String::as_str).collect();
+        let names_b: Vec<&str> = second.keys().map(String::as_str).collect();
+        assert_eq!(names_a.len(), 30);
+        assert_eq!(names_a, names_b, "truncation must be deterministic");
+        // 30 ops, alpha-bucket first (alphabetical). Alpha had 50 ops at
+        // even indices 0,2,...,98 → first 30 are alpha-0..alpha-29.
+        for name in &names_a {
+            assert!(
+                name.starts_with("alpha-"),
+                "expected alpha bucket to fill first, got {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_below_cap_keeps_all_ops_in_spec_order() {
+        let spec = spec_of(vec![
+            op("a", &["t1"]),
+            op("b", &["t2"]),
+            op("c", &["t1"]),
+        ]);
+        let reg = build_registry(&spec, &[], &[], Some(10));
+        let names: Vec<&str> = reg.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn tag_histogram_sorts_by_count_desc_then_tag_asc() {
+        let spec = spec_of(vec![
+            op("a", &["users"]),
+            op("b", &["users"]),
+            op("c", &["users"]),
+            op("d", &["orgs"]),
+            op("e", &["orgs"]),
+            op("f", &["billing"]),
+            op("g", &[]),
+        ]);
+        let reg = build_registry(&spec, &[], &[], None);
+        let hist = tag_histogram(&reg, &spec, 10);
+        assert_eq!(
+            hist,
+            vec![
+                ("users".to_string(), 3),
+                ("orgs".to_string(), 2),
+                ("billing".to_string(), 1),
+                ("default".to_string(), 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn tag_histogram_caps_to_top_n() {
+        let mut ops = Vec::new();
+        for tag in ["t1", "t2", "t3", "t4", "t5", "t6", "t7"] {
+            ops.push(op(&format!("op-{}", tag), &[tag]));
+        }
+        let spec = spec_of(ops);
+        let reg = build_registry(&spec, &[], &[], None);
+        let hist = tag_histogram(&reg, &spec, 3);
+        assert_eq!(hist.len(), 3);
+    }
+
+    #[test]
+    fn multi_tag_op_contributes_to_every_tag_bucket() {
+        let spec = spec_of(vec![op("a", &["users", "admin"])]);
+        let reg = build_registry(&spec, &[], &[], None);
+        let hist = tag_histogram(&reg, &spec, 10);
+        let map: BTreeMap<String, usize> = hist.into_iter().collect();
+        assert_eq!(map.get("users"), Some(&1));
+        assert_eq!(map.get("admin"), Some(&1));
     }
 
     #[test]

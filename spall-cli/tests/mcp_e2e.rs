@@ -369,6 +369,211 @@ async fn array_query_param_explodes_into_repeated_pairs() {
     let _ = shutdown(server);
 }
 
+/// Build a synthetic spec with `ops_per_tag` operations on each of the
+/// supplied tags. Operation IDs are deterministic: `{tag}-op-{N}` so
+/// tests can assert which subset survived truncation.
+fn many_ops_spec(port: u16, tags: &[&str], ops_per_tag: usize) -> String {
+    let mut paths = Vec::new();
+    for tag in tags {
+        for i in 0..ops_per_tag {
+            paths.push(format!(
+                r#""/{tag}/op-{i}": {{
+                    "get": {{
+                        "operationId": "{tag}-op-{i}",
+                        "tags": ["{tag}"],
+                        "responses": {{ "200": {{ "description": "OK" }} }}
+                    }}
+                }}"#,
+                tag = tag,
+                i = i,
+            ));
+        }
+    }
+    format!(
+        r#"{{
+  "openapi": "3.0.0",
+  "info": {{ "title": "Big", "version": "1.0.0" }},
+  "servers": [{{ "url": "http://localhost:{port}" }}],
+  "paths": {{ {paths} }}
+}}"#,
+        port = port,
+        paths = paths.join(","),
+    )
+}
+
+#[tokio::test]
+async fn warning_fires_when_filtered_tool_count_exceeds_hint() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("big.json");
+    // 3 tags × 50 ops = 150 tools — comfortably above the 100 hint.
+    std::fs::write(
+        &spec_path,
+        many_ops_spec(mock.address().port(), &["users", "orgs", "billing"], 50),
+    )
+    .unwrap();
+    setup_api(&temp, "big", spec_path.to_str().unwrap());
+
+    let mut server = spawn(&temp, "big", &[]);
+    // Drive one round-trip so the server has fully initialized before
+    // we tear it down and inspect stderr.
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+    }));
+    let _ = server.recv();
+
+    let stderr = shutdown(server);
+    assert!(
+        stderr.contains("WARNING 150 tools exceeds the ~100-tool cap"),
+        "expected size warning, stderr was:\n{}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("top tags by population"),
+        "expected histogram line, stderr was:\n{}",
+        stderr,
+    );
+    // All three tags should appear in the histogram with count=50.
+    for tag in ["users", "orgs", "billing"] {
+        assert!(
+            stderr.contains(&format!("{}=50", tag)),
+            "expected {}=50 in histogram, stderr was:\n{}",
+            tag,
+            stderr,
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_warning_when_filtered_tool_count_below_hint() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("small.json");
+    // 2 tags × 20 ops = 40 tools, below the 100 hint.
+    std::fs::write(
+        &spec_path,
+        many_ops_spec(mock.address().port(), &["users", "orgs"], 20),
+    )
+    .unwrap();
+    setup_api(&temp, "small", spec_path.to_str().unwrap());
+
+    let mut server = spawn(&temp, "small", &[]);
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+    }));
+    let _ = server.recv();
+    let stderr = shutdown(server);
+
+    assert!(
+        !stderr.contains("WARNING"),
+        "no warning expected at 40 tools, stderr was:\n{}",
+        stderr,
+    );
+}
+
+#[tokio::test]
+async fn max_tools_truncates_deterministically_across_invocations() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("big.json");
+    std::fs::write(
+        &spec_path,
+        many_ops_spec(mock.address().port(), &["alpha", "beta", "gamma"], 50),
+    )
+    .unwrap();
+    setup_api(&temp, "big", spec_path.to_str().unwrap());
+
+    let names_for_run = || -> Vec<String> {
+        let mut server = spawn(&temp, "big", &["--spall-max-tools", "30"]);
+        server.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }));
+        let _ = server.recv();
+        server.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }));
+        let resp = server.recv();
+        let tools = resp["result"]["tools"].as_array().unwrap().clone();
+        let _ = shutdown(server);
+        tools
+            .into_iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let first = names_for_run();
+    let second = names_for_run();
+    assert_eq!(first.len(), 30, "max-tools cap must truncate to 30");
+    assert_eq!(first, second, "truncation must be deterministic across runs");
+    // The sort key buckets by first tag alphabetically; with 50 ops in
+    // each of alpha/beta/gamma, the 30-entry slice is fully inside the
+    // alpha bucket.
+    for name in &first {
+        assert!(
+            name.starts_with("alpha-"),
+            "expected alpha bucket to fill first, got {}",
+            name
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_tags_prints_tsv_then_exits_without_starting_server() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("big.json");
+    std::fs::write(
+        &spec_path,
+        many_ops_spec(mock.address().port(), &["users", "orgs"], 3),
+    )
+    .unwrap();
+    setup_api(&temp, "big", spec_path.to_str().unwrap());
+
+    let cache_dir = temp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let output = Command::new(bin_path())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("XDG_CACHE_HOME", &cache_dir)
+        .arg("mcp")
+        .arg("big")
+        .arg("--spall-list-tags")
+        .output()
+        .expect("run spall mcp --spall-list-tags");
+
+    assert!(
+        output.status.success(),
+        "expected exit 0, got {:?}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("tag\tcount\tsample-op-id"),
+        "expected TSV header, got: {:?}",
+        stdout,
+    );
+    let body: Vec<&str> = lines.collect();
+    assert_eq!(body.len(), 2, "expected 2 tag rows, got: {:?}", body);
+    // BTreeMap iteration order: alphabetical → orgs then users.
+    assert!(body[0].starts_with("orgs\t3\torgs-op-"), "row 0: {}", body[0]);
+    assert!(body[1].starts_with("users\t3\tusers-op-"), "row 1: {}", body[1]);
+}
+
 #[tokio::test]
 async fn unknown_tool_returns_is_error() {
     let mock = MockServer::start().await;

@@ -36,6 +36,18 @@ pub fn mcp_cmd() -> Command {
                 .action(ArgAction::Append)
                 .help("Hide operations carrying this OpenAPI tag (repeatable)."),
         )
+        .arg(
+            Arg::new("max_tools")
+                .long("spall-max-tools")
+                .value_parser(clap::value_parser!(usize))
+                .help("Deterministically truncate the filtered registry to N tools. Order: alphabetical by first tag, then spec order within tag."),
+        )
+        .arg(
+            Arg::new("list_tags")
+                .long("spall-list-tags")
+                .action(ArgAction::SetTrue)
+                .help("Load the spec, print 'tag\\tcount\\tsample-op-id' TSV to stdout, and exit without starting the server. Honors --spall-include / --spall-exclude."),
+        )
 }
 
 /// Dispatcher for the `mcp` subcommand.
@@ -80,7 +92,14 @@ pub async fn handle_mcp(
         .map(|vals| vals.cloned().collect())
         .unwrap_or_default();
 
-    crate::mcp::run(api_name, spec, entry, include, exclude)
+    if matches.get_flag("list_tags") {
+        crate::mcp::list_tags(&spec, &include, &exclude);
+        return Ok(());
+    }
+
+    let max_tools = matches.get_one::<usize>("max_tools").copied();
+
+    crate::mcp::run(api_name, spec, entry, include, exclude, max_tools)
         .await
         .map_err(Into::into)
 }
