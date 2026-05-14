@@ -245,6 +245,75 @@ async fn step_failure_on_unmet_criterion_exits_nonzero() {
 }
 
 #[tokio::test]
+async fn with_criteria_fixture_runs_all_three_conditions() {
+    // The vendored fixture in e2e/fixtures/arazzo/with-criteria.arazzo.yaml
+    // stacks three criteria — `==` on a numeric, `==` on a quoted
+    // string, and `!=` on an empty-string literal. The parse test
+    // covers shape; this runtime test pins down evaluation: if any of
+    // the three is mis-evaluated the workflow returns a non-zero exit.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .and(body_json(serde_json::json!({"email": "alice@example.com"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "tok-9",
+            "status": "ready",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let temp = TempDir::new().unwrap();
+    // Write the openapi spec where the fixture expects it (alongside
+    // the .arazzo.yaml as `simple-openapi.json`).
+    let openapi_path = temp.path().join("simple-openapi.json");
+    std::fs::write(&openapi_path, openapi_for(&server.uri())).unwrap();
+
+    // Copy the vendored fixture into the temp dir so its relative
+    // `url: ./simple-openapi.json` resolves against the temp path.
+    let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("e2e")
+        .join("fixtures")
+        .join("arazzo")
+        .join("with-criteria.arazzo.yaml");
+    let arazzo_path = temp.path().join("with-criteria.arazzo.yaml");
+    std::fs::copy(&fixture_src, &arazzo_path)
+        .expect("copy with-criteria fixture into temp dir");
+
+    let cfg_dir = temp.path().join("cfg");
+    let cache_dir = temp.path().join("cache");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let output = Command::new(bin_path())
+        .env("XDG_CONFIG_HOME", &cfg_dir)
+        .env("XDG_CACHE_HOME", &cache_dir)
+        .args([
+            "arazzo",
+            "run",
+            arazzo_path.to_str().unwrap(),
+            "--input",
+            "email=alice@example.com",
+        ])
+        .output()
+        .expect("spawn spall");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "with-criteria fixture should pass all three criteria.\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        stdout, stderr,
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("workflow output must be valid JSON");
+    assert_eq!(parsed["workflowId"], "criteriaCheck");
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn validate_subcommand_reports_clean_v1_doc() {
     let temp = TempDir::new().unwrap();
     let arazzo_path = temp.path().join("workflow.arazzo.yaml");

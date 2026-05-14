@@ -28,7 +28,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use thiserror::Error;
 
-use crate::execute::{execute_operation_programmatic, OperationResult, ProgrammaticArgs};
+use crate::execute::{
+    build_url_with_path_args, execute_operation_programmatic, raise_for_status, OperationResult,
+    ProgrammaticArgs,
+};
 use crate::fetch::load_raw;
 use crate::http::HttpConfig;
 
@@ -206,6 +209,7 @@ pub struct LoadedSources {
 ///
 /// `doc_path` is used to resolve relative source URLs against the doc's
 /// directory. `verbose` controls the workflow-start binding banner.
+#[must_use = "the LoadedSources bundle drives every subsequent step lookup"]
 pub async fn prepare_sources(
     doc: &ArazzoDocument,
     doc_path: &Path,
@@ -347,6 +351,7 @@ pub struct RunOutcome {
 }
 
 /// Run a workflow end-to-end.
+#[must_use = "the RunOutcome carries the workflow's outputs and per-step results"]
 pub async fn run_workflow(
     doc: &ArazzoDocument,
     sources: &LoadedSources,
@@ -406,18 +411,37 @@ fn pick_workflow<'a>(
     requested: Option<&str>,
 ) -> Result<&'a Workflow, ArazzoRunError> {
     if let Some(id) = requested {
-        doc.workflows
+        return doc
+            .workflows
             .iter()
             .find(|w| w.workflow_id == id)
-            .ok_or_else(|| ArazzoRunError::WorkflowNotFound(id.to_string()))
-    } else if doc.workflows.len() == 1 {
-        Ok(&doc.workflows[0])
-    } else {
-        // Multi-workflow doc with no --workflow specified.
-        Err(ArazzoRunError::WorkflowNotFound(
-            "(none specified; multiple workflows in doc — pass --workflow <id>)".to_string(),
-        ))
+            .ok_or_else(|| {
+                let available = doc
+                    .workflows
+                    .iter()
+                    .map(|w| w.workflow_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ArazzoRunError::WorkflowNotFound(format!(
+                    "'{}' (available: {})",
+                    id, available
+                ))
+            });
     }
+    if doc.workflows.len() == 1 {
+        return Ok(&doc.workflows[0]);
+    }
+    // Multi-workflow doc with no --workflow specified — list the choices.
+    let available = doc
+        .workflows
+        .iter()
+        .map(|w| w.workflow_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ArazzoRunError::WorkflowNotFound(format!(
+        "(none specified; multiple workflows in doc — pass --workflow <id>; available: {})",
+        available
+    )))
 }
 
 /// Look up the operation referenced by a step, returning the source name
@@ -533,7 +557,7 @@ async fn run_step(
     for p in &step.parameters {
         let value = evaluate_value(&p.value, ctx, &format!("step '{}' parameter '{}'", step.step_id, p.name))?;
         let str_val = json_to_string(&value);
-        let location = parameter_location(p, op);
+        let location = parameter_location(p, op, &step.step_id)?;
         match location.as_str() {
             "path" => {
                 args.path.insert(p.name.clone(), str_val);
@@ -570,11 +594,17 @@ async fn run_step(
     }
 
     if opts.dry_run {
-        let url_repr = format!("{} {}/{}", op.method, entry.base_url.as_deref().unwrap_or(""), op.path_template);
-        eprintln!("[dry-run] step '{}': {}", step.step_id, url_repr);
-        if !args.path.is_empty() {
-            eprintln!("            path: {:?}", args.path);
-        }
+        // Reuse the shared URL builder so the dry-run render exactly
+        // matches what would go on the wire — no double-slash bugs from
+        // hand-formatted strings.
+        let url = build_url_with_path_args(
+            op,
+            spec,
+            entry,
+            args.server_override.as_deref(),
+            &args.path,
+        );
+        eprintln!("[dry-run] step '{}': {} {}", step.step_id, op.method, url);
         if !args.query.is_empty() {
             eprintln!("            query: {:?}", args.query);
         }
@@ -592,9 +622,16 @@ async fn run_step(
         });
     }
 
-    let op_result = execute_operation_programmatic(op, spec, entry, &args)
-        .await
-        .map_err(|e| step_http_error(step, source_name, sources, &e))?;
+    // The programmatic path returns Ok for any HTTP status; we lift
+    // 4xx/5xx into Err here so the runner can attach the source-binding
+    // hint before bubbling up to the CLI.
+    let op_result = match execute_operation_programmatic(op, spec, entry, &args).await {
+        Ok(res) => match raise_for_status(res) {
+            Ok(ok) => ok,
+            Err(e) => return Err(step_http_error(step, source_name, sources, &e)),
+        },
+        Err(e) => return Err(step_http_error(step, source_name, sources, &e)),
+    };
 
     let snapshot = response_snapshot_from(&op_result);
     ctx.current_response = Some(snapshot.clone());
@@ -663,9 +700,11 @@ async fn run_step(
     })
 }
 
-/// Walk a JSON value; any string that starts with `$` is parsed as an
-/// expression and replaced with its evaluated value. Other strings and
-/// non-string scalars pass through unchanged. Objects and arrays recurse.
+/// Walk a JSON value; string leaves that start with one of the known
+/// Arazzo expression namespaces (`$inputs.`, `$workflow.`, `$steps.`,
+/// `$response.`) are parsed and replaced with their evaluated value.
+/// Strings that merely start with `$` (e.g. `"$10 fee"`, `"$VAR"`) are
+/// kept verbatim — only valid expression prefixes trigger parsing.
 fn evaluate_value(
     value: &serde_json::Value,
     ctx: &Context,
@@ -673,7 +712,7 @@ fn evaluate_value(
 ) -> Result<serde_json::Value, ArazzoRunError> {
     match value {
         serde_json::Value::String(s) => {
-            if s.starts_with('$') {
+            if looks_like_expression(s) {
                 let e = parse_expression(s).map_err(|err| ArazzoRunError::Expression {
                     context: context_label.to_string(),
                     source: err,
@@ -708,22 +747,46 @@ fn evaluate_value(
     }
 }
 
+/// True when a string starts with one of the known Arazzo expression
+/// namespaces. Avoids treating literals like `"$10 fee"` or `"$VAR"` as
+/// malformed expressions.
+fn looks_like_expression(s: &str) -> bool {
+    s.starts_with("$inputs.")
+        || s.starts_with("$workflow.")
+        || s.starts_with("$steps.")
+        || s == "$response.statusCode"
+        || s.starts_with("$response.body")
+        || s.starts_with("$response.header.")
+}
+
 /// Pick the parameter's location: prefer the step-level `in:` override,
-/// else look up the operation's parameter by name.
-fn parameter_location(p: &Parameter, op: &ResolvedOperation) -> String {
+/// else look up the operation's parameter by name. Errors hard if the
+/// step parameter doesn't match any operation parameter and has no
+/// `in:` override — silent fallback would mask Arazzo doc typos.
+fn parameter_location(
+    p: &Parameter,
+    op: &ResolvedOperation,
+    step_id: &str,
+) -> Result<String, ArazzoRunError> {
     if let Some(loc) = &p.location {
-        return loc.clone();
+        return Ok(loc.clone());
     }
     if let Some(op_p) = op.parameters.iter().find(|x| x.name == p.name) {
-        return match op_p.location {
+        return Ok(match op_p.location {
             ParameterLocation::Path => "path".to_string(),
             ParameterLocation::Query => "query".to_string(),
             ParameterLocation::Header => "header".to_string(),
             ParameterLocation::Cookie => "cookie".to_string(),
-        };
+        });
     }
-    // Fall back to query — common default in OpenAPI parameter typing.
-    "query".to_string()
+    Err(ArazzoRunError::UnsupportedStepFeature {
+        step: step_id.to_string(),
+        feature: format!(
+            "parameter '{}' has no 'in' field and is not declared on operation '{}' \
+             (silent query fallback would mask doc typos; add 'in: query|path|header|cookie')",
+            p.name, op.operation_id
+        ),
+    })
 }
 
 fn json_to_string(v: &serde_json::Value) -> String {
@@ -739,7 +802,10 @@ fn json_to_string(v: &serde_json::Value) -> String {
 fn response_snapshot_from(res: &OperationResult) -> ResponseSnapshot {
     ResponseSnapshot {
         status: res.status.as_u16(),
-        headers: BTreeMap::new(), // execute_operation_programmatic discards headers; v2 plumbs them through
+        // execute_operation_programmatic returns response headers
+        // already lowercased; the expression evaluator looks them up
+        // case-insensitively so this is the right shape directly.
+        headers: res.headers.clone(),
         body: res.value.clone(),
     }
 }
@@ -778,6 +844,7 @@ fn step_http_error(
 }
 
 /// Map `RunOutcome` into a JSON value suitable for stdout emission.
+#[must_use = "the rendered JSON is the only output"]
 pub fn outcome_to_json(outcome: &RunOutcome) -> serde_json::Value {
     let mut outputs = serde_json::Map::new();
     for (k, v) in &outcome.outputs {

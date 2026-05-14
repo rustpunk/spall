@@ -108,9 +108,15 @@ pub fn parse_expression(raw: &str) -> Result<Expr, ExprError> {
         return Ok(Expr::Literal(serde_json::Value::String(raw.to_string())));
     }
     if let Some(rest) = raw.strip_prefix("$inputs.") {
+        if rest.is_empty() {
+            return Err(ExprError::BadStepExpression(raw.to_string()));
+        }
         return Ok(Expr::Inputs(rest.to_string()));
     }
     if let Some(rest) = raw.strip_prefix("$workflow.inputs.") {
+        if rest.is_empty() {
+            return Err(ExprError::BadStepExpression(raw.to_string()));
+        }
         return Ok(Expr::Inputs(rest.to_string()));
     }
     if let Some(rest) = raw.strip_prefix("$steps.") {
@@ -626,6 +632,20 @@ mod tests {
         assert!(matches!(
             parse_expression("$bogus.foo").unwrap_err(),
             ExprError::UnknownNamespace(_)
+        ));
+    }
+
+    #[test]
+    fn empty_input_name_rejected_at_parse_time() {
+        // Symmetric with $steps..outputs.x — both should fail at parse,
+        // not silently parse and then fail at eval with UnknownInput("").
+        assert!(matches!(
+            parse_expression("$inputs.").unwrap_err(),
+            ExprError::BadStepExpression(_)
+        ));
+        assert!(matches!(
+            parse_expression("$workflow.inputs.").unwrap_err(),
+            ExprError::BadStepExpression(_)
         ));
     }
 

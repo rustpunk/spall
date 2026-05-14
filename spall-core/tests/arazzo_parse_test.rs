@@ -61,6 +61,39 @@ fn with_criteria_fixture_parses() {
 }
 
 #[test]
+fn x_spall_api_extension_parses_on_source_description() {
+    // Regression guard: the runner reads `x-spall-api` to override the
+    // default name-match binding from doc-source name → spall API
+    // entry. A future serde rename or `#[serde(flatten)]` change could
+    // silently drop this field; this test catches that.
+    let yaml = r#"
+arazzo: "1.0.1"
+info:
+  title: Bind override probe
+  version: "1.0.0"
+sourceDescriptions:
+  - name: petstore-prod
+    url: ./openapi.json
+    type: openapi
+    x-spall-api: petstore
+workflows:
+  - workflowId: probe
+    steps:
+      - stepId: only
+        operationId: getPet
+"#;
+    let doc = spall_core::yaml::from_str::<ArazzoDocument>(yaml)
+        .expect("x-spall-api fixture parses");
+    let src = &doc.source_descriptions[0];
+    assert_eq!(src.name, "petstore-prod");
+    assert_eq!(
+        src.x_spall_api.as_deref(),
+        Some("petstore"),
+        "x-spall-api extension must round-trip into SourceDescription.x_spall_api",
+    );
+}
+
+#[test]
 fn with_outputs_fixture_parses() {
     let doc = parse("with-outputs.arazzo.yaml");
     let wf = &doc.workflows[0];
