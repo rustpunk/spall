@@ -120,6 +120,16 @@ pub enum ArazzoRunError {
         limit: u32,
         last: String,
     },
+
+    #[error("workflow '{workflow}' ended on the failure path via failureAction at step '{step}'")]
+    WorkflowEndedOnFailure { workflow: String, step: String },
+
+    #[error("workflow '{workflow}' exceeded --spall-max-steps ({limit}) — possible infinite goto loop, last step was '{step}'")]
+    StepBudgetExhausted {
+        workflow: String,
+        step: String,
+        limit: usize,
+    },
 }
 
 /// Diagnostic emitted by `validate_doc` for v2-only or otherwise
@@ -358,7 +368,14 @@ pub struct RunOptions {
     pub inputs: BTreeMap<String, serde_json::Value>,
     pub dry_run: bool,
     pub verbose: bool,
+    /// Hard cap on the number of step executions per workflow. Prevents
+    /// `goto X` from step X with always-match criteria from locking up
+    /// the runner. Counts retries and goto-revisits, not unique steps.
+    pub max_steps: usize,
 }
+
+/// Default `max_steps` when `--spall-max-steps` is omitted.
+pub const DEFAULT_MAX_STEPS: usize = 10_000;
 
 /// Outcome of a single step.
 pub struct StepOutcome {
@@ -414,8 +431,17 @@ pub async fn run_workflow(
         .collect();
 
     let mut idx: usize = 0;
+    let mut step_budget: usize = 0;
     while idx < wf.steps.len() {
         let step = &wf.steps[idx];
+        step_budget += 1;
+        if step_budget > opts.max_steps {
+            return Err(ArazzoRunError::StepBudgetExhausted {
+                workflow: wf.workflow_id.clone(),
+                step: step.step_id.clone(),
+                limit: opts.max_steps,
+            });
+        }
         let flow = run_step_with_actions(
             step,
             wf,
@@ -447,12 +473,19 @@ pub async fn run_workflow(
                         step.step_id,
                     );
                 }
-                // `type:end` is the "user has explicitly handled this
-                // outcome" knob — exit zero either way and emit
-                // workflow outputs (which may be partial). If the user
-                // wants exit-non-zero on a known-OK 4xx, they should
-                // omit the failureAction and let the bail propagate.
-                break;
+                if success {
+                    break;
+                }
+                // Failure-path `type:end` exits non-zero so CI
+                // pipelines surface degraded runs. Redocly + Respect
+                // runners both behave this way; flipping the sign
+                // would silently green-light a workflow that took
+                // its failure branch. Users absorbing a known-OK 4xx
+                // should use `type:goto` to a cleanup step instead.
+                return Err(ArazzoRunError::WorkflowEndedOnFailure {
+                    workflow: wf.workflow_id.clone(),
+                    step: step.step_id.clone(),
+                });
             }
             // Retry returned here means the dispatcher requested a
             // retry but no execution occurred. The retry loop is
@@ -675,9 +708,29 @@ async fn run_step_with_actions(
                 match flow {
                     StepFlow::Continue => return Err(err),
                     StepFlow::Goto { .. } | StepFlow::End { .. } => {
-                        // Record a synthetic outcome so workflow output
-                        // serialization can surface the failed step.
+                        // Record a synthetic outcome AND populate
+                        // ctx.steps with the response snapshot (or a
+                        // zero-status placeholder when the failure was
+                        // criteria-only) so downstream expressions
+                        // like $steps.<failed-id>.response.statusCode
+                        // resolve instead of erroring with "step never
+                        // ran". outputs stays empty because step.outputs
+                        // never ran.
                         step_outcomes.push(synthetic_failure_outcome(step, ctx));
+                        let snapshot = ctx.current_response.clone().unwrap_or_else(|| {
+                            spall_core::arazzo::ResponseSnapshot {
+                                status: 0,
+                                headers: BTreeMap::new(),
+                                body: serde_json::Value::Null,
+                            }
+                        });
+                        ctx.steps.insert(
+                            step.step_id.clone(),
+                            StepResult {
+                                response: snapshot,
+                                outputs: BTreeMap::new(),
+                            },
+                        );
                         return Ok(flow);
                     }
                     StepFlow::Retry { after, limit } => {
@@ -689,6 +742,14 @@ async fn run_step_with_actions(
                             });
                         }
                         attempt += 1;
+                        // Clamp the sleep against the runner's
+                        // safety-net so a buggy spec with
+                        // `retryAfter: 999999` doesn't hang the
+                        // workflow indefinitely.
+                        let max_wait = std::time::Duration::from_secs(
+                            crate::arazzo_runner_actions::MAX_RETRY_WAIT_SECS,
+                        );
+                        let after = std::cmp::min(after, max_wait);
                         if opts.verbose {
                             eprintln!(
                                 "spall: step '{}' retry {}/{} after {:.3}s ({})",
@@ -714,36 +775,43 @@ async fn run_step_with_actions(
     }
 }
 
-/// Pick the action chain that applies to a step's success path. When
-/// the step doesn't define `onSuccess` explicitly, the workflow-level
-/// `successActions` chain is used as the default (Arazzo §4.6).
+/// Pick the action chain that applies to a step's success path.
+///
+/// Three-way semantics (Arazzo §4.6): step's `onSuccess: …` wins over
+/// workflow-level `successActions` when present; an explicit
+/// `onSuccess: []` in the step suppresses workflow-level fallback
+/// (the step opts out of the global default); absent `onSuccess`
+/// falls back to workflow-level.
 fn effective_success_chain<'a>(step: &'a Step, workflow: &'a Workflow) -> &'a [ActionOrRef] {
-    if !step.on_success.is_empty() {
-        &step.on_success
-    } else {
-        &workflow.success_actions
+    match &step.on_success {
+        Some(chain) => chain.as_slice(),
+        None => workflow.success_actions.as_slice(),
     }
 }
 
-/// Pick the action chain that applies to a step's failure path.
+/// Pick the action chain that applies to a step's failure path. Same
+/// absent-vs-empty distinction as [`effective_success_chain`].
 fn effective_failure_chain<'a>(
     step: &'a Step,
     workflow: &'a Workflow,
 ) -> &'a [FailureActionOrRef] {
-    if !step.on_failure.is_empty() {
-        &step.on_failure
-    } else {
-        &workflow.failure_actions
+    match &step.on_failure {
+        Some(chain) => chain.as_slice(),
+        None => workflow.failure_actions.as_slice(),
     }
 }
 
 /// True for errors that a `failureAction` chain is allowed to swallow.
-/// Transport / expression / dispatch errors always bubble up so a typo
-/// can't silently disappear via `type: end`.
+/// Expression / dispatch / workflow-shape errors always bubble up so a
+/// typo can't silently disappear via `type:end`. Transport errors are
+/// recoverable — flaky DNS / connection-reset is exactly the case
+/// `type:retry` exists for.
 fn is_recoverable_step_error(err: &ArazzoRunError) -> bool {
     matches!(
         err,
-        ArazzoRunError::StepHttpError { .. } | ArazzoRunError::CriterionFailed { .. }
+        ArazzoRunError::StepHttpError { .. }
+            | ArazzoRunError::CriterionFailed { .. }
+            | ArazzoRunError::Transport(_)
     )
 }
 

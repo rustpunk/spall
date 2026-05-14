@@ -35,7 +35,7 @@
 //! - Auth on the HTTP endpoint itself.
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -49,9 +49,16 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use super::{handle_line, AuthProfiles, ToolEntry};
+
+/// Cap on request body size. axum's default is 2 MiB which is too
+/// small for OpenAPI specs that legitimately have multipart uploads;
+/// 16 MiB covers the common cases without inviting OOM via large
+/// adversarial payloads. The matching configuration lives in
+/// `axum::extract::DefaultBodyLimit`.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Header name for the MCP session identifier, per spec.
 const HEADER_SESSION_ID: &str = "mcp-session-id";
@@ -101,13 +108,31 @@ pub async fn run_http(
         allowed_origins: allowed_origins.into_iter().collect(),
     });
 
-    let cors = CorsLayer::new()
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .allow_origin(Any);
+    // Align the CORS layer with the handler-side Origin allowlist so
+    // browser preflight rejection matches the actual POST rejection.
+    // When no allowlist is set, fall back to the localhost-only
+    // permissive policy — same machine the default 127.0.0.1 bind
+    // reaches.
+    let cors = if state.allowed_origins.is_empty() {
+        CorsLayer::new()
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .allow_origin(Any)
+    } else {
+        let origins: Vec<HeaderValue> = state
+            .allowed_origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o).ok())
+            .collect();
+        CorsLayer::new()
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .allow_origin(AllowOrigin::list(origins))
+    };
 
     let app = Router::new()
         .route("/", post(handle_post))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(cors)
         .with_state(state);
 
@@ -137,21 +162,36 @@ struct HttpState {
 }
 
 async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, body: String) -> Response {
-    // Origin allowlist (DNS-rebinding mitigation). Skipped when the
-    // allowlist is empty — same-origin localhost requests are allowed
-    // without configuration.
-    if !state.allowed_origins.is_empty() {
-        let origin = headers
-            .get("origin")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !state.allowed_origins.contains(origin) {
-            return (
-                StatusCode::FORBIDDEN,
-                "origin not in --spall-allowed-origin allowlist",
-            )
-                .into_response();
-        }
+    // Origin policy:
+    // - Empty allowlist + Origin absent → allow (curl, MCP test
+    //   clients, same-process). Most browsers always send Origin on
+    //   POST; missing Origin implies non-browser caller.
+    // - Empty allowlist + Origin localhost → allow (page running on
+    //   the same host).
+    // - Empty allowlist + Origin remote → REJECT. This is the DNS
+    //   rebinding mitigation the MCP spec requires. Previously we
+    //   skipped the check entirely when the allowlist was empty,
+    //   which left the localhost-default deployment open to remote
+    //   attackers who control DNS for `localhost.example.com`.
+    // - Non-empty allowlist → require exact Origin match.
+    let origin = headers
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let allowed = if state.allowed_origins.is_empty() {
+        origin.is_empty() || is_localhost_origin(origin)
+    } else {
+        state.allowed_origins.contains(origin)
+    };
+    if !allowed {
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "origin '{}' not allowed (configure with --spall-allowed-origin)",
+                origin
+            ),
+        )
+            .into_response();
     }
 
     // Peek the JSON-RPC method to gate session-id requirements.
@@ -218,6 +258,22 @@ async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, bo
 
     let body = response.unwrap_or(Value::Null);
     (headers_out, Json(body)).into_response()
+}
+
+/// True for `Origin` headers pointing at the same machine the default
+/// `127.0.0.1` bind serves. Used by the default-allowlist Origin check
+/// in [`handle_post`] to ride alongside the spec's DNS-rebinding
+/// guidance.
+fn is_localhost_origin(origin: &str) -> bool {
+    matches!(origin, "http://localhost" | "https://localhost"
+        | "http://127.0.0.1" | "https://127.0.0.1"
+        | "http://[::1]" | "https://[::1]")
+        || origin.starts_with("http://localhost:")
+        || origin.starts_with("https://localhost:")
+        || origin.starts_with("http://127.0.0.1:")
+        || origin.starts_with("https://127.0.0.1:")
+        || origin.starts_with("http://[::1]:")
+        || origin.starts_with("https://[::1]:")
 }
 
 /// Generate a 128-bit random hex session id. `rand::thread_rng()` is

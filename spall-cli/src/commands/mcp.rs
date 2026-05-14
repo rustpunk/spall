@@ -5,7 +5,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use miette::Result;
 use spall_config::registry::{ApiEntry, ApiRegistry};
 use spall_core::value::SpallValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::SpallCliError;
@@ -204,8 +204,13 @@ fn parse_auth_tool_flags(
 
 /// Pre-resolve every profile referenced by `--spall-auth-tool` or by
 /// an `x-mcp-auth-profile` extension into an `ApiEntry`. Profiles that
-/// don't exist in the API's `[profiles.*]` block error out at startup
-/// so the per-call dispatch path stays infallible.
+/// don't exist in the API's `[profile.*]` block surface ALL unknown
+/// names at once with their call-site attribution (which flag /
+/// extension on which operation introduced them), sorted for
+/// deterministic output. The `[profile.*]` membership is the canonical
+/// validation here — we skip the secondary `registry.resolve_profile`
+/// existence check that would have produced a redundant "internal:"
+/// error.
 fn resolve_auth_profiles(
     api_name: &str,
     registry: &ApiRegistry,
@@ -213,33 +218,55 @@ fn resolve_auth_profiles(
     default_entry: &ApiEntry,
     auth_tool: &HashMap<String, String>,
 ) -> Result<crate::mcp::AuthProfiles> {
-    let mut needed: HashSet<String> = HashSet::new();
-    needed.extend(auth_tool.values().cloned());
+    // Track each referenced profile with where it was referenced from.
+    // BTreeMap (not HashSet) so error output is alphabetically stable.
+    let mut needed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut auth_tool_sorted: Vec<(&String, &String)> = auth_tool.iter().collect();
+    auth_tool_sorted.sort_by_key(|(k, _)| k.as_str());
+    for (tool_key, profile) in auth_tool_sorted {
+        needed
+            .entry(profile.clone())
+            .or_default()
+            .push(format!("--spall-auth-tool {}={}", tool_key, profile));
+    }
     for op in &spec.operations {
         if let Some(SpallValue::Str(p)) = op.extensions.get("x-mcp-auth-profile") {
-            needed.insert(p.clone());
+            needed
+                .entry(p.clone())
+                .or_default()
+                .push(format!("x-mcp-auth-profile on operation '{}'", op.operation_id));
         }
     }
 
+    let mut unknown: Vec<(String, Vec<String>)> = Vec::new();
     let mut by_profile: HashMap<String, ApiEntry> = HashMap::new();
-    for profile in needed {
+    for (profile, sources) in needed {
         if !default_entry.profiles.contains_key(&profile) {
-            let configured: Vec<&String> = default_entry.profiles.keys().collect();
-            return Err(SpallCliError::Usage(format!(
-                "auth profile '{}' is not configured for api '{}'; configured profiles: {:?}",
-                profile, api_name, configured,
-            ))
-            .into());
+            unknown.push((profile, sources));
+            continue;
         }
+        // Already checked `profiles.contains_key`, so `resolve_profile`
+        // is guaranteed to find the entry — the registry walks the same
+        // map. unwrap is safe here.
         let entry = registry
             .resolve_profile(api_name, Some(&profile))
-            .ok_or_else(|| {
-                SpallCliError::Usage(format!(
-                    "internal: api '{}' vanished while resolving profile '{}'",
-                    api_name, profile
-                ))
-            })?;
+            .expect("profile present in default_entry.profiles must resolve");
         by_profile.insert(profile, entry);
+    }
+
+    if !unknown.is_empty() {
+        let mut configured: Vec<&String> = default_entry.profiles.keys().collect();
+        configured.sort();
+        let report = unknown
+            .iter()
+            .map(|(p, srcs)| format!("  '{}' (referenced from: {})", p, srcs.join("; ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(SpallCliError::Usage(format!(
+            "auth profile(s) not configured for api '{}':\n{}\nconfigured profiles in this api: {:?}",
+            api_name, report, configured,
+        ))
+        .into());
     }
 
     Ok(crate::mcp::AuthProfiles {

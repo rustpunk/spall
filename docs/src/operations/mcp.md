@@ -207,20 +207,33 @@ spall mcp petstore --spall-transport http --spall-port 0
 ### Origin allowlist (DNS rebinding mitigation)
 
 The spec requires the server to validate the `Origin` header to block
-DNS-rebinding attacks. When `--spall-allowed-origin <origin>` is
-provided (repeatable), requests whose `Origin` header isn't in the
-allowlist receive `403 Forbidden` before their body is deserialized:
+DNS-rebinding attacks. spall's policy:
 
-```bash
-spall mcp petstore --spall-transport http \
-    --spall-allowed-origin https://app.example.com \
-    --spall-allowed-origin https://staging.example.com
-```
+- **Allowlist set** (`--spall-allowed-origin <origin>`, repeatable):
+  only listed origins succeed; all others get `403 Forbidden`. The
+  CORS preflight layer is configured against the same list so
+  browsers see a coherent preflight rejection rather than a generic
+  CORS error.
 
-When no allowlist is set, `Origin` is not checked. Combined with the
-localhost-only default bind, this is safe for local-development use
-(no remote attacker can reach the server). Production deployments
-should set both the bind interface and the allowlist explicitly.
+  ```bash
+  spall mcp petstore --spall-transport http \
+      --spall-allowed-origin https://app.example.com \
+      --spall-allowed-origin https://staging.example.com
+  ```
+
+- **Allowlist empty** (default): non-browser callers (no Origin
+  header — curl, the MCP test client) and localhost browsers
+  (`http://localhost[:N]`, `http://127.0.0.1[:N]`, `http://[::1][:N]`,
+  same with `https`) succeed. Browsers with a remote Origin get
+  `403`. This closes the DNS-rebinding hole where an attacker-
+  controlled DNS record at `localhost.example.com → 127.0.0.1` could
+  otherwise drive a victim's browser into the local server.
+
+### Request body size
+
+Capped at 16 MiB. Larger requests get HTTP `413 Payload Too Large`.
+OpenAPI specs with very large multipart payloads should sit behind a
+reverse proxy that handles streaming uploads, or run as stdio.
 
 ### TLS, auth on the HTTP endpoint
 

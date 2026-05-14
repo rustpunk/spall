@@ -223,22 +223,29 @@ Three action types are supported:
 
 ### `type: end`
 
-Stops the workflow. Treated as user-handled — the CLI exits zero
-regardless of which side (success or failure) triggered the end.
-Use this for "this 4xx is fine, stop gracefully":
+Stops the workflow. Exit code depends on which side fired:
+
+- Success-side `type:end` (in `onSuccess` or `successActions`) →
+  exit 0 with workflow outputs.
+- Failure-side `type:end` (in `onFailure` or `failureActions`) →
+  exit non-zero with workflow + step attribution in stderr. The
+  workflow took its failure branch and CI pipelines need to surface
+  that.
 
 ```yaml
 steps:
   - stepId: probe
     operationId: getProbeStatus
     onFailure:
-      - name: swallow-404
+      - name: known-4xx
         type: end
         criteria:
           - condition: $response.statusCode == 404
 ```
 
-If no `criteria` are listed, the action fires unconditionally.
+If no `criteria` are listed, the action fires unconditionally. To
+absorb a known-OK 4xx into a zero exit, use `type: goto` to a
+cleanup step (see below), not `type: end` on the failure side.
 
 ### `type: retry`
 
@@ -258,8 +265,14 @@ steps:
 ```
 
 `retryLimit` defaults to `1` if omitted; `retryAfter` defaults to `0`.
-The retry counter does NOT compose with `--spall-retry` (which is the
-HTTP-transport retry layer); they're orthogonal.
+The runner clamps each retry sleep at 60 seconds — a buggy spec with
+`retryAfter: 999999` cannot hang the workflow indefinitely. The
+retry counter does NOT compose with `--spall-retry` (the HTTP-transport
+retry layer); they're orthogonal.
+
+`type: retry` also fires on transport errors (DNS / connection-reset /
+TLS handshake fails), not just HTTP 4xx/5xx — that's the exact case
+backoff exists for.
 
 ### `type: goto`
 
@@ -283,7 +296,14 @@ steps:
 ### Workflow-level fallback
 
 `workflow.successActions` and `workflow.failureActions` apply to every
-step that doesn't define its own `onSuccess` / `onFailure` chain:
+step that doesn't define its own `onSuccess` / `onFailure` chain.
+Step-level absence vs explicit-empty matter:
+
+- `onFailure` field absent on the step → workflow-level applies.
+- `onFailure: []` on the step → opt out of the workflow-level default,
+  no actions fire on failure (the underlying error bubbles up).
+- `onFailure: [...]` non-empty → step-level wins; workflow-level is
+  not consulted.
 
 ```yaml
 workflows:
@@ -293,10 +313,10 @@ workflows:
         type: end
     steps:
       - stepId: a
-        operationId: a-op
+        operationId: a-op            # workflow-level 'bail' applies
       - stepId: b
         operationId: b-op
-        onFailure: []  # not allowed — non-empty step-level wins
+        onFailure: []                # opts out of workflow-level
 ```
 
 ### Reusable named actions
@@ -329,6 +349,16 @@ Action `criteria` reuse the same condition mini-language as
 `successCriteria`. v1 supports only `type: simple` (the default);
 `jsonpath` and `regex` are deferred to issue #5 and error hard at
 dispatch time so partial implementations don't sneak in via fixtures.
+A non-empty `context` field — only used by v2 jsonpath/regex — also
+errors hard so it can't be confused with simple-mode evaluation.
+
+### Step budget
+
+`spall arazzo run --spall-max-steps N` caps the total number of step
+executions per workflow (default `10000`). The counter increments on
+every step body run including retries and `goto`-revisits. A `goto X`
+from step X with always-true criteria — the textbook infinite-loop
+shape — bails with `StepBudgetExhausted` once the counter overshoots.
 
 ## v1 limitations
 

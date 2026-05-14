@@ -555,9 +555,18 @@ workflows:
         .output()
         .expect("spawn spall");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // Criterion-gated failure-side `type:end` still exits non-zero —
+    // the criteria controlled WHICH failureAction fired, not whether
+    // the workflow ended on the failure path. The match itself is
+    // observable via the workflow + step attribution in stderr.
     assert!(
-        output.status.success(),
-        "criterion-gated end must exit zero on the matching 404.\n--- stderr ---\n{}",
+        !output.status.success(),
+        "criterion-gated end on the failure path must exit non-zero.\n--- stderr ---\n{}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("gatedEnd") && stderr.contains("probeStep"),
+        "stderr should attribute the end to its workflow + step: {}",
         stderr,
     );
     server.verify().await;
@@ -597,19 +606,20 @@ workflows:
         .output()
         .expect("spawn spall");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    // `type:end` is the explicit "user has handled this" knob — the
-    // workflow-level action absorbed the 500 and exit zero. If the
-    // user wants exit-non-zero on the 500, they should omit the
-    // failureAction and let the bail propagate naturally.
+    // Failure-side `type:end` exits non-zero by design: the workflow
+    // took its failure branch and CI pipelines need to surface that.
+    // Users who want to swallow a known-OK 4xx should `type:goto` a
+    // cleanup step instead — see `failure_action_goto_jumps_to_recovery_step`.
     assert!(
-        output.status.success(),
-        "type:end at the workflow level should swallow the failure.\n--- stderr ---\n{}",
+        !output.status.success(),
+        "workflow-level type:end failure action must exit non-zero.\n--- stderr ---\n{}",
         stderr,
     );
-    // Confirm the failure was handled (not bubbled up as a step error).
+    // The error attribution should name both the workflow and the
+    // step that triggered the failureAction.
     assert!(
-        !stderr.contains("returned HTTP"),
-        "step HTTP error should not surface when failure action handles it: {}",
+        stderr.contains("fallbackFlow") && stderr.contains("probeStep"),
+        "stderr should attribute the end to its workflow + step: {}",
         stderr,
     );
     server.verify().await;
@@ -653,19 +663,24 @@ workflows:
         .output()
         .expect("spawn spall");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    // The reference resolves to a `type:end` failure action → exit
-    // zero (user has handled this). If the reference had failed to
-    // resolve, the runner would have raised an ActionDispatch error
-    // before reaching the step body, and exit would be non-zero with
-    // a different stderr.
+    // The reference resolves to a failure-side `type:end` → exit
+    // non-zero with workflow+step attribution. If the reference had
+    // FAILED to resolve, the runner would have raised an
+    // ActionDispatch error with "action dispatch" in stderr — assert
+    // we DIDN'T hit that path so we know the ref was honored.
     assert!(
-        output.status.success(),
-        "components reference resolved to type:end → workflow exits zero.\n--- stderr ---\n{}",
+        !output.status.success(),
+        "resolved type:end on failure path → workflow exits non-zero.\n--- stderr ---\n{}",
         stderr,
     );
     assert!(
         !stderr.contains("action dispatch"),
         "components reference should resolve cleanly, stderr was: {}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("viaComponents"),
+        "stderr should attribute the end to the workflow id: {}",
         stderr,
     );
     server.verify().await;

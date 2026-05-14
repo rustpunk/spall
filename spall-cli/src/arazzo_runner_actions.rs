@@ -28,6 +28,13 @@ use thiserror::Error;
 /// need more should set the field explicitly.
 const DEFAULT_RETRY_LIMIT: u32 = 1;
 
+/// Hard upper bound on per-retry sleep, in seconds. A buggy spec with
+/// `retryAfter: 999999` would otherwise hang the workflow runner for
+/// over 11 days; clamping at one minute keeps the runner interruptible
+/// without disabling legitimate backoff. Used by the runner's retry
+/// loop in `arazzo_runner.rs`.
+pub(crate) const MAX_RETRY_WAIT_SECS: u64 = 60;
+
 /// Errors raised while resolving or evaluating an action chain.
 #[derive(Debug, Error)]
 pub enum ActionDispatchError {
@@ -45,6 +52,9 @@ pub enum ActionDispatchError {
 
     #[error("action '{name}' has unsupported criterion type '{kind}' (jsonpath/regex are v2 — see issue #5)")]
     UnsupportedCriterionType { name: String, kind: String },
+
+    #[error("action '{name}' has non-empty criterion `context` '{context}' (only used by v2 jsonpath/regex types — see issue #5)")]
+    UnsupportedCriterionContext { name: String, context: String },
 
     #[error("action '{name}' criterion #{index}: {source}")]
     CriterionExpression {
@@ -241,6 +251,14 @@ fn criteria_pass(
                 kind: kind.to_string(),
             });
         }
+        if let Some(ctx_str) = c.context.as_deref() {
+            if !ctx_str.is_empty() {
+                return Err(ActionDispatchError::UnsupportedCriterionContext {
+                    name: action_name.to_string(),
+                    context: ctx_str.to_string(),
+                });
+            }
+        }
         let cond = parse_condition(&c.condition).map_err(|e| {
             ActionDispatchError::CriterionExpression {
                 name: action_name.to_string(),
@@ -360,6 +378,49 @@ mod tests {
             "got {:?}",
             err,
         );
+    }
+
+    #[test]
+    fn non_empty_criterion_context_is_rejected_hard() {
+        let action = Action {
+            name: "g".into(),
+            kind: "end".into(),
+            workflow_id: None,
+            step_id: None,
+            criteria: vec![Criterion {
+                condition: "1 == 1".into(),
+                // `context` is only meaningful for v2 jsonpath/regex
+                // criteria; a non-empty value with kind=simple (the
+                // default) signals the author expected v2 semantics.
+                context: Some("$response.body".into()),
+                kind: None,
+            }],
+        };
+        let err = dispatch_success_chain(&[action], &empty_ctx()).unwrap_err();
+        assert!(
+            matches!(err, ActionDispatchError::UnsupportedCriterionContext { .. }),
+            "got {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn empty_criterion_context_is_treated_as_absent() {
+        let action = Action {
+            name: "g".into(),
+            kind: "end".into(),
+            workflow_id: None,
+            step_id: None,
+            criteria: vec![Criterion {
+                condition: "1 == 1".into(),
+                context: Some(String::new()),
+                kind: None,
+            }],
+        };
+        // Empty context should pass through (defensive — a YAML
+        // serializer might emit `context: ""` for an unset field).
+        let flow = dispatch_success_chain(&[action], &empty_ctx()).unwrap();
+        assert!(matches!(flow, StepFlow::End { success: true }));
     }
 
     #[test]

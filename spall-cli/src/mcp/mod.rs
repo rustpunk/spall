@@ -186,7 +186,17 @@ fn resolve_auth_profile<'a>(
     auth_tool: &'a HashMap<String, String>,
     matched: &mut std::collections::HashSet<&'a str>,
 ) -> Option<String> {
-    for key in [name, op.operation_id.as_str()] {
+    // Try the sanitized tool name first, fall back to the raw
+    // operationId. Dedupe so a tool whose sanitized form equals its
+    // operationId doesn't get probed twice. The two-form match exists
+    // because users may have only seen the post-sanitize name in
+    // tools/list output OR may write against the raw operationId from
+    // the spec.
+    let mut probes: Vec<&str> = vec![name];
+    if op.operation_id.as_str() != name {
+        probes.push(op.operation_id.as_str());
+    }
+    for key in probes {
         if let Some((k, p)) = auth_tool.get_key_value(key) {
             matched.insert(k.as_str());
             return Some(p.clone());

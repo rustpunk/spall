@@ -794,6 +794,71 @@ async fn http_transport_origin_allowlist_blocks_unlisted_origin() {
 }
 
 #[tokio::test]
+async fn http_transport_default_origin_policy_blocks_remote_origin() {
+    // No --spall-allowed-origin → empty allowlist. The default policy
+    // is "localhost or no Origin"; a remote Origin header still 403s.
+    // This closes the DNS-rebinding gap the spec calls out: without
+    // the check, an attacker-controlled DNS record pointing at
+    // 127.0.0.1 served from a remote page could drive a victim's
+    // browser into the local server.
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // Remote Origin → 403 even without an allowlist.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("origin", "https://example.com")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Localhost Origin → allowed.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("origin", "http://localhost:8080")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // No Origin header (curl, MCP test client) → allowed.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[tokio::test]
 async fn tools_list_carries_annotations_and_meta_tags() {
     let mock = MockServer::start().await;
     let temp = TempDir::new().unwrap();

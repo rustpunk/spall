@@ -132,14 +132,17 @@ pub struct Step {
     /// the step's response after `successCriteria` pass.
     #[serde(default)]
     pub outputs: IndexMap<String, String>,
-    /// Per-step success-action chain (Arazzo §4.6.1). Overrides
-    /// workflow-level `successActions` for this step when non-empty.
+    /// Per-step success-action chain (Arazzo §4.6.1). Three states:
+    /// `None` (absent in YAML) → fall back to workflow-level
+    /// `successActions`; `Some(vec![])` (explicit `onSuccess: []` in
+    /// YAML) → no actions, do NOT fall back; `Some(vec![…])` →
+    /// step-level chain wins.
     #[serde(default)]
-    pub on_success: Vec<ActionOrRef>,
-    /// Per-step failure-action chain (Arazzo §4.6.2). Overrides
-    /// workflow-level `failureActions` for this step when non-empty.
+    pub on_success: Option<Vec<ActionOrRef>>,
+    /// Per-step failure-action chain (Arazzo §4.6.2). Same
+    /// absent-vs-empty distinction as `on_success`.
     #[serde(default)]
-    pub on_failure: Vec<FailureActionOrRef>,
+    pub on_failure: Option<Vec<FailureActionOrRef>>,
 }
 
 /// A step parameter. `value` is a JSON value that may be:
