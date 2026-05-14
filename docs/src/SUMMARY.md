@@ -30,5 +30,6 @@
 - [Request History](operations/history.md)
 - [Interactive REPL](operations/repl.md)
 - [Arazzo Workflows](operations/arazzo.md)
+- [MCP Server](operations/mcp.md)
 - [Shell Completions](operations/shell-completions.md)
 - [Exit Codes](operations/exit-codes.md)

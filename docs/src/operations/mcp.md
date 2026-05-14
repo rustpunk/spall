@@ -1,0 +1,121 @@
+# MCP Server
+
+`spall mcp <api>` serves every operation in a registered OpenAPI spec as
+a [Model Context Protocol][mcp-spec] tool over stdio. Drop the binary
+into a Claude Desktop or ChatGPT Apps config and the AI client can call
+your API with no integration code.
+
+[mcp-spec]: https://modelcontextprotocol.io/specification/2025-06-18
+
+## What it does
+
+Given an API you've already added with `spall api add petstore <spec-url>`:
+
+```bash
+spall mcp petstore        # serves on stdio, default transport
+```
+
+Each `ResolvedOperation` becomes one MCP tool. The tool's `inputSchema`
+is generated from the operation's parameters and request body; on
+`tools/call`, spall dispatches through the same request pipeline used by
+`spall <api> <op>` (auth chain, default headers, proxy, retries).
+
+Wire it into Claude Desktop with this entry in
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "spall-petstore": {
+      "command": "spall",
+      "args": ["mcp", "petstore"]
+    }
+  }
+}
+```
+
+Restart Claude; the tools appear in the sidebar.
+
+## Usage
+
+```text
+spall mcp <api>
+    [--spall-transport stdio]
+    [--spall-include <tag>]      # repeatable
+    [--spall-exclude <tag>]      # repeatable
+```
+
+- `--spall-transport` accepts only `stdio` in v1. Streamable HTTP is a
+  followup (MCP deprecated the older HTTP+SSE transport in spec revision
+  2025-03-26).
+- `--spall-include <tag>` keeps only operations carrying that OpenAPI
+  tag (repeatable; union semantics).
+- `--spall-exclude <tag>` removes operations carrying that tag.
+- Operations with no `tags` belong to a synthetic tag named `default` —
+  you can include/exclude them by that name.
+
+## Tool naming
+
+Tool names come straight from the operation's `operationId`, sanitized
+to fit MCP's allowed character class (`[A-Za-z0-9_./-]`, max 64 chars,
+lowercased). For example:
+
+| `operationId`     | tool name        |
+|-------------------|------------------|
+| `getPetById`      | `getpetbyid`     |
+| `create user`     | `create-user`    |
+| `Foo::Bar`        | `foo-bar`        |
+
+If two sanitized names collide (extremely rare; the resolver
+deduplicates `operationId` collisions on load), spall appends `-2`,
+`-3`, etc.
+
+## Auth
+
+`tools/call` runs the standard spall auth resolution chain (env var →
+hasp → OAuth2 stored token → config field). You must configure
+credentials out-of-band before starting the server; MCP gives no
+opportunity to prompt interactively.
+
+## Limitations
+
+- **Tools only.** No MCP `resources` or `prompts` surfaces in v1.
+- **Request/response only.** No progress streaming on long-running
+  calls.
+- **`oneOf` / `anyOf` / `allOf` are flattened.** Spall's resolver
+  collapses schema composition on load, so each tool's `inputSchema`
+  reflects a single resolved branch. If your spec relies heavily on
+  polymorphism, the tool input shape may be coarser than the spec
+  suggests.
+- **Recursive schemas collapse.** Schemas that hit the `$ref` cycle /
+  depth guard emit `{ "description": "cyclic schema omitted" }` in
+  place; clients see a permissive empty schema.
+
+## Troubleshooting
+
+### Claude Desktop only shows some of my tools
+
+Claude Desktop caps the per-server tool count near 100 and may truncate
+above it. Use `--spall-include <tag>` to slice a large spec into a
+focused subset, or run multiple `spall mcp` instances with disjoint tag
+filters.
+
+### "Server disconnected" / corrupted JSON-RPC stream
+
+Stdio MCP requires that **only JSON-RPC** is written to stdout. Spall's
+server hot path uses `eprintln!` for diagnostics and never writes to
+stdout outside of protocol replies. Sanity check:
+
+```bash
+echo '' | spall mcp <api>
+```
+
+The server should print its single-line stderr banner and exit on EOF
+with zero stdout output.
+
+### "Unknown argument"
+
+Tool arguments are routed to the parameter location declared in the
+spec. Pass each parameter by its **spec name** (not the `--query` /
+`--header` flag used on the CLI). The reserved key `body` carries the
+JSON request body when the operation declares one.

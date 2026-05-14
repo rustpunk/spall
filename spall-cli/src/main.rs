@@ -13,6 +13,7 @@ mod history;
 mod http;
 mod links;
 mod matches;
+mod mcp;
 mod output;
 mod paginate;
 mod preview;
@@ -173,6 +174,7 @@ pub async fn run_with_args(
         }
         Some(("arazzo", sub)) => commands::arazzo::handle_arazzo(sub, registry, cache_dir).await,
         Some(("auth", sub)) => commands::auth::handle_auth(sub).await,
+        Some(("mcp", sub)) => commands::mcp::handle_mcp(sub, registry, cache_dir).await,
         Some(("completions", sub)) => {
             let shell = sub
                 .get_one::<String>("shell")
@@ -497,6 +499,7 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand(api_management_cmd())
         .subcommand(commands::arazzo::arazzo_cmd())
+        .subcommand(commands::mcp::mcp_cmd())
         .subcommand(auth_cmd())
         .subcommand(history_cmd())
         .subcommand(
