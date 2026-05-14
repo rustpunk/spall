@@ -379,19 +379,38 @@ pub const DEFAULT_MAX_STEPS: usize = 10_000;
 
 /// Outcome of a single step.
 ///
-/// `failed_via` is `Some("on-failure-end" | "on-failure-goto")` when
-/// the step's HTTP/criteria failure was absorbed by a `failureAction`
-/// chain (the workflow continued via `goto` or terminated via `end`).
-/// `None` means the step body completed normally — either success or
-/// an unhandled failure that bubbled up. Consumers of the JSON output
-/// use this to distinguish "step succeeded" from "step's failure was
-/// caught."
+/// `failed_via` is `Some(_)` when the step's HTTP/criteria failure
+/// was absorbed by a `failureAction` chain (the workflow continued
+/// via `goto` or terminated via `end`). `None` means the step body
+/// completed normally — either success or an unhandled failure that
+/// bubbled up. Consumers of the JSON output use this to distinguish
+/// "step succeeded" from "step's failure was caught."
 pub struct StepOutcome {
     pub step_id: String,
     pub status: u16,
     pub outputs: BTreeMap<String, serde_json::Value>,
     pub dry_run: bool,
-    pub failed_via: Option<&'static str>,
+    pub failed_via: Option<FailedVia>,
+}
+
+/// Which failureAction absorbed a step failure. Serialized into the
+/// `failedVia` JSON field as a kebab-case discriminator; the wire
+/// strings are a documented public contract, so the variants live
+/// here (not as `&'static str` literals at call sites) to keep a
+/// typo from drifting the JSON shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedVia {
+    OnFailureEnd,
+    OnFailureGoto,
+}
+
+impl FailedVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailedVia::OnFailureEnd => "on-failure-end",
+            FailedVia::OnFailureGoto => "on-failure-goto",
+        }
+    }
 }
 
 /// Outcome of a workflow run.
@@ -730,8 +749,8 @@ async fn run_step_with_actions(
                         // ran". outputs stays empty because step.outputs
                         // never ran.
                         let via = match &flow {
-                            StepFlow::Goto { .. } => "on-failure-goto",
-                            StepFlow::End { .. } => "on-failure-end",
+                            StepFlow::Goto { .. } => FailedVia::OnFailureGoto,
+                            StepFlow::End { .. } => FailedVia::OnFailureEnd,
                             _ => unreachable!(),
                         };
                         step_outcomes.push(synthetic_failure_outcome(step, ctx, via));
@@ -864,7 +883,7 @@ fn print_action_chain_preview(
     }
     for a in failure {
         eprintln!(
-            "            onFailure: {} (type={}{}{}{})",
+            "            onFailure: {} (type={}{}{}{}{})",
             a.name,
             a.kind,
             a.step_id
@@ -873,6 +892,9 @@ fn print_action_chain_preview(
                 .unwrap_or_default(),
             a.retry_after
                 .map(|s| format!(", retryAfter={}s", s))
+                .unwrap_or_default(),
+            a.retry_limit
+                .map(|n| format!(", retryLimit={}", n))
                 .unwrap_or_default(),
             if a.criteria.is_empty() {
                 String::new()
@@ -889,7 +911,7 @@ fn print_action_chain_preview(
 /// "step's HTTP returned N but a failureAction caught it." The status
 /// field carries whatever the wire actually returned (or 0 when the
 /// failure was criteria-only).
-fn synthetic_failure_outcome(step: &Step, ctx: &Context, via: &'static str) -> StepOutcome {
+fn synthetic_failure_outcome(step: &Step, ctx: &Context, via: FailedVia) -> StepOutcome {
     let status = ctx
         .current_response
         .as_ref()
@@ -1259,7 +1281,7 @@ pub fn outcome_to_json(outcome: &RunOutcome) -> serde_json::Value {
             serde_json::Value::Object(step_outputs),
         );
         if let Some(via) = s.failed_via {
-            obj.insert("failedVia".to_string(), serde_json::json!(via));
+            obj.insert("failedVia".to_string(), serde_json::json!(via.as_str()));
         }
         steps.push(serde_json::Value::Object(obj));
     }

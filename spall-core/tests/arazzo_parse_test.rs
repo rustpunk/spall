@@ -168,6 +168,48 @@ fn with_component_actions_fixture_parses() {
 }
 
 #[test]
+fn explicit_empty_on_success_round_trips_as_some_empty_vec() {
+    // Symmetric regression guard with the on_failure case below: the
+    // absent-vs-empty distinction matters for both sides of the
+    // dispatcher. A serde change that quietly drops it on EITHER
+    // field would silently regress the runner's "step opts out of
+    // workflow-level fallback" semantics.
+    let yaml = r#"
+arazzo: "1.0.1"
+info:
+  title: Empty-onSuccess probe
+  version: "1.0.0"
+sourceDescriptions:
+  - name: api
+    url: ./openapi.json
+    type: openapi
+workflows:
+  - workflowId: probe
+    successActions:
+      - name: shout
+        type: end
+    steps:
+      - stepId: optOut
+        operationId: getThing
+        onSuccess: []
+      - stepId: useDefault
+        operationId: getThing
+"#;
+    let doc = spall_core::yaml::from_str::<ArazzoDocument>(yaml)
+        .expect("explicit-empty fixture parses");
+    let wf = &doc.workflows[0];
+    assert_eq!(
+        wf.steps[0].on_success.as_ref().map(|v| v.len()),
+        Some(0),
+        "onSuccess: [] must parse as Some(vec![])",
+    );
+    assert!(
+        wf.steps[1].on_success.is_none(),
+        "absent onSuccess must parse as None",
+    );
+}
+
+#[test]
 fn explicit_empty_on_failure_round_trips_as_some_empty_vec() {
     // Regression guard for the Option<Vec<_>> change: `onFailure: []`
     // in YAML must parse to Some(vec![]) so the runner can distinguish

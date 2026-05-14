@@ -510,11 +510,38 @@ workflows:
         .args(["arazzo", "run", arazzo_path.to_str().unwrap()])
         .output()
         .expect("spawn spall");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
-        "goto-recovery workflow should succeed.\n--- stderr ---\n{}",
-        stderr,
+        "goto-recovery workflow should succeed.\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        stdout, stderr,
+    );
+    // The failed step's record in the per-step JSON output must
+    // carry `failedVia: "on-failure-goto"` — that's the public
+    // contract consumers use to distinguish an absorbed failure
+    // from a clean success. A future refactor that drops the field
+    // (or renames the wire string) trips this assertion.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("workflow output must be valid JSON");
+    let steps = parsed["steps"].as_array().expect("steps array");
+    let maybe_fail = steps
+        .iter()
+        .find(|s| s["stepId"] == "maybeFail")
+        .expect("maybeFail step record");
+    assert_eq!(
+        maybe_fail["failedVia"], "on-failure-goto",
+        "absorbed-failure step must surface failedVia in JSON output: {:?}",
+        maybe_fail,
+    );
+    let cleanup = steps
+        .iter()
+        .find(|s| s["stepId"] == "cleanupStep")
+        .expect("cleanupStep record");
+    assert!(
+        cleanup.get("failedVia").is_none(),
+        "successful step record must NOT carry failedVia: {:?}",
+        cleanup,
     );
     server.verify().await;
 }

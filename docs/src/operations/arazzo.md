@@ -360,6 +360,44 @@ every step body run including retries and `goto`-revisits. A `goto X`
 from step X with always-true criteria — the textbook infinite-loop
 shape — bails with `StepBudgetExhausted` once the counter overshoots.
 
+## JSON output shape
+
+`spall arazzo run --output json` (the default) emits one workflow
+record to stdout per run:
+
+```jsonc
+{
+  "workflowId": "loginAndUseToken",
+  "outputs": { /* workflow-level outputs */ },
+  "steps": [
+    {
+      "stepId": "doLogin",
+      "status": 200,
+      "dryRun": false,
+      "outputs": { "token": "Bearer abc123" }
+      // failedVia omitted — step completed normally
+    },
+    {
+      "stepId": "maybeFail",
+      "status": 500,
+      "dryRun": false,
+      "outputs": {},
+      "failedVia": "on-failure-goto"   // absorbed via goto recovery
+    }
+  ]
+}
+```
+
+Per-step fields:
+
+| Field        | Type            | Meaning                                                                             |
+|--------------|-----------------|-------------------------------------------------------------------------------------|
+| `stepId`     | string          | The step's `stepId` from the .arazzo.yaml.                                          |
+| `status`     | integer         | HTTP status of the step's response, or `0` if no HTTP call ran (criteria-only fail). |
+| `dryRun`     | boolean         | `true` when the step body was skipped due to `--dry-run`.                            |
+| `outputs`    | object          | Values from the step's `outputs:` expressions. Empty when the step failed.           |
+| `failedVia`  | string \| absent | Only present when an `onFailure` action absorbed the step. Values: `"on-failure-end"`, `"on-failure-goto"`. Consumers use this to distinguish an absorbed-failure step from a true success. |
+
 ## v1 limitations
 
 | Feature              | v1                  | Tracking         |
