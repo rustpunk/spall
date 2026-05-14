@@ -39,6 +39,7 @@ pub fn mcp_cmd() -> Command {
 }
 
 /// Dispatcher for the `mcp` subcommand.
+#[must_use = "dropping the Result swallows server startup and runtime errors"]
 pub async fn handle_mcp(
     matches: &ArgMatches,
     registry: &ApiRegistry,
