@@ -56,7 +56,6 @@ pub struct OperationResult {
 /// dispatcher, REPL).
 #[derive(Default, Debug)]
 #[non_exhaustive]
-#[allow(dead_code)] // Wired in by `arazzo_runner` in the next commit.
 pub struct ProgrammaticArgs {
     /// Path parameters keyed by the parameter `name` from the spec.
     pub path: BTreeMap<String, String>,
@@ -86,7 +85,6 @@ pub struct ProgrammaticArgs {
     pub retry_max_wait_secs: u64,
 }
 
-#[allow(dead_code)] // Wired in by `arazzo_runner` in the next commit.
 impl ProgrammaticArgs {
     /// Construct an empty `ProgrammaticArgs` with sensible retry defaults.
     #[must_use = "the constructed args are the only output"]
@@ -117,7 +115,6 @@ impl ProgrammaticArgs {
 /// follow, history recording, `store_last_response`, verbose/time
 /// stderr logging, response-schema warning emission.
 #[must_use = "the OperationResult carries the response body"]
-#[allow(dead_code)] // Wired in by `arazzo_runner` in the next commit.
 pub async fn execute_operation_programmatic(
     op: &ResolvedOperation,
     spec: &ResolvedSpec,

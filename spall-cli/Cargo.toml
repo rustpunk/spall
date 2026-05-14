@@ -29,6 +29,7 @@ tabled = "0.20"
 csv = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 jmespath = "0.5"
+indexmap = "2"
 chrono = "0.4"
 base64 = "0.22"
 rpassword = "7"
