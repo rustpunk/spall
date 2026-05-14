@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::TempDir;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
@@ -572,6 +572,185 @@ async fn list_tags_prints_tsv_then_exits_without_starting_server() {
     // BTreeMap iteration order: alphabetical → orgs then users.
     assert!(body[0].starts_with("orgs\t3\torgs-op-"), "row 0: {}", body[0]);
     assert!(body[1].starts_with("users\t3\tusers-op-"), "row 1: {}", body[1]);
+}
+
+/// Spec with one operation per HTTP method, no body, returning 200.
+/// Used by the annotations matrix test.
+fn methods_spec(port: u16) -> String {
+    format!(
+        r#"{{
+  "openapi": "3.0.0",
+  "info": {{ "title": "Methods", "version": "1.0.0" }},
+  "servers": [{{ "url": "http://localhost:{port}" }}],
+  "paths": {{
+    "/items": {{
+      "get":    {{ "operationId": "listItems",   "tags": ["items"], "responses": {{ "200": {{ "description": "OK" }} }} }},
+      "post":   {{ "operationId": "createItem",  "tags": ["items"], "responses": {{ "200": {{ "description": "OK" }} }} }},
+      "put":    {{ "operationId": "replaceItem", "tags": ["items"], "responses": {{ "200": {{ "description": "OK" }} }} }},
+      "patch":  {{ "operationId": "patchItem",   "tags": ["items"], "responses": {{ "200": {{ "description": "OK" }} }} }},
+      "delete": {{ "operationId": "deleteItem",  "tags": ["items"], "responses": {{ "200": {{ "description": "OK" }} }} }}
+    }},
+    "/health": {{
+      "get": {{
+        "operationId": "health",
+        "tags": ["ops", "internal"],
+        "x-mcp-annotations": {{ "readOnlyHint": false, "openWorldHint": true }},
+        "responses": {{ "200": {{ "description": "OK" }} }}
+      }}
+    }}
+  }}
+}}"#
+    )
+}
+
+#[tokio::test]
+async fn tools_list_carries_annotations_and_meta_tags() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("methods.json");
+    std::fs::write(&spec_path, methods_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "methods", spec_path.to_str().unwrap());
+
+    let mut server = spawn(&temp, "methods", &[]);
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+    }));
+    let _ = server.recv();
+    server.send(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
+    let resp = server.recv();
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+
+    let by_name: std::collections::HashMap<String, Value> = tools
+        .iter()
+        .map(|t| (t["name"].as_str().unwrap().to_string(), t.clone()))
+        .collect();
+
+    let cases = [
+        ("listitems", true, false, true),
+        ("createitem", false, false, false),
+        ("replaceitem", false, true, true),
+        ("patchitem", false, true, false),
+        ("deleteitem", false, true, true),
+    ];
+    for (name, ro, dest, idem) in cases {
+        let tool = by_name.get(name).unwrap_or_else(|| panic!("missing tool {}", name));
+        let ann = &tool["annotations"];
+        if name == "createitem" {
+            // POST → no derived hints.
+            assert!(
+                ann.as_object().unwrap().is_empty(),
+                "POST {} should have empty annotations, got {:?}",
+                name,
+                ann,
+            );
+        } else {
+            assert_eq!(ann["readOnlyHint"], json!(ro), "{}: readOnlyHint", name);
+            assert_eq!(ann["destructiveHint"], json!(dest), "{}: destructiveHint", name);
+            assert_eq!(ann["idempotentHint"], json!(idem), "{}: idempotentHint", name);
+        }
+        // _meta.spall.tags carries the tag list.
+        assert_eq!(tool["_meta"]["spall.tags"], json!(["items"]), "tags for {}", name);
+    }
+
+    // The /health GET sets x-mcp-annotations: { readOnlyHint: false,
+    // openWorldHint: true } → readOnlyHint flipped, openWorldHint
+    // added, idempotentHint retained from the derived defaults.
+    let health = by_name.get("health").expect("health tool");
+    assert_eq!(health["annotations"]["readOnlyHint"], json!(false));
+    assert_eq!(health["annotations"]["openWorldHint"], json!(true));
+    assert_eq!(health["annotations"]["idempotentHint"], json!(true));
+    assert_eq!(health["_meta"]["spall.tags"], json!(["ops", "internal"]));
+
+    let _ = shutdown(server);
+}
+
+#[tokio::test]
+async fn per_tool_auth_override_dispatches_with_profile_bearer() {
+    let mock = MockServer::start().await;
+    // /admin requires admin bearer; /public requires no auth header at
+    // all (a request carrying Authorization should fail the matcher).
+    wiremock::Mock::given(method("GET"))
+        .and(path("/admin"))
+        .and(header("Authorization", "Bearer admin-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": "admin"})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/public"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": "public"})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("authed.json");
+    let spec = format!(
+        r#"{{
+  "openapi": "3.0.0",
+  "info": {{ "title": "Authed", "version": "1.0.0" }},
+  "servers": [{{ "url": "http://localhost:{port}" }}],
+  "paths": {{
+    "/admin":  {{ "get": {{ "operationId": "admin-op",  "responses": {{ "200": {{ "description": "OK" }} }} }} }},
+    "/public": {{ "get": {{ "operationId": "public-op", "responses": {{ "200": {{ "description": "OK" }} }} }} }}
+  }}
+}}"#,
+        port = mock.address().port()
+    );
+    std::fs::write(&spec_path, spec).unwrap();
+
+    // Wire two profiles on the api: 'admin' has the bearer, default
+    // has no auth. The admin-op tool gets pinned to the admin profile.
+    let apis_dir = temp.path().join("spall").join("apis");
+    std::fs::create_dir_all(&apis_dir).unwrap();
+    let api_toml = format!(
+        r#"source = "{}"
+
+[profile.admin]
+[profile.admin.auth]
+kind = "bearer"
+token = "admin-secret"
+"#,
+        spec_path.to_str().unwrap()
+    );
+    std::fs::write(apis_dir.join("authed.toml"), api_toml).unwrap();
+
+    let mut server = spawn(
+        &temp,
+        "authed",
+        &["--spall-auth-tool", "admin-op=admin"],
+    );
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+    }));
+    let _ = server.recv();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "admin-op", "arguments": {} }
+    }));
+    let resp = server.recv();
+    assert_eq!(resp["result"]["isError"], false, "admin-op: {:?}", resp);
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "public-op", "arguments": {} }
+    }));
+    let resp = server.recv();
+    assert_eq!(resp["result"]["isError"], false, "public-op: {:?}", resp);
+
+    let _ = shutdown(server);
 }
 
 #[tokio::test]

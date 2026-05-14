@@ -15,8 +15,9 @@ pub mod schema;
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 use spall_config::registry::ApiEntry;
-use spall_core::ir::{ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSpec};
-use std::collections::BTreeMap;
+use spall_core::ir::{HttpMethod, ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSpec};
+use spall_core::value::SpallValue;
+use std::collections::{BTreeMap, HashMap};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::execute::{execute_operation_programmatic, ProgrammaticArgs};
@@ -49,10 +50,30 @@ const WARNING_TAG_HISTOGRAM_TOP_N: usize = 5;
 /// are the same instance for the server's lifetime — the spec is loaded
 /// once at startup and never reloaded. If hot-reload is ever added,
 /// store the operation by id instead.
+///
+/// `annotations` is the per-MCP-spec hint block surfaced on
+/// `tools/list`. Derived from the HTTP method at build time and merged
+/// with the operation's `x-mcp-annotations` extension when present.
+///
+/// `auth_profile` is `Some(name)` when the operation should dispatch
+/// against a profile-overlaid `ApiEntry` rather than the default. The
+/// name resolves to a pre-cached entry in [`AuthProfiles`].
 struct ToolEntry {
     op_index: usize,
     description: String,
     input_schema: Value,
+    annotations: Value,
+    auth_profile: Option<String>,
+}
+
+/// Pre-resolved `ApiEntry`s keyed by profile name. The `default` field
+/// holds the entry with no profile overlay; `by_profile` holds entries
+/// for each profile referenced by `--spall-auth-tool` or
+/// `x-mcp-auth-profile`. Validating profile existence at startup keeps
+/// the per-call dispatch path infallible.
+pub struct AuthProfiles {
+    pub default: ApiEntry,
+    pub by_profile: HashMap<String, ApiEntry>,
 }
 
 /// Build the tool registry from `spec` applying the include/exclude tag
@@ -61,12 +82,19 @@ struct ToolEntry {
 /// When `max_tools` is `Some(N)` and the filtered count exceeds `N`,
 /// the registry is deterministically truncated to `N` entries before
 /// insertion — order documented in [`truncate_deterministically`].
+///
+/// `auth_tool` maps a finalized tool name to a profile name the
+/// dispatcher should use in place of the default `ApiEntry`. Entries in
+/// the map whose key doesn't match any final tool name are surfaced to
+/// the caller as `unmatched_auth_tool_keys` — `run()` warns about them
+/// on stderr.
 fn build_registry(
     spec: &ResolvedSpec,
     include: &[String],
     exclude: &[String],
     max_tools: Option<usize>,
-) -> IndexMap<String, ToolEntry> {
+    auth_tool: &HashMap<String, String>,
+) -> (IndexMap<String, ToolEntry>, Vec<String>) {
     let filtered: Vec<(usize, &ResolvedOperation)> = spec
         .operations
         .iter()
@@ -80,21 +108,93 @@ fn build_registry(
     };
 
     let mut out: IndexMap<String, ToolEntry> = IndexMap::new();
+    let mut matched_keys: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
     for (idx, op) in ordered {
         let raw = sanitize_tool_name(&op.operation_id);
         let name = unique_name(&raw, &out);
         let description = build_description(op);
         let input_schema = schema::operation_input_schema(op);
+        let annotations = derive_annotations(op);
+        let auth_profile = resolve_auth_profile(op, &name, auth_tool, &mut matched_keys);
         out.insert(
             name,
             ToolEntry {
                 op_index: idx,
                 description,
                 input_schema,
+                annotations,
+                auth_profile,
             },
         );
     }
-    out
+
+    let unmatched: Vec<String> = auth_tool
+        .keys()
+        .filter(|k| !matched_keys.contains(k.as_str()))
+        .cloned()
+        .collect();
+    (out, unmatched)
+}
+
+/// MCP `annotations` block for one tool, per spec 2025-06-18 §tools.
+/// Defaults are derived from HTTP method; `x-mcp-annotations` on the
+/// operation overrides each hint field-by-field. Returns `{}` when no
+/// hints apply (POST without an override).
+fn derive_annotations(op: &ResolvedOperation) -> Value {
+    let mut map = serde_json::Map::new();
+    let (read_only, destructive, idempotent) = match op.method {
+        HttpMethod::Get | HttpMethod::Head | HttpMethod::Options | HttpMethod::Trace => {
+            (Some(true), Some(false), Some(true))
+        }
+        HttpMethod::Put | HttpMethod::Delete => (Some(false), Some(true), Some(true)),
+        HttpMethod::Patch => (Some(false), Some(true), Some(false)),
+        HttpMethod::Post => (None, None, None),
+    };
+    if let Some(b) = read_only {
+        map.insert("readOnlyHint".to_string(), Value::Bool(b));
+    }
+    if let Some(b) = destructive {
+        map.insert("destructiveHint".to_string(), Value::Bool(b));
+    }
+    if let Some(b) = idempotent {
+        map.insert("idempotentHint".to_string(), Value::Bool(b));
+    }
+
+    // Field-by-field override from x-mcp-annotations. Spec authors can
+    // flip any hint, set `openWorldHint` (which spall doesn't derive),
+    // or supply `title`. Unknown keys pass through so future MCP spec
+    // additions don't need a spall release.
+    if let Some(SpallValue::Object(over)) = op.extensions.get("x-mcp-annotations") {
+        for (k, v) in over {
+            map.insert(k.clone(), Value::from(v));
+        }
+    }
+
+    Value::Object(map)
+}
+
+/// Pick the auth profile a tool should dispatch against. CLI flag takes
+/// precedence over the `x-mcp-auth-profile` extension; the flag's key
+/// is matched against the finalized tool name AND the raw
+/// `operationId` so users can write either form. The matched key (if
+/// any) is recorded so `build_registry` can surface unmatched CLI keys.
+fn resolve_auth_profile<'a>(
+    op: &'a ResolvedOperation,
+    name: &str,
+    auth_tool: &'a HashMap<String, String>,
+    matched: &mut std::collections::HashSet<&'a str>,
+) -> Option<String> {
+    for key in [name, op.operation_id.as_str()] {
+        if let Some((k, p)) = auth_tool.get_key_value(key) {
+            matched.insert(k.as_str());
+            return Some(p.clone());
+        }
+    }
+    if let Some(SpallValue::Str(s)) = op.extensions.get("x-mcp-auth-profile") {
+        return Some(s.clone());
+    }
+    None
 }
 
 /// Returns the first OpenAPI tag for an operation, or the synthetic
@@ -274,18 +374,26 @@ fn build_description(op: &ResolvedOperation) -> String {
 pub async fn run(
     api_name: String,
     spec: ResolvedSpec,
-    entry: ApiEntry,
+    profiles: AuthProfiles,
     include: Vec<String>,
     exclude: Vec<String>,
     max_tools: Option<usize>,
+    auth_tool: HashMap<String, String>,
 ) -> Result<(), crate::SpallCliError> {
-    let registry = build_registry(&spec, &include, &exclude, max_tools);
+    let (registry, unmatched_auth) =
+        build_registry(&spec, &include, &exclude, max_tools, &auth_tool);
     eprintln!(
         "spall mcp: serving '{}' over stdio ({} tool{})",
         api_name,
         registry.len(),
         if registry.len() == 1 { "" } else { "s" }
     );
+    for key in &unmatched_auth {
+        eprintln!(
+            "spall mcp: --spall-auth-tool key '{}' did not match any registered tool (filtered out, or unknown operationId)",
+            key,
+        );
+    }
     if registry.len() > MAX_TOOL_COUNT_HINT {
         let hist = tag_histogram(&registry, &spec, WARNING_TAG_HISTOGRAM_TOP_N)
             .into_iter()
@@ -308,7 +416,7 @@ pub async fn run(
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_line(&line, &spec, &entry, &registry).await;
+        let response = handle_line(&line, &spec, &profiles, &registry).await;
         if let Some(resp) = response {
             let mut bytes = match serde_json::to_vec(&resp) {
                 Ok(b) => b,
@@ -337,7 +445,7 @@ pub async fn run(
 async fn handle_line(
     line: &str,
     spec: &ResolvedSpec,
-    entry: &ApiEntry,
+    profiles: &AuthProfiles,
     registry: &IndexMap<String, ToolEntry>,
 ) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
@@ -357,9 +465,9 @@ async fn handle_line(
         "initialize" => Some(rpc_result(id, handle_initialize())),
         "notifications/initialized" | "notifications/cancelled" => None,
         "ping" => Some(rpc_result(id, json!({}))),
-        "tools/list" => Some(rpc_result(id, handle_tools_list(registry))),
+        "tools/list" => Some(rpc_result(id, handle_tools_list(spec, registry))),
         "tools/call" => {
-            let result = handle_tools_call(&params, spec, entry, registry).await;
+            let result = handle_tools_call(&params, spec, profiles, registry).await;
             Some(rpc_result(id, result))
         }
         "" => {
@@ -397,14 +505,21 @@ fn handle_initialize() -> Value {
     })
 }
 
-fn handle_tools_list(registry: &IndexMap<String, ToolEntry>) -> Value {
+fn handle_tools_list(spec: &ResolvedSpec, registry: &IndexMap<String, ToolEntry>) -> Value {
     let tools: Vec<Value> = registry
         .iter()
         .map(|(name, entry)| {
+            let tags: Vec<Value> = spec
+                .operations
+                .get(entry.op_index)
+                .map(|op| op.tags.iter().cloned().map(Value::String).collect())
+                .unwrap_or_default();
             json!({
                 "name": name,
                 "description": entry.description,
                 "inputSchema": entry.input_schema,
+                "annotations": entry.annotations,
+                "_meta": { "spall.tags": tags },
             })
         })
         .collect();
@@ -414,7 +529,7 @@ fn handle_tools_list(registry: &IndexMap<String, ToolEntry>) -> Value {
 async fn handle_tools_call(
     params: &Value,
     spec: &ResolvedSpec,
-    entry: &ApiEntry,
+    profiles: &AuthProfiles,
     registry: &IndexMap<String, ToolEntry>,
 ) -> Value {
     let name = match params.get("name").and_then(Value::as_str) {
@@ -435,6 +550,11 @@ async fn handle_tools_call(
     let prog_args = match build_programmatic_args(op, &arguments) {
         Ok(a) => a,
         Err(e) => return tool_error(&e),
+    };
+
+    let entry = match tool.auth_profile.as_deref() {
+        Some(name) => profiles.by_profile.get(name).unwrap_or(&profiles.default),
+        None => &profiles.default,
     };
 
     match execute_operation_programmatic(op, spec, entry, &prog_args).await {
@@ -677,6 +797,8 @@ mod tests {
                 op_index: 0,
                 description: String::new(),
                 input_schema: json!({}),
+                annotations: json!({}),
+                auth_profile: None,
             },
         );
         assert_eq!(unique_name("foo", &existing), "foo-2");
@@ -686,6 +808,8 @@ mod tests {
                 op_index: 1,
                 description: String::new(),
                 input_schema: json!({}),
+                annotations: json!({}),
+                auth_profile: None,
             },
         );
         assert_eq!(unique_name("foo", &existing), "foo-3");
@@ -720,7 +844,7 @@ mod tests {
             op("second", &["tagb"]),
             op("third", &["taga"]),
         ]);
-        let reg = build_registry(&spec, &["taga".into()], &[], None);
+        let reg = build_registry(&spec, &["taga".into()], &[], None, &HashMap::new()).0;
         let names: Vec<&str> = reg.keys().map(String::as_str).collect();
         assert_eq!(names, vec!["first", "third"]);
     }
@@ -736,8 +860,8 @@ mod tests {
             ops.push(op(&format!("beta-{}", i), &["beta"]));
         }
         let spec = spec_of(ops);
-        let first = build_registry(&spec, &[], &[], Some(30));
-        let second = build_registry(&spec, &[], &[], Some(30));
+        let first = build_registry(&spec, &[], &[], Some(30), &HashMap::new()).0;
+        let second = build_registry(&spec, &[], &[], Some(30), &HashMap::new()).0;
         let names_a: Vec<&str> = first.keys().map(String::as_str).collect();
         let names_b: Vec<&str> = second.keys().map(String::as_str).collect();
         assert_eq!(names_a.len(), 30);
@@ -760,7 +884,7 @@ mod tests {
             op("b", &["t2"]),
             op("c", &["t1"]),
         ]);
-        let reg = build_registry(&spec, &[], &[], Some(10));
+        let reg = build_registry(&spec, &[], &[], Some(10), &HashMap::new()).0;
         let names: Vec<&str> = reg.keys().map(String::as_str).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
     }
@@ -776,7 +900,7 @@ mod tests {
             op("f", &["billing"]),
             op("g", &[]),
         ]);
-        let reg = build_registry(&spec, &[], &[], None);
+        let reg = build_registry(&spec, &[], &[], None, &HashMap::new()).0;
         let hist = tag_histogram(&reg, &spec, 10);
         assert_eq!(
             hist,
@@ -796,7 +920,7 @@ mod tests {
             ops.push(op(&format!("op-{}", tag), &[tag]));
         }
         let spec = spec_of(ops);
-        let reg = build_registry(&spec, &[], &[], None);
+        let reg = build_registry(&spec, &[], &[], None, &HashMap::new()).0;
         let hist = tag_histogram(&reg, &spec, 3);
         assert_eq!(hist.len(), 3);
     }
@@ -804,11 +928,124 @@ mod tests {
     #[test]
     fn multi_tag_op_contributes_to_every_tag_bucket() {
         let spec = spec_of(vec![op("a", &["users", "admin"])]);
-        let reg = build_registry(&spec, &[], &[], None);
+        let reg = build_registry(&spec, &[], &[], None, &HashMap::new()).0;
         let hist = tag_histogram(&reg, &spec, 10);
         let map: BTreeMap<String, usize> = hist.into_iter().collect();
         assert_eq!(map.get("users"), Some(&1));
         assert_eq!(map.get("admin"), Some(&1));
+    }
+
+    fn op_with_method(id: &str, method: HttpMethod) -> ResolvedOperation {
+        let mut o = op(id, &[]);
+        o.method = method;
+        o
+    }
+
+    #[test]
+    fn annotations_derive_from_http_method() {
+        // GET / HEAD / OPTIONS / TRACE → readOnly + idempotent.
+        for m in [
+            HttpMethod::Get,
+            HttpMethod::Head,
+            HttpMethod::Options,
+            HttpMethod::Trace,
+        ] {
+            let ann = derive_annotations(&op_with_method("x", m));
+            assert_eq!(ann["readOnlyHint"], json!(true), "{:?}", m);
+            assert_eq!(ann["destructiveHint"], json!(false), "{:?}", m);
+            assert_eq!(ann["idempotentHint"], json!(true), "{:?}", m);
+        }
+        // PUT / DELETE → destructive + idempotent.
+        for m in [HttpMethod::Put, HttpMethod::Delete] {
+            let ann = derive_annotations(&op_with_method("x", m));
+            assert_eq!(ann["readOnlyHint"], json!(false), "{:?}", m);
+            assert_eq!(ann["destructiveHint"], json!(true), "{:?}", m);
+            assert_eq!(ann["idempotentHint"], json!(true), "{:?}", m);
+        }
+        // PATCH → destructive, NOT idempotent.
+        let ann = derive_annotations(&op_with_method("x", HttpMethod::Patch));
+        assert_eq!(ann["readOnlyHint"], json!(false));
+        assert_eq!(ann["destructiveHint"], json!(true));
+        assert_eq!(ann["idempotentHint"], json!(false));
+        // POST → no hints (server unknown intent).
+        let ann = derive_annotations(&op_with_method("x", HttpMethod::Post));
+        assert!(ann.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn x_mcp_annotations_extension_overrides_field_by_field() {
+        let mut o = op_with_method("x", HttpMethod::Get);
+        // Flip readOnlyHint and add openWorldHint (which spall doesn't
+        // derive). idempotentHint should retain the GET-derived true.
+        let mut override_map: IndexMap<String, SpallValue> = IndexMap::new();
+        override_map.insert("readOnlyHint".into(), SpallValue::Bool(false));
+        override_map.insert("openWorldHint".into(), SpallValue::Bool(true));
+        o.extensions
+            .insert("x-mcp-annotations".into(), SpallValue::Object(override_map));
+        let ann = derive_annotations(&o);
+        assert_eq!(ann["readOnlyHint"], json!(false));
+        assert_eq!(ann["openWorldHint"], json!(true));
+        assert_eq!(ann["idempotentHint"], json!(true));
+    }
+
+    #[test]
+    fn x_mcp_auth_profile_extension_picks_up_at_build_time() {
+        let mut o = op("authed", &[]);
+        o.extensions
+            .insert("x-mcp-auth-profile".into(), SpallValue::Str("admin".into()));
+        let spec = spec_of(vec![o]);
+        let reg = build_registry(&spec, &[], &[], None, &HashMap::new()).0;
+        let (_name, entry) = reg.iter().next().unwrap();
+        assert_eq!(entry.auth_profile.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn cli_auth_tool_flag_overrides_extension() {
+        let mut o = op("authed", &[]);
+        o.extensions
+            .insert("x-mcp-auth-profile".into(), SpallValue::Str("admin".into()));
+        let spec = spec_of(vec![o]);
+        let mut flags = HashMap::new();
+        flags.insert("authed".to_string(), "readonly".to_string());
+        let (reg, unmatched) = build_registry(&spec, &[], &[], None, &flags);
+        let (_name, entry) = reg.iter().next().unwrap();
+        assert_eq!(entry.auth_profile.as_deref(), Some("readonly"));
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn unmatched_auth_tool_key_is_reported() {
+        let spec = spec_of(vec![op("a", &[])]);
+        let mut flags = HashMap::new();
+        flags.insert("ghost-tool".to_string(), "admin".to_string());
+        let (_, unmatched) = build_registry(&spec, &[], &[], None, &flags);
+        assert_eq!(unmatched, vec!["ghost-tool".to_string()]);
+    }
+
+    #[test]
+    fn cli_auth_tool_matches_raw_operation_id_or_sanitized_name() {
+        // sanitize lowercases "Foo" → "foo", but the user may have
+        // written the raw operationId on the CLI. Either form should
+        // land on the same tool.
+        let spec = spec_of(vec![op("GetThing", &[])]);
+        let mut by_raw = HashMap::new();
+        by_raw.insert("GetThing".to_string(), "p".to_string());
+        let entry_a = build_registry(&spec, &[], &[], None, &by_raw)
+            .0
+            .iter()
+            .next()
+            .map(|(_, e)| e.auth_profile.clone())
+            .unwrap();
+        let mut by_sanitized = HashMap::new();
+        by_sanitized.insert("getthing".to_string(), "p".to_string());
+        let entry_b = build_registry(&spec, &[], &[], None, &by_sanitized)
+            .0
+            .iter()
+            .next()
+            .map(|(_, e)| e.auth_profile.clone())
+            .unwrap();
+        assert_eq!(entry_a, Some("p".to_string()));
+        assert_eq!(entry_b, Some("p".to_string()));
     }
 
     #[test]

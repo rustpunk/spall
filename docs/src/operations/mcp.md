@@ -85,6 +85,76 @@ hasp → OAuth2 stored token → config field). You must configure
 credentials out-of-band before starting the server; MCP gives no
 opportunity to prompt interactively.
 
+### Per-tool auth profiles
+
+Some APIs mix public-read and admin-write endpoints, or carry separate
+keychain entries per operation class. Two surfaces let you pin
+specific tools to a non-default `[profile.*]` block from the API's
+config:
+
+```bash
+spall mcp github \
+    --spall-auth-tool delete-repo=admin \
+    --spall-auth-tool transfer-repo=admin
+```
+
+The flag is repeatable; `<tool>` matches either the sanitized tool
+name from `tools/list` or the raw `operationId` from the spec.
+
+Equivalently, declare the binding inline on the operation in your
+spec via the extension `x-mcp-auth-profile`:
+
+```yaml
+paths:
+  /repos/{id}:
+    delete:
+      operationId: delete-repo
+      x-mcp-auth-profile: admin
+      ...
+```
+
+When both forms target the same tool, the CLI flag wins.
+
+Profiles named via either path are validated at server start; an
+unknown profile name aborts startup with the list of configured
+profiles so typos surface immediately.
+
+## Tool annotations
+
+Each entry in `tools/list` carries an `annotations` block with
+client-confirmation hints derived from the HTTP method
+([MCP spec 2025-06-18 §tools][mcp-tools]):
+
+[mcp-tools]: https://modelcontextprotocol.io/specification/2025-06-18/server/tools
+
+| Method            | readOnlyHint | destructiveHint | idempotentHint |
+|-------------------|--------------|-----------------|----------------|
+| GET / HEAD / OPTIONS / TRACE | true | false | true |
+| PUT / DELETE      | false        | true            | true           |
+| PATCH             | false        | true            | false          |
+| POST              | (omitted)    | (omitted)       | (omitted)      |
+
+`POST` is intentionally hint-free — the server cannot infer intent.
+Override any hint with the operation-level `x-mcp-annotations`
+extension, which merges field-by-field over the derived defaults:
+
+```yaml
+paths:
+  /search:
+    post:
+      operationId: search
+      x-mcp-annotations:
+        readOnlyHint: true   # POST that is in fact read-only
+        idempotentHint: true
+      ...
+```
+
+Unknown keys (e.g. `openWorldHint`, `title`) pass through so future
+MCP spec additions don't require a spall release.
+
+Each tool entry also carries `_meta.spall.tags` with the OpenAPI tag
+list — useful for clients that surface tags in their UI.
+
 ## Limitations
 
 - **Tools only.** No MCP `resources` or `prompts` surfaces in v1.

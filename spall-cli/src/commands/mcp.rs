@@ -3,7 +3,9 @@
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use miette::Result;
-use spall_config::registry::ApiRegistry;
+use spall_config::registry::{ApiEntry, ApiRegistry};
+use spall_core::value::SpallValue;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::SpallCliError;
@@ -48,6 +50,12 @@ pub fn mcp_cmd() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Load the spec, print 'tag\\tcount\\tsample-op-id' TSV to stdout, and exit without starting the server. Honors --spall-include / --spall-exclude."),
         )
+        .arg(
+            Arg::new("auth_tool")
+                .long("spall-auth-tool")
+                .action(ArgAction::Append)
+                .help("Per-tool auth profile override in the form <tool>=<profile> (repeatable). <tool> matches either the tool name from tools/list or the raw operationId; <profile> must exist in the API's [profiles.*] block."),
+        )
 }
 
 /// Dispatcher for the `mcp` subcommand.
@@ -62,26 +70,26 @@ pub async fn handle_mcp(
         .ok_or_else(|| SpallCliError::Usage("API name required".to_string()))?
         .clone();
 
-    let entry = registry
+    let default_entry = registry
         .resolve_profile(&api_name, None)
         .ok_or_else(|| SpallCliError::Usage(format!("Unknown API: {}", api_name)))?;
 
     let proxy = crate::http::resolve_env_proxy();
-    let raw = crate::fetch::load_raw(&entry.source, cache_dir, proxy.as_deref())
+    let raw = crate::fetch::load_raw(&default_entry.source, cache_dir, proxy.as_deref())
         .await
         .map_err(|e| SpallCliError::SpecLoadFailed {
             api: api_name.clone(),
-            source: entry.source.clone(),
+            source: default_entry.source.clone(),
             cause: spall_core::error::SpallCoreError::InvalidSource(e.to_string()),
         })?;
 
-    let spec = spall_core::cache::load_or_resolve(&entry.source, &raw, cache_dir).map_err(|e| {
-        SpallCliError::SpecLoadFailed {
+    let spec = spall_core::cache::load_or_resolve(&default_entry.source, &raw, cache_dir).map_err(
+        |e| SpallCliError::SpecLoadFailed {
             api: api_name.clone(),
-            source: entry.source.clone(),
+            source: default_entry.source.clone(),
             cause: e,
-        }
-    })?;
+        },
+    )?;
 
     let include: Vec<String> = matches
         .get_many::<String>("include")
@@ -99,7 +107,89 @@ pub async fn handle_mcp(
 
     let max_tools = matches.get_one::<usize>("max_tools").copied();
 
-    crate::mcp::run(api_name, spec, entry, include, exclude, max_tools)
+    let auth_tool = parse_auth_tool_flags(matches.get_many::<String>("auth_tool"))?;
+    let profiles = resolve_auth_profiles(&api_name, registry, &spec, &default_entry, &auth_tool)?;
+
+    crate::mcp::run(api_name, spec, profiles, include, exclude, max_tools, auth_tool)
         .await
         .map_err(Into::into)
+}
+
+/// Parse `--spall-auth-tool <tool>=<profile>` instances into a map.
+/// Each value must contain exactly one `=` separator and non-empty
+/// halves; malformed entries fail loudly so a typo doesn't silently
+/// fall through to the default profile at dispatch time.
+fn parse_auth_tool_flags(
+    values: Option<clap::parser::ValuesRef<String>>,
+) -> Result<HashMap<String, String>> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let Some(values) = values else {
+        return Ok(out);
+    };
+    for raw in values {
+        let Some((tool, profile)) = raw.split_once('=') else {
+            return Err(SpallCliError::Usage(format!(
+                "--spall-auth-tool value '{}' must be <tool>=<profile>",
+                raw
+            ))
+            .into());
+        };
+        let tool = tool.trim();
+        let profile = profile.trim();
+        if tool.is_empty() || profile.is_empty() {
+            return Err(SpallCliError::Usage(format!(
+                "--spall-auth-tool value '{}' has empty <tool> or <profile>",
+                raw
+            ))
+            .into());
+        }
+        out.insert(tool.to_string(), profile.to_string());
+    }
+    Ok(out)
+}
+
+/// Pre-resolve every profile referenced by `--spall-auth-tool` or by
+/// an `x-mcp-auth-profile` extension into an `ApiEntry`. Profiles that
+/// don't exist in the API's `[profiles.*]` block error out at startup
+/// so the per-call dispatch path stays infallible.
+fn resolve_auth_profiles(
+    api_name: &str,
+    registry: &ApiRegistry,
+    spec: &spall_core::ir::ResolvedSpec,
+    default_entry: &ApiEntry,
+    auth_tool: &HashMap<String, String>,
+) -> Result<crate::mcp::AuthProfiles> {
+    let mut needed: HashSet<String> = HashSet::new();
+    needed.extend(auth_tool.values().cloned());
+    for op in &spec.operations {
+        if let Some(SpallValue::Str(p)) = op.extensions.get("x-mcp-auth-profile") {
+            needed.insert(p.clone());
+        }
+    }
+
+    let mut by_profile: HashMap<String, ApiEntry> = HashMap::new();
+    for profile in needed {
+        if !default_entry.profiles.contains_key(&profile) {
+            let configured: Vec<&String> = default_entry.profiles.keys().collect();
+            return Err(SpallCliError::Usage(format!(
+                "auth profile '{}' is not configured for api '{}'; configured profiles: {:?}",
+                profile, api_name, configured,
+            ))
+            .into());
+        }
+        let entry = registry
+            .resolve_profile(api_name, Some(&profile))
+            .ok_or_else(|| {
+                SpallCliError::Usage(format!(
+                    "internal: api '{}' vanished while resolving profile '{}'",
+                    api_name, profile
+                ))
+            })?;
+        by_profile.insert(profile, entry);
+    }
+
+    Ok(crate::mcp::AuthProfiles {
+        default: default_entry.clone(),
+        by_profile,
+    })
 }
