@@ -10,6 +10,7 @@
 //! parse as a JSON-RPC message. Diagnostics go to stderr via
 //! `eprintln!`. No `tracing` dep — see plan doc for the rationale.
 
+pub mod http;
 pub mod schema;
 
 use indexmap::IndexMap;
@@ -58,7 +59,7 @@ const WARNING_TAG_HISTOGRAM_TOP_N: usize = 5;
 /// `auth_profile` is `Some(name)` when the operation should dispatch
 /// against a profile-overlaid `ApiEntry` rather than the default. The
 /// name resolves to a pre-cached entry in [`AuthProfiles`].
-struct ToolEntry {
+pub(crate) struct ToolEntry {
     op_index: usize,
     description: String,
     input_schema: Value,
@@ -368,6 +369,49 @@ fn build_description(op: &ResolvedOperation) -> String {
     buf
 }
 
+/// Build the tool registry and emit the startup banner + any tool-count
+/// warnings to stderr. Shared by the stdio (`run`) and HTTP
+/// (`http::run_http`) entry points so banner / warning copy stays
+/// identical across transports.
+pub(crate) fn prepare_server(
+    api_name: &str,
+    transport_label: &str,
+    spec: &ResolvedSpec,
+    include: &[String],
+    exclude: &[String],
+    max_tools: Option<usize>,
+    auth_tool: &HashMap<String, String>,
+) -> IndexMap<String, ToolEntry> {
+    let (registry, unmatched_auth) = build_registry(spec, include, exclude, max_tools, auth_tool);
+    eprintln!(
+        "spall mcp: serving '{}' over {} ({} tool{})",
+        api_name,
+        transport_label,
+        registry.len(),
+        if registry.len() == 1 { "" } else { "s" }
+    );
+    for key in &unmatched_auth {
+        eprintln!(
+            "spall mcp: --spall-auth-tool key '{}' did not match any registered tool (filtered out, or unknown operationId)",
+            key,
+        );
+    }
+    if registry.len() > MAX_TOOL_COUNT_HINT {
+        let hist = tag_histogram(&registry, spec, WARNING_TAG_HISTOGRAM_TOP_N)
+            .into_iter()
+            .map(|(t, c)| format!("{}={}", t, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "spall mcp: WARNING {} tools exceeds the ~{}-tool cap most MCP clients (incl. Claude Desktop) silently truncate at; pass --spall-include <tag> or --spall-max-tools <N> to trim.",
+            registry.len(),
+            MAX_TOOL_COUNT_HINT,
+        );
+        eprintln!("spall mcp: top tags by population: {}", hist);
+    }
+    registry
+}
+
 /// Server entry point. Builds the tool registry then serves stdio
 /// JSON-RPC until EOF on stdin.
 #[must_use = "ignoring this Result swallows server-side errors"]
@@ -380,33 +424,9 @@ pub async fn run(
     max_tools: Option<usize>,
     auth_tool: HashMap<String, String>,
 ) -> Result<(), crate::SpallCliError> {
-    let (registry, unmatched_auth) =
-        build_registry(&spec, &include, &exclude, max_tools, &auth_tool);
-    eprintln!(
-        "spall mcp: serving '{}' over stdio ({} tool{})",
-        api_name,
-        registry.len(),
-        if registry.len() == 1 { "" } else { "s" }
+    let registry = prepare_server(
+        &api_name, "stdio", &spec, &include, &exclude, max_tools, &auth_tool,
     );
-    for key in &unmatched_auth {
-        eprintln!(
-            "spall mcp: --spall-auth-tool key '{}' did not match any registered tool (filtered out, or unknown operationId)",
-            key,
-        );
-    }
-    if registry.len() > MAX_TOOL_COUNT_HINT {
-        let hist = tag_histogram(&registry, &spec, WARNING_TAG_HISTOGRAM_TOP_N)
-            .into_iter()
-            .map(|(t, c)| format!("{}={}", t, c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!(
-            "spall mcp: WARNING {} tools exceeds the ~{}-tool cap most MCP clients (incl. Claude Desktop) silently truncate at; pass --spall-include <tag> or --spall-max-tools <N> to trim.",
-            registry.len(),
-            MAX_TOOL_COUNT_HINT,
-        );
-        eprintln!("spall mcp: top tags by population: {}", hist);
-    }
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -442,7 +462,7 @@ pub async fn run(
 /// Parse one JSON-RPC frame and dispatch. Returns `None` for
 /// notifications (no `id`) and for parse errors that aren't recoverable
 /// into a JSON-RPC error envelope (notifications can't error per spec).
-async fn handle_line(
+pub(crate) async fn handle_line(
     line: &str,
     spec: &ResolvedSpec,
     profiles: &AuthProfiles,

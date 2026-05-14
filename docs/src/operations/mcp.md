@@ -40,16 +40,20 @@ Restart Claude; the tools appear in the sidebar.
 
 ```text
 spall mcp <api>
-    [--spall-transport stdio]
+    [--spall-transport stdio|http]
+    [--spall-port <N>]           # HTTP only; default 8765
+    [--spall-bind <addr>]        # HTTP only; default 127.0.0.1
+    [--spall-allowed-origin <origin>]  # HTTP only; repeatable
     [--spall-include <tag>]      # repeatable
     [--spall-exclude <tag>]      # repeatable
     [--spall-max-tools <N>]
     [--spall-list-tags]
 ```
 
-- `--spall-transport` accepts only `stdio` in v1. Streamable HTTP is a
-  followup (MCP deprecated the older HTTP+SSE transport in spec revision
-  2025-03-26).
+- `--spall-transport` selects the wire protocol:
+  - `stdio` (default) for Claude Desktop / config-launched servers.
+  - `http` for Streamable HTTP per MCP spec 2025-06-18 §HTTP; see
+    [Running over HTTP](#running-over-http) below.
 - `--spall-include <tag>` keeps only operations carrying that OpenAPI
   tag (repeatable; union semantics).
 - `--spall-exclude <tag>` removes operations carrying that tag.
@@ -168,6 +172,64 @@ list — useful for clients that surface tags in their UI.
 - **Recursive schemas collapse.** Schemas that hit the `$ref` cycle /
   depth guard emit `{ "description": "cyclic schema omitted" }` in
   place; clients see a permissive empty schema.
+
+## Running over HTTP
+
+`--spall-transport http` switches the server from line-delimited
+JSON-RPC over stdio to Streamable HTTP per [MCP spec 2025-06-18
+§HTTP][mcp-http]. The wire shape:
+
+- One POST endpoint at `/` (the bind root). Body is one JSON-RPC 2.0
+  request frame; response is the matching reply as `application/json`.
+- `Mcp-Session-Id` header is issued on `initialize` and required on
+  every subsequent request. Sessions live for the process lifetime;
+  restarting the server invalidates all existing sessions.
+- Streaming (`text/event-stream`) responses are documented in the
+  spec for long-running tools. spall's v1 tools are all
+  request/response; the server returns JSON regardless of which
+  format the client `Accept`s.
+
+[mcp-http]: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+
+```bash
+# Localhost by default (MCP spec recommendation; mitigates DNS rebinding).
+spall mcp petstore --spall-transport http --spall-port 8765
+
+# Bind on all interfaces — combine with a reverse proxy that adds auth + TLS.
+spall mcp petstore --spall-transport http --spall-port 8765 --spall-bind 0.0.0.0
+
+# Pass --spall-port 0 to let the kernel pick a free port. The bound
+# port is logged to stderr:
+spall mcp petstore --spall-transport http --spall-port 0
+# [spall-mcp] listening on http://127.0.0.1:54321/
+```
+
+### Origin allowlist (DNS rebinding mitigation)
+
+The spec requires the server to validate the `Origin` header to block
+DNS-rebinding attacks. When `--spall-allowed-origin <origin>` is
+provided (repeatable), requests whose `Origin` header isn't in the
+allowlist receive `403 Forbidden` before their body is deserialized:
+
+```bash
+spall mcp petstore --spall-transport http \
+    --spall-allowed-origin https://app.example.com \
+    --spall-allowed-origin https://staging.example.com
+```
+
+When no allowlist is set, `Origin` is not checked. Combined with the
+localhost-only default bind, this is safe for local-development use
+(no remote attacker can reach the server). Production deployments
+should set both the bind interface and the allowlist explicitly.
+
+### TLS, auth on the HTTP endpoint
+
+Both are deliberately **not** in scope for the spall server itself. The
+expected deployment is a reverse proxy (Caddy / Nginx / Cloudflare /
+fly proxy / etc.) that terminates TLS and adds auth, with spall
+listening on a private port behind it. This matches the
+`claude-desktop` / `chatgpt-apps` deployment pattern and keeps spall's
+dep tree small.
 
 ## Sizing your server
 

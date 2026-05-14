@@ -603,6 +603,196 @@ fn methods_spec(port: u16) -> String {
     )
 }
 
+/// Spawn `spall mcp <api> --spall-transport http --spall-port 0`
+/// and parse the OS-assigned port from the sentinel stderr line.
+/// Returns the running child + bound socket address.
+async fn spawn_http(
+    temp: &TempDir,
+    api: &str,
+    extra_args: &[&str],
+) -> (std::process::Child, String) {
+    let cache_dir = temp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let mut cmd = std::process::Command::new(bin_path());
+    cmd.env("XDG_CONFIG_HOME", temp.path())
+        .env("XDG_CACHE_HOME", &cache_dir)
+        .arg("mcp")
+        .arg(api)
+        .args(["--spall-transport", "http", "--spall-port", "0"])
+        .args(extra_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn spall mcp http");
+
+    // Read stderr until we see the sentinel line.
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = BufReader::new(stderr);
+    let mut url: Option<String> = None;
+    // Bounded read loop — 50 lines is plenty for the banner + warnings.
+    for _ in 0..50 {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read stderr");
+        if n == 0 {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("[spall-mcp] listening on ") {
+            url = Some(rest.trim().trim_end_matches('/').to_string());
+            break;
+        }
+    }
+    let url = url.expect("HTTP transport must print listening sentinel");
+    // Restore stderr so the test can still read leftover banner lines if
+    // it wants to (we don't, but keeping the handle alive prevents the
+    // child from getting SIGPIPE on its next eprintln).
+    child.stderr = Some(reader.into_inner());
+    (child, url)
+}
+
+#[tokio::test]
+async fn http_transport_round_trips_initialize_then_tools_list() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // initialize: server should respond with Mcp-Session-Id header.
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    assert_eq!(init.status(), reqwest::StatusCode::OK);
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("Mcp-Session-Id header must be issued on initialize")
+        .to_string();
+    assert_eq!(session_id.len(), 32, "session id should be 128-bit hex");
+    let init_body: Value = init.json().await.expect("init body");
+    assert_eq!(init_body["result"]["serverInfo"]["name"], "spall");
+
+    // tools/list with the issued session id.
+    let list = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("send tools/list");
+    assert_eq!(list.status(), reqwest::StatusCode::OK);
+    let list_body: Value = list.json().await.expect("list body");
+    let tools = list_body["result"]["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 2);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[tokio::test]
+async fn http_transport_rejects_request_without_session_id() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // tools/list with no Mcp-Session-Id should be rejected with 400.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("send tools/list");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Mcp-Session-Id"),
+        "error message should mention the missing session id: {:?}",
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[tokio::test]
+async fn http_transport_origin_allowlist_blocks_unlisted_origin() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(
+        &temp,
+        "petstore",
+        &["--spall-allowed-origin", "https://example.com"],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // Request with a non-allowlisted Origin → 403.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("origin", "https://evil.example.org")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Same request with the allowed Origin succeeds.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("origin", "https://example.com")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[tokio::test]
 async fn tools_list_carries_annotations_and_meta_tags() {
     let mock = MockServer::start().await;

@@ -22,9 +22,26 @@ pub fn mcp_cmd() -> Command {
         .arg(
             Arg::new("transport")
                 .long("spall-transport")
-                .value_parser(["stdio"])
+                .value_parser(["stdio", "http"])
                 .default_value("stdio")
-                .help("Transport. Only 'stdio' is supported in v1; Streamable HTTP is a followup."),
+                .help("Transport: 'stdio' (default, for Claude Desktop / config-launched servers) or 'http' (Streamable HTTP per MCP spec 2025-06-18, for reverse-proxy / hosted servers)."),
+        )
+        .arg(
+            Arg::new("port")
+                .long("spall-port")
+                .value_parser(clap::value_parser!(u16))
+                .help("Listen port when --spall-transport=http (default 8765). Pass 0 to let the kernel pick a free port; the bound port is printed to stderr."),
+        )
+        .arg(
+            Arg::new("bind")
+                .long("spall-bind")
+                .help("Bind interface when --spall-transport=http (default 127.0.0.1). The MCP spec recommends localhost-only by default; opt into broader binds explicitly."),
+        )
+        .arg(
+            Arg::new("allowed_origin")
+                .long("spall-allowed-origin")
+                .action(ArgAction::Append)
+                .help("Allowlist of Origin header values when --spall-transport=http (repeatable). When non-empty, requests with a non-matching Origin get HTTP 403 — mitigates DNS rebinding."),
         )
         .arg(
             Arg::new("include")
@@ -110,9 +127,46 @@ pub async fn handle_mcp(
     let auth_tool = parse_auth_tool_flags(matches.get_many::<String>("auth_tool"))?;
     let profiles = resolve_auth_profiles(&api_name, registry, &spec, &default_entry, &auth_tool)?;
 
-    crate::mcp::run(api_name, spec, profiles, include, exclude, max_tools, auth_tool)
-        .await
-        .map_err(Into::into)
+    let transport = matches
+        .get_one::<String>("transport")
+        .map(String::as_str)
+        .unwrap_or("stdio");
+    match transport {
+        "stdio" => crate::mcp::run(api_name, spec, profiles, include, exclude, max_tools, auth_tool)
+            .await
+            .map_err(Into::into),
+        "http" => {
+            let port = matches
+                .get_one::<u16>("port")
+                .copied()
+                .unwrap_or(crate::mcp::http::DEFAULT_PORT);
+            let bind = matches
+                .get_one::<String>("bind")
+                .map(String::as_str)
+                .unwrap_or(crate::mcp::http::DEFAULT_BIND);
+            let listen_addr: std::net::SocketAddr = format!("{}:{}", bind, port).parse().map_err(
+                |e| SpallCliError::Usage(format!("invalid --spall-bind '{}:{}': {}", bind, port, e)),
+            )?;
+            let allowed_origins: Vec<String> = matches
+                .get_many::<String>("allowed_origin")
+                .map(|vals| vals.cloned().collect())
+                .unwrap_or_default();
+            crate::mcp::http::run_http(
+                api_name,
+                spec,
+                profiles,
+                include,
+                exclude,
+                max_tools,
+                auth_tool,
+                listen_addr,
+                allowed_origins,
+            )
+            .await
+            .map_err(Into::into)
+        }
+        other => Err(SpallCliError::Usage(format!("unknown transport '{}'", other)).into()),
+    }
 }
 
 /// Parse `--spall-auth-tool <tool>=<profile>` instances into a map.
