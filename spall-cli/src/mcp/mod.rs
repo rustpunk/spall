@@ -15,7 +15,7 @@ pub mod schema;
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 use spall_config::registry::ApiEntry;
-use spall_core::ir::{ParameterLocation, ResolvedOperation, ResolvedSpec};
+use spall_core::ir::{ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSpec};
 use std::collections::BTreeMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -33,8 +33,13 @@ const ERR_INVALID_PARAMS: i32 = -32602;
 const ERR_PARSE: i32 = -32700;
 
 /// One tool in the dispatch registry. Built once at startup and never
-/// mutated thereafter; the operation index is what dispatch uses to
-/// look up the `ResolvedOperation` on `tools/call`.
+/// mutated thereafter.
+///
+/// `op_index` indexes into `spec.operations` by position. This is safe
+/// because the registry and the `spec` passed to `handle_tools_call`
+/// are the same instance for the server's lifetime — the spec is loaded
+/// once at startup and never reloaded. If hot-reload is ever added,
+/// store the operation by id instead.
 struct ToolEntry {
     op_index: usize,
     description: String,
@@ -333,10 +338,14 @@ fn tool_error(message: &str) -> Value {
 }
 
 /// Walk the MCP-provided arguments object, route each key to the
-/// matching `ResolvedParameter::location` slot in `ProgrammaticArgs`, and
-/// handle the `body` reserved key when the operation has a request body.
-/// Non-string scalars are coerced to strings for non-body slots (path,
-/// query, header, cookie all want `String`).
+/// matching `ResolvedParameter` slot in `ProgrammaticArgs`, and handle
+/// the `body` reserved key when the operation has a request body.
+///
+/// Array arguments are expanded per the parameter's OpenAPI `style` and
+/// `explode` flags: query params with the default `form` + `explode:
+/// true` produce `?ids=1&ids=2&ids=3` via `query_extras`; non-exploded
+/// forms and `simple`-style path/header/cookie params produce
+/// comma-joined values.
 fn build_programmatic_args(
     op: &ResolvedOperation,
     arguments: &Value,
@@ -348,40 +357,116 @@ fn build_programmatic_args(
         _ => return Err("'arguments' must be a JSON object".to_string()),
     };
 
-    let mut by_name: BTreeMap<&str, ParameterLocation> = BTreeMap::new();
-    for p in &op.parameters {
-        by_name.insert(p.name.as_str(), p.location);
-    }
+    let by_name: BTreeMap<&str, &ResolvedParameter> =
+        op.parameters.iter().map(|p| (p.name.as_str(), p)).collect();
 
     for (key, value) in obj {
         if key == "body" && op.request_body.is_some() {
             prog.body = Some(value.clone());
             continue;
         }
-        let loc = match by_name.get(key.as_str()) {
-            Some(l) => *l,
+        let param = match by_name.get(key.as_str()) {
+            Some(p) => *p,
             None => return Err(format!("unknown argument '{}'", key)),
         };
-        let stringified = coerce_to_string(value);
-        match loc {
-            ParameterLocation::Path => {
-                prog.path.insert(key.clone(), stringified);
-            }
-            ParameterLocation::Query => {
-                prog.query.insert(key.clone(), stringified);
-            }
-            ParameterLocation::Header => {
-                prog.header.insert(key.clone(), stringified);
-            }
-            ParameterLocation::Cookie => {
-                prog.cookie.insert(key.clone(), stringified);
-            }
-        }
+        place_argument(&mut prog, param, key, value);
     }
     Ok(prog)
 }
 
-fn coerce_to_string(v: &Value) -> String {
+/// Place one argument into the right `ProgrammaticArgs` slot, expanding
+/// arrays per the parameter's OpenAPI `style` / `explode` flags.
+fn place_argument(
+    prog: &mut ProgrammaticArgs,
+    param: &ResolvedParameter,
+    name: &str,
+    value: &Value,
+) {
+    match (param.location, value) {
+        (ParameterLocation::Query, Value::Array(items)) => {
+            // OpenAPI defaults for query: style = "form", explode = true.
+            // Form + explode → ?ids=1&ids=2; form + no-explode → ?ids=1,2.
+            let explode = explode_default_for(&param.style, param.explode, true);
+            if explode {
+                for item in items {
+                    prog.query_extras
+                        .push((name.to_string(), scalar_to_string(item)));
+                }
+            } else {
+                let joined = items
+                    .iter()
+                    .map(scalar_to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                prog.query.insert(name.to_string(), joined);
+            }
+        }
+        (ParameterLocation::Path, Value::Array(items)) => {
+            // OpenAPI default for path: style = "simple". `simple` and
+            // `simple + explode` both comma-join scalars; matrix/label
+            // styles produce different separators and are uncommon
+            // enough to defer.
+            let joined = items
+                .iter()
+                .map(scalar_to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            prog.path.insert(name.to_string(), joined);
+        }
+        (ParameterLocation::Header, Value::Array(items)) => {
+            // RFC 9110 §5.3 — multi-value headers are comma-joined.
+            let joined = items
+                .iter()
+                .map(scalar_to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            prog.header.insert(name.to_string(), joined);
+        }
+        (ParameterLocation::Cookie, Value::Array(items)) => {
+            let joined = items
+                .iter()
+                .map(scalar_to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            prog.cookie.insert(name.to_string(), joined);
+        }
+        (ParameterLocation::Path, v) => {
+            prog.path.insert(name.to_string(), scalar_to_string(v));
+        }
+        (ParameterLocation::Query, v) => {
+            prog.query.insert(name.to_string(), scalar_to_string(v));
+        }
+        (ParameterLocation::Header, v) => {
+            prog.header.insert(name.to_string(), scalar_to_string(v));
+        }
+        (ParameterLocation::Cookie, v) => {
+            prog.cookie.insert(name.to_string(), scalar_to_string(v));
+        }
+    }
+}
+
+/// OpenAPI 3.0/3.1 explode defaults: `true` only when style is `form`,
+/// `false` otherwise. If the spec authors explicitly set `explode`, the
+/// resolver carries their choice forward; only treat it as a default
+/// when the parser left it at the all-zeroes fallback.
+fn explode_default_for(style: &str, explode: bool, fallback_for_form: bool) -> bool {
+    if explode {
+        return true;
+    }
+    if style == "form" {
+        // The IR populates `explode` from the spec; we can't distinguish
+        // "spec said false" from "spec didn't say". Default form params
+        // to exploded per OpenAPI's `form` default — matches what curl /
+        // Postman would do for a missing `explode` field.
+        return fallback_for_form;
+    }
+    false
+}
+
+/// Coerce a JSON scalar to its string form. Objects fall back to JSON
+/// text (the param is type: object, not array — OpenAPI's `deepObject`
+/// style for query params is rare and out of v1 scope).
+fn scalar_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
@@ -565,6 +650,116 @@ mod tests {
         let args = json!({"zzz": 1});
         let err = build_programmatic_args(&op, &args).unwrap_err();
         assert!(err.contains("unknown argument 'zzz'"));
+    }
+
+    fn make_param(name: &str, loc: ParameterLocation, style: &str, explode: bool) -> ResolvedParameter {
+        ResolvedParameter {
+            name: name.to_string(),
+            location: loc,
+            required: false,
+            deprecated: false,
+            style: style.to_string(),
+            explode,
+            schema: bare_schema(),
+            description: None,
+            extensions: IndexMap::new(),
+        }
+    }
+
+    fn op_with_params(params: Vec<ResolvedParameter>) -> ResolvedOperation {
+        ResolvedOperation {
+            operation_id: "x".into(),
+            method: HttpMethod::Get,
+            path_template: "/x".into(),
+            summary: None,
+            description: None,
+            deprecated: false,
+            parameters: params,
+            request_body: None,
+            responses: IndexMap::new(),
+            security: Vec::new(),
+            tags: Vec::new(),
+            extensions: IndexMap::new(),
+            servers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn array_query_with_form_explode_expands_to_repeated_pairs() {
+        // OpenAPI default for query params: style=form, explode=true.
+        let op = op_with_params(vec![make_param(
+            "ids",
+            ParameterLocation::Query,
+            "form",
+            true,
+        )]);
+        let prog = build_programmatic_args(&op, &json!({"ids": [1, 2, 3]})).unwrap();
+        assert!(prog.query.is_empty(), "explode=true bypasses the single-value map");
+        assert_eq!(
+            prog.query_extras,
+            vec![
+                ("ids".to_string(), "1".to_string()),
+                ("ids".to_string(), "2".to_string()),
+                ("ids".to_string(), "3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn array_query_with_form_style_still_explodes_when_spec_says_false() {
+        // Limitation: the IR's `explode: bool` collapses
+        // "spec set false" with "spec omitted explode entirely" into
+        // the same value. To match OpenAPI's documented `form` default
+        // (explode=true), spall errs on the side of repetition. Specs
+        // that explicitly need comma-join under `form` are uncommon
+        // and would have to set `style: pipeDelimited` or
+        // `spaceDelimited` to get unambiguous comma-join.
+        let op = op_with_params(vec![make_param(
+            "ids",
+            ParameterLocation::Query,
+            "form",
+            false,
+        )]);
+        let prog = build_programmatic_args(&op, &json!({"ids": ["a", "b"]})).unwrap();
+        assert_eq!(prog.query_extras.len(), 2);
+    }
+
+    #[test]
+    fn array_query_with_pipe_delimited_style_comma_joins() {
+        // Non-form, non-exploded styles collapse to comma-join in v1.
+        let op = op_with_params(vec![make_param(
+            "ids",
+            ParameterLocation::Query,
+            "pipeDelimited",
+            false,
+        )]);
+        let prog = build_programmatic_args(&op, &json!({"ids": [1, 2, 3]})).unwrap();
+        assert!(prog.query_extras.is_empty());
+        assert_eq!(prog.query.get("ids").map(String::as_str), Some("1,2,3"));
+    }
+
+    #[test]
+    fn array_path_param_comma_joins() {
+        let op = op_with_params(vec![make_param(
+            "ids",
+            ParameterLocation::Path,
+            "simple",
+            false,
+        )]);
+        let prog = build_programmatic_args(&op, &json!({"ids": [1, 2, 3]})).unwrap();
+        assert_eq!(prog.path.get("ids").map(String::as_str), Some("1,2,3"));
+    }
+
+    #[test]
+    fn array_header_comma_joins_per_rfc_9110() {
+        let op = op_with_params(vec![make_param(
+            "X-Tags",
+            ParameterLocation::Header,
+            "simple",
+            false,
+        )]);
+        let prog = build_programmatic_args(&op, &json!({"X-Tags": ["a", "b", "c"]})).unwrap();
+        assert_eq!(prog.header.get("X-Tags").map(String::as_str), Some("a,b,c"));
     }
 
     fn bare_schema() -> ResolvedSchema {

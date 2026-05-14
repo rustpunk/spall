@@ -65,8 +65,17 @@ pub struct OperationResult {
 pub struct ProgrammaticArgs {
     /// Path parameters keyed by the parameter `name` from the spec.
     pub path: BTreeMap<String, String>,
-    /// Query parameters keyed by name.
+    /// Query parameters keyed by name. One value per name; for
+    /// array-valued query params with `explode = true`, populate
+    /// [`Self::query_extras`] instead and reqwest will emit
+    /// `?ids=1&ids=2` per OpenAPI `style: form` semantics.
     pub query: BTreeMap<String, String>,
+    /// Additional query pairs appended *after* [`Self::query`]. Used by
+    /// the MCP dispatcher to expand array arguments per OpenAPI
+    /// `style: form, explode: true` (the default for query parameters in
+    /// OpenAPI 3.x). Same key may appear multiple times — reqwest's
+    /// query serializer preserves the repetition.
+    pub query_extras: Vec<(String, String)>,
     /// Headers keyed by canonical-case name. Applied **after** auth
     /// resolution, so callers may override an `Authorization` header set
     /// by spall's auth chain.
@@ -102,6 +111,7 @@ impl Default for ProgrammaticArgs {
         Self {
             path: BTreeMap::new(),
             query: BTreeMap::new(),
+            query_extras: Vec::new(),
             header: BTreeMap::new(),
             cookie: BTreeMap::new(),
             body: None,
@@ -219,12 +229,15 @@ pub(crate) async fn prepare_and_send(
         }
     }
 
-    // Step 3: query pairs.
+    // Step 3: query pairs. The dedup'd map yields one pair per key;
+    // `query_extras` adds any further pairs (repeated keys allowed) for
+    // OpenAPI `style: form, explode: true` array serialization.
     let mut query_pairs: Vec<(String, String)> = args
         .query
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    query_pairs.extend(args.query_extras.iter().cloned());
 
     // Step 4: auth resolution + injection.
     let resolved_auth =

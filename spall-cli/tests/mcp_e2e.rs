@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{MockServer, ResponseTemplate};
 
 fn bin_path() -> String {
@@ -279,6 +279,92 @@ async fn http_404_surfaces_as_tool_is_error() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let body: Value = serde_json::from_str(text).expect("parse body");
     assert_eq!(body["error"], "not found");
+
+    let _ = shutdown(server);
+}
+
+#[tokio::test]
+async fn array_query_param_explodes_into_repeated_pairs() {
+    // Regression guard for issue #10 (audit smell #1): when an MCP tool
+    // is called with an array argument that maps to a query parameter,
+    // the dispatcher must honor OpenAPI's form+explode default and send
+    // `?ids=1&ids=2&ids=3`, not `?ids=%5B1%2C2%2C3%5D`.
+    let mock = MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/search"))
+        .and(query_param("ids", "1"))
+        // wiremock's query_param matches any occurrence; combined with
+        // expect(1) below we assert the request fires exactly once
+        // with all the right values via expect_count + a second
+        // matcher block.
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"hits": 3})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("search.json");
+    let spec = format!(
+        r#"{{
+  "openapi": "3.0.0",
+  "info": {{ "title": "Search", "version": "1.0.0" }},
+  "servers": [{{ "url": "http://localhost:{port}" }}],
+  "paths": {{
+    "/search": {{
+      "get": {{
+        "operationId": "search",
+        "parameters": [{{
+          "name": "ids",
+          "in": "query",
+          "schema": {{ "type": "array", "items": {{ "type": "integer" }} }},
+          "style": "form",
+          "explode": true
+        }}],
+        "responses": {{ "200": {{ "description": "OK" }} }}
+      }}
+    }}
+  }}
+}}"#,
+        port = mock.address().port()
+    );
+    std::fs::write(&spec_path, spec).unwrap();
+    setup_api(&temp, "search", spec_path.to_str().unwrap());
+
+    let mut server = spawn(&temp, "search", &[]);
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+    }));
+    let _ = server.recv();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "search", "arguments": { "ids": [1, 2, 3] } }
+    }));
+    let resp = server.recv();
+    assert_eq!(resp["result"]["isError"], false);
+
+    // Inspect what wiremock actually saw — the strongest assertion:
+    // all three values arrived as repeated `ids=N` pairs, not as a
+    // single literal-JSON value.
+    let received = mock.received_requests().await.expect("requests");
+    assert_eq!(received.len(), 1);
+    let url = &received[0].url;
+    let raw_query = url.query().unwrap_or("");
+    assert!(
+        raw_query.contains("ids=1") && raw_query.contains("ids=2") && raw_query.contains("ids=3"),
+        "expected repeated ids pairs, got: {}",
+        raw_query
+    );
+    assert!(
+        !raw_query.contains("%5B"),
+        "raw JSON literal leaked into query string: {}",
+        raw_query
+    );
 
     let _ = shutdown(server);
 }
