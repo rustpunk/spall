@@ -1,6 +1,7 @@
 //! spall-cli: Binary entry point. Two-phase clap parse and dispatch.
 
 mod arazzo_runner;
+mod arazzo_runner_actions;
 mod auth;
 mod chain;
 mod commands;

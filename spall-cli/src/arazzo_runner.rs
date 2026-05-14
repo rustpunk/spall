@@ -20,17 +20,21 @@
 use indexmap::IndexMap;
 use spall_config::registry::{ApiEntry, ApiRegistry};
 use spall_core::arazzo::{
-    eval, eval_condition, parse_condition, parse_expression, ArazzoDocument, Context, ExprError,
-    Parameter, ResponseSnapshot, SourceDescription, Step, StepResult, Workflow,
+    eval, eval_condition, parse_condition, parse_expression, ActionOrRef, ArazzoDocument,
+    Components, Context, ExprError, FailureActionOrRef, Parameter, ResponseSnapshot,
+    SourceDescription, Step, StepResult, Workflow,
 };
 use spall_core::ir::{ParameterLocation, ResolvedOperation, ResolvedSpec};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use thiserror::Error;
 
+use crate::arazzo_runner_actions::{
+    dispatch_failure_chain, dispatch_success_chain, resolve_failure_chain, resolve_success_chain,
+    ActionDispatchError, StepFlow,
+};
 use crate::execute::{
-    build_url_with_path_args, execute_operation_programmatic, raise_for_status, OperationResult,
-    ProgrammaticArgs,
+    build_url_with_path_args, execute_operation_programmatic, OperationResult, ProgrammaticArgs,
 };
 use crate::fetch::load_raw;
 use crate::http::HttpConfig;
@@ -95,6 +99,27 @@ pub enum ArazzoRunError {
 
     #[error("transport error: {0}")]
     Transport(String),
+
+    #[error("step '{step}' action dispatch: {source}")]
+    ActionDispatch {
+        step: String,
+        #[source]
+        source: ActionDispatchError,
+    },
+
+    #[error("step '{step}' goto target '{target}' does not exist in workflow '{workflow}'")]
+    GotoTargetMissing {
+        step: String,
+        target: String,
+        workflow: String,
+    },
+
+    #[error("step '{step}' retry limit ({limit}) exhausted; last error: {last}")]
+    RetryExhausted {
+        step: String,
+        limit: u32,
+        last: String,
+    },
 }
 
 /// Diagnostic emitted by `validate_doc` for v2-only or otherwise
@@ -380,9 +405,66 @@ pub async fn run_workflow(
 
     let mut step_outcomes: Vec<StepOutcome> = Vec::new();
 
-    for step in &wf.steps {
-        let outcome = run_step(step, sources, &mut ctx, &opts, &http_config).await?;
-        step_outcomes.push(outcome);
+    // step_id → index lookup for `goto` targets.
+    let step_index: HashMap<String, usize> = wf
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.step_id.clone(), i))
+        .collect();
+
+    let mut idx: usize = 0;
+    while idx < wf.steps.len() {
+        let step = &wf.steps[idx];
+        let flow = run_step_with_actions(
+            step,
+            wf,
+            doc.components.as_ref(),
+            sources,
+            &mut ctx,
+            &opts,
+            &http_config,
+            &mut step_outcomes,
+        )
+        .await?;
+        match flow {
+            StepFlow::Continue => idx += 1,
+            StepFlow::Goto { step_id } => {
+                idx = *step_index.get(&step_id).ok_or_else(|| {
+                    ArazzoRunError::GotoTargetMissing {
+                        step: step.step_id.clone(),
+                        target: step_id.clone(),
+                        workflow: wf.workflow_id.clone(),
+                    }
+                })?;
+            }
+            StepFlow::End { success } => {
+                if opts.verbose {
+                    eprintln!(
+                        "spall: workflow '{}' ended via {}Action at step '{}'",
+                        wf.workflow_id,
+                        if success { "success" } else { "failure" },
+                        step.step_id,
+                    );
+                }
+                // `type:end` is the "user has explicitly handled this
+                // outcome" knob — exit zero either way and emit
+                // workflow outputs (which may be partial). If the user
+                // wants exit-non-zero on a known-OK 4xx, they should
+                // omit the failureAction and let the bail propagate.
+                break;
+            }
+            // Retry returned here means the dispatcher requested a
+            // retry but no execution occurred. The retry loop is
+            // internal to `run_step_with_actions`; reaching this arm
+            // would be a logic bug.
+            StepFlow::Retry { .. } => {
+                return Err(ArazzoRunError::Transport(format!(
+                    "internal: step '{}' surfaced Retry to the outer loop",
+                    step.step_id
+                )));
+            }
+        }
     }
 
     // Workflow-level outputs.
@@ -537,6 +619,151 @@ fn find_source_key<'a>(sources: &'a LoadedSources, name: &'a str) -> &'a str {
         .unwrap_or(name)
 }
 
+/// Wrap [`run_step`] with the action-chain machinery from Arazzo §4.6.
+///
+/// On step success: record the outcome and dispatch `step.onSuccess`
+/// (or `workflow.successActions` when step-level is empty).
+///
+/// On a recoverable step failure (HTTP 4xx/5xx or successCriteria
+/// fail): dispatch `step.onFailure` (or `workflow.failureActions`).
+/// If the chain returns `Retry`, sleep + re-run the same step until
+/// the retry limit is reached. If no action in the chain matches
+/// (`Continue`), bubble the underlying step error up.
+#[allow(clippy::too_many_arguments)]
+async fn run_step_with_actions(
+    step: &Step,
+    workflow: &Workflow,
+    components: Option<&Components>,
+    sources: &LoadedSources,
+    ctx: &mut Context,
+    opts: &RunOptions,
+    http_config: &HttpConfig,
+    step_outcomes: &mut Vec<StepOutcome>,
+) -> Result<StepFlow, ArazzoRunError> {
+    let success_chain = effective_success_chain(step, workflow);
+    let failure_chain = effective_failure_chain(step, workflow);
+    let success_actions = resolve_success_chain(success_chain, components)
+        .map_err(|e| ArazzoRunError::ActionDispatch {
+            step: step.step_id.clone(),
+            source: e,
+        })?;
+    let failure_actions = resolve_failure_chain(failure_chain, components)
+        .map_err(|e| ArazzoRunError::ActionDispatch {
+            step: step.step_id.clone(),
+            source: e,
+        })?;
+
+    let mut attempt: u32 = 0;
+    loop {
+        match run_step(step, sources, ctx, opts, http_config).await {
+            Ok(outcome) => {
+                step_outcomes.push(outcome);
+                return dispatch_success_chain(&success_actions, ctx).map_err(|e| {
+                    ArazzoRunError::ActionDispatch {
+                        step: step.step_id.clone(),
+                        source: e,
+                    }
+                });
+            }
+            Err(err) if is_recoverable_step_error(&err) => {
+                let flow = dispatch_failure_chain(&failure_actions, ctx).map_err(|e| {
+                    ArazzoRunError::ActionDispatch {
+                        step: step.step_id.clone(),
+                        source: e,
+                    }
+                })?;
+                match flow {
+                    StepFlow::Continue => return Err(err),
+                    StepFlow::Goto { .. } | StepFlow::End { .. } => {
+                        // Record a synthetic outcome so workflow output
+                        // serialization can surface the failed step.
+                        step_outcomes.push(synthetic_failure_outcome(step, ctx));
+                        return Ok(flow);
+                    }
+                    StepFlow::Retry { after, limit } => {
+                        if attempt >= limit {
+                            return Err(ArazzoRunError::RetryExhausted {
+                                step: step.step_id.clone(),
+                                limit,
+                                last: err.to_string(),
+                            });
+                        }
+                        attempt += 1;
+                        if opts.verbose {
+                            eprintln!(
+                                "spall: step '{}' retry {}/{} after {:.3}s ({})",
+                                step.step_id,
+                                attempt,
+                                limit,
+                                after.as_secs_f64(),
+                                err,
+                            );
+                        }
+                        if !after.is_zero() {
+                            tokio::time::sleep(after).await;
+                        }
+                        // ctx.current_response stays populated from the
+                        // failed attempt; run_step overwrites it on
+                        // the next try.
+                        continue;
+                    }
+                }
+            }
+            Err(hard) => return Err(hard),
+        }
+    }
+}
+
+/// Pick the action chain that applies to a step's success path. When
+/// the step doesn't define `onSuccess` explicitly, the workflow-level
+/// `successActions` chain is used as the default (Arazzo §4.6).
+fn effective_success_chain<'a>(step: &'a Step, workflow: &'a Workflow) -> &'a [ActionOrRef] {
+    if !step.on_success.is_empty() {
+        &step.on_success
+    } else {
+        &workflow.success_actions
+    }
+}
+
+/// Pick the action chain that applies to a step's failure path.
+fn effective_failure_chain<'a>(
+    step: &'a Step,
+    workflow: &'a Workflow,
+) -> &'a [FailureActionOrRef] {
+    if !step.on_failure.is_empty() {
+        &step.on_failure
+    } else {
+        &workflow.failure_actions
+    }
+}
+
+/// True for errors that a `failureAction` chain is allowed to swallow.
+/// Transport / expression / dispatch errors always bubble up so a typo
+/// can't silently disappear via `type: end`.
+fn is_recoverable_step_error(err: &ArazzoRunError) -> bool {
+    matches!(
+        err,
+        ArazzoRunError::StepHttpError { .. } | ArazzoRunError::CriterionFailed { .. }
+    )
+}
+
+/// Outcome record for a step whose failure was absorbed by a
+/// failureAction (`goto` or `end`). The status field carries whatever
+/// the wire actually returned (or 0 when the failure was criteria-only).
+fn synthetic_failure_outcome(step: &Step, ctx: &Context) -> StepOutcome {
+    let status = ctx
+        .current_response
+        .as_ref()
+        .map(|s| s.status)
+        .unwrap_or(0);
+    StepOutcome {
+        step_id: step.step_id.clone(),
+        status,
+        outputs: BTreeMap::new(),
+        dry_run: false,
+    }
+}
+
 async fn run_step(
     step: &Step,
     sources: &LoadedSources,
@@ -622,19 +849,44 @@ async fn run_step(
         });
     }
 
-    // The programmatic path returns Ok for any HTTP status; we lift
-    // 4xx/5xx into Err here so the runner can attach the source-binding
-    // hint before bubbling up to the CLI.
+    // The programmatic path returns Ok for any HTTP status. Take the
+    // result + build the snapshot up front so `ctx.current_response`
+    // is populated even when we end up returning `StepHttpError` —
+    // on_failure dispatch needs to see `$response.statusCode` etc.
     let op_result = match execute_operation_programmatic(op, spec, entry, &args).await {
-        Ok(res) => match raise_for_status(res) {
-            Ok(ok) => ok,
-            Err(e) => return Err(step_http_error(step, source_name, sources, &e)),
-        },
+        Ok(res) => res,
         Err(e) => return Err(step_http_error(step, source_name, sources, &e)),
     };
 
     let snapshot = response_snapshot_from(&op_result);
     ctx.current_response = Some(snapshot.clone());
+
+    // 4xx / 5xx lifts into a step-failure error AFTER the snapshot is
+    // recorded. This is the spot where the v1 path used to call
+    // `raise_for_status`; inlining keeps the snapshot observable on
+    // failure for the on_failure dispatch.
+    let code = op_result.status.as_u16();
+    if op_result.status.is_client_error() || op_result.status.is_server_error() {
+        let synthetic = sources.synthetic.contains(source_name);
+        let hint = if (code == 401 || code == 403) && synthetic {
+            let source = sources
+                .entries
+                .get(source_name)
+                .map(|e| e.source.as_str())
+                .unwrap_or("<unknown>");
+            format!(
+                " — source '{}' is unbound; try: spall api add {} {} && spall auth login {}",
+                source_name, source_name, source, source_name
+            )
+        } else {
+            String::new()
+        };
+        return Err(ArazzoRunError::StepHttpError {
+            step: step.step_id.clone(),
+            status: code,
+            hint,
+        });
+    }
 
     // successCriteria.
     for (idx, c) in step.success_criteria.iter().enumerate() {

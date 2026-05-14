@@ -215,16 +215,133 @@ $ spall arazzo run ./onboard.arazzo.yaml --input email=a@b.test --dry-run
             body: {"email":"a@b.test"}
 ```
 
+## Failure actions
+
+Step and workflow-level action chains let a workflow recover from
+HTTP failures and unmet `successCriteria` per Arazzo §4.6 / §4.7.
+Three action types are supported:
+
+### `type: end`
+
+Stops the workflow. Treated as user-handled — the CLI exits zero
+regardless of which side (success or failure) triggered the end.
+Use this for "this 4xx is fine, stop gracefully":
+
+```yaml
+steps:
+  - stepId: probe
+    operationId: getProbeStatus
+    onFailure:
+      - name: swallow-404
+        type: end
+        criteria:
+          - condition: $response.statusCode == 404
+```
+
+If no `criteria` are listed, the action fires unconditionally.
+
+### `type: retry`
+
+Sleeps for `retryAfter` seconds then re-runs the current step, up to
+`retryLimit` times. When the limit is reached, the workflow exits
+non-zero with the last error attached:
+
+```yaml
+steps:
+  - stepId: callFlakyAPI
+    operationId: getThing
+    onFailure:
+      - name: try-again
+        type: retry
+        retryAfter: 0.5
+        retryLimit: 3
+```
+
+`retryLimit` defaults to `1` if omitted; `retryAfter` defaults to `0`.
+The retry counter does NOT compose with `--spall-retry` (which is the
+HTTP-transport retry layer); they're orthogonal.
+
+### `type: goto`
+
+Jumps to the named step. `workflowId` (cross-workflow goto) is a v2
+feature and rejects at runtime if used:
+
+```yaml
+steps:
+  - stepId: probe
+    operationId: probe
+    onFailure:
+      - name: recover
+        type: goto
+        stepId: cleanupStep
+  - stepId: shouldBeSkipped
+    operationId: probe
+  - stepId: cleanupStep
+    operationId: cleanup
+```
+
+### Workflow-level fallback
+
+`workflow.successActions` and `workflow.failureActions` apply to every
+step that doesn't define its own `onSuccess` / `onFailure` chain:
+
+```yaml
+workflows:
+  - workflowId: paranoid
+    failureActions:
+      - name: bail
+        type: end
+    steps:
+      - stepId: a
+        operationId: a-op
+      - stepId: b
+        operationId: b-op
+        onFailure: []  # not allowed — non-empty step-level wins
+```
+
+### Reusable named actions
+
+Heavy uses can centralize actions under `components`:
+
+```yaml
+components:
+  failureActions:
+    bail:
+      name: bail
+      type: end
+workflows:
+  - workflowId: x
+    steps:
+      - stepId: probe
+        operationId: probe
+        onFailure:
+          - reference: $components.failureActions.bail
+```
+
+Reference paths must be exactly
+`$components.successActions.<name>` or
+`$components.failureActions.<name>` — typos error at workflow-start
+time so a malformed reference doesn't silently fall through.
+
+### Criterion `type`
+
+Action `criteria` reuse the same condition mini-language as
+`successCriteria`. v1 supports only `type: simple` (the default);
+`jsonpath` and `regex` are deferred to issue #5 and error hard at
+dispatch time so partial implementations don't sneak in via fixtures.
+
 ## v1 limitations
 
 | Feature              | v1                  | Tracking         |
 |----------------------|---------------------|------------------|
-| `failureActions`     | Not honored         | issue #5         |
-| `onSuccess` / `onFailure` actions | Not honored | issue #5         |
+| `failureActions` / `successActions` (workflow + step level) | **Implemented** (this release) | — |
+| `onSuccess` / `onFailure` actions | **Implemented** (this release) | — |
+| `$components.successActions` / `$components.failureActions` refs | **Implemented** (this release) | — |
 | `workflowId` (nested) | Errors at runtime  | issue #5         |
 | `replay` action       | Not implemented    | issue #5         |
 | `operationPath`       | Errors at runtime  | issue #5         |
 | `successCriteria.type: regex` / `jsonpath` | Skipped with a warning | issue #5 |
+| Action `criteria.type: regex` / `jsonpath` | Errors at dispatch | issue #5 |
 | `--spall-bind <source>=<api>` CLI override | Use `x-spall-api` extension | issue #5 |
 | Inputs JSON Schema validation | None — values are opaque strings | issue #5 |
 
