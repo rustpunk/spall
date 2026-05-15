@@ -742,3 +742,93 @@ async fn validate_subcommand_reports_clean_v1_doc() {
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(stderr.contains("parses cleanly"), "stderr: {}", stderr);
 }
+
+/// Issue #16: pin the `[dry-run] resolved actions:` stderr shape so a
+/// clippy-clean rename of `Action.{kind,name,retry_after,retry_limit}`
+/// can't silently mangle the user-visible preview. Two fixtures cover
+/// the two action-shape families: `with-retry.arazzo.yaml` for the
+/// retry-with-budget onFailure shape, and `with-component-actions
+/// .arazzo.yaml` for the type=end onSuccess + onFailure shape.
+#[tokio::test]
+async fn dry_run_preview_renders_action_chain_shape_for_both_chains() {
+    fn copy_fixture(temp: &TempDir, fixture: &str) -> std::path::PathBuf {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("e2e")
+            .join("fixtures")
+            .join("arazzo");
+        let arazzo_path = temp.path().join(fixture);
+        std::fs::copy(src.join(fixture), &arazzo_path)
+            .unwrap_or_else(|e| panic!("copy {} fixture: {}", fixture, e));
+        std::fs::copy(
+            src.join("simple-openapi.json"),
+            temp.path().join("simple-openapi.json"),
+        )
+        .expect("copy simple-openapi.json next to fixture");
+        arazzo_path
+    }
+
+    fn run_dry(temp: &TempDir, arazzo_path: &std::path::Path) -> String {
+        let cfg_dir = temp.path().join("cfg");
+        let cache_dir = temp.path().join("cache");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let output = Command::new(bin_path())
+            .env("XDG_CONFIG_HOME", &cfg_dir)
+            .env("XDG_CACHE_HOME", &cache_dir)
+            .args([
+                "arazzo",
+                "run",
+                "--dry-run",
+                arazzo_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn spall");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    // Retry shape: onFailure carries name, type=retry, retryAfter, retryLimit.
+    let temp_retry = TempDir::new().unwrap();
+    let path = copy_fixture(&temp_retry, "with-retry.arazzo.yaml");
+    let stderr = run_dry(&temp_retry, &path);
+    assert!(
+        stderr.contains("[dry-run] step 'probeStep' resolved actions:"),
+        "with-retry: missing sentinel; stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("onFailure: try-again (type=retry, retryAfter=0s, retryLimit=2)"),
+        "with-retry: retry-shaped onFailure line missing; stderr:\n{}",
+        stderr
+    );
+    // No criteria are set in this fixture; `criteria=` must NOT appear
+    // on the preview line.
+    assert!(
+        !stderr
+            .lines()
+            .any(|l| l.contains("onFailure:") && l.contains("criteria=")),
+        "with-retry: criteria= should be absent on onFailure line; stderr:\n{}",
+        stderr
+    );
+
+    // Component-references shape: onSuccess + onFailure, both type=end.
+    let temp_comp = TempDir::new().unwrap();
+    let path = copy_fixture(&temp_comp, "with-component-actions.arazzo.yaml");
+    let stderr = run_dry(&temp_comp, &path);
+    assert!(
+        stderr.contains("[dry-run] step 'probeStep' resolved actions:"),
+        "with-component-actions: missing sentinel; stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("onSuccess: keepGoing (type=end)"),
+        "with-component-actions: onSuccess line missing; stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("onFailure: bail (type=end)"),
+        "with-component-actions: onFailure line missing; stderr:\n{}",
+        stderr
+    );
+}
