@@ -229,7 +229,7 @@ fn truncate_deterministically(
     let mut entries = filtered;
     entries.sort_by(|a, b| first_tag(a.1).cmp(first_tag(b.1)).then_with(|| a.0.cmp(&b.0)));
     entries.truncate(cap);
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by_key(|a| a.0);
     entries
 }
 
