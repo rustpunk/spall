@@ -243,6 +243,33 @@ async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, bo
     } else {
         state.allowed_origins.contains(origin)
     };
+
+    if state.verbose {
+        let origin_str = if origin.is_empty() {
+            "<absent>".to_string()
+        } else {
+            origin.to_string()
+        };
+        let outcome = if state.allowed_origins.is_empty() {
+            if allowed {
+                "<any>".to_string()
+            } else {
+                "rejected:remote-origin-with-empty-allowlist".to_string()
+            }
+        } else if allowed {
+            origin.to_string()
+        } else {
+            "rejected:not-in-allowlist".to_string()
+        };
+        eprintln!(
+            "{} kind=http-request origin={} allowlist={} headers={}",
+            super::verbose::SENTINEL,
+            super::verbose::quote_if_needed(&origin_str),
+            super::verbose::quote_if_needed(&outcome),
+            super::verbose::format_headers(&headers),
+        );
+    }
+
     if !allowed {
         return (
             StatusCode::FORBIDDEN,

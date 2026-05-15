@@ -715,7 +715,6 @@ async fn handle_tools_call(
     registry: &IndexMap<String, ToolEntry>,
     verbose: bool,
 ) -> Value {
-    let _ = verbose; // Wired in commit 2.
     let name = match params.get("name").and_then(Value::as_str) {
         Some(s) => s,
         None => return tool_error("missing 'name' in tools/call params"),
@@ -736,7 +735,32 @@ async fn handle_tools_call(
         Err(e) => return tool_error(&e),
     };
 
-    let resolved = match profiles.resolve(tool.auth_profile.as_deref()).await {
+    let resolve_result = profiles.resolve(tool.auth_profile.as_deref()).await;
+    if verbose {
+        let (profile_field, status_field) = match (&tool.auth_profile, &resolve_result) {
+            (None, _) => ("<default>".to_string(), None),
+            (Some(name), Ok(_)) => (name.clone(), None),
+            (Some(_), Err(ResolveErr::NotValidated { name })) => {
+                (name.clone(), Some("resolve-not-validated"))
+            }
+            (Some(_), Err(ResolveErr::RegistryMiss { name })) => {
+                (name.clone(), Some("resolve-registry-miss"))
+            }
+        };
+        let status_suffix = status_field
+            .map(|s| format!(" status={}", s))
+            .unwrap_or_default();
+        eprintln!(
+            "{} kind=tools/call tool={} profile={} method={} url={}{}",
+            verbose::SENTINEL,
+            name,
+            profile_field,
+            op.method,
+            op.path_template,
+            status_suffix,
+        );
+    }
+    let resolved = match resolve_result {
         Ok(r) => r,
         Err(e) => return tool_error(&format!("{}", e)),
     };
