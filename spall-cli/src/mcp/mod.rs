@@ -100,6 +100,7 @@ pub struct AuthProfiles {
 /// never approved. `RegistryMiss` means the registry rejected the
 /// resolution at first-call time (would require a registry mutation
 /// in flight; no current code path does this).
+#[derive(Debug)]
 pub(crate) enum ResolveErr {
     NotValidated { name: String },
     RegistryMiss { name: String },
@@ -1368,5 +1369,114 @@ mod tests {
             properties: IndexMap::new(),
             items: None,
         }
+    }
+
+    fn auth_profile_entry(name: &str, profiles: &[&str]) -> ApiEntry {
+        use spall_config::registry::ProfileConfig;
+        let mut map = std::collections::HashMap::new();
+        for p in profiles {
+            map.insert(
+                (*p).to_string(),
+                ProfileConfig {
+                    base_url: Some(format!("https://{}-{}.example", name, p)),
+                    headers: Vec::new(),
+                    auth: None,
+                    proxy: None,
+                },
+            );
+        }
+        ApiEntry {
+            name: name.to_string(),
+            source: format!("/tmp/{}.json", name),
+            config_path: None,
+            base_url: Some("https://default.example".to_string()),
+            default_headers: Vec::new(),
+            auth: None,
+            proxy: None,
+            profiles: map,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_default_returns_borrow_of_default_entry() {
+        let entry = auth_profile_entry("svc", &[]);
+        let registry = Arc::new(ApiRegistry::from_entries(
+            vec![entry.clone()],
+            spall_config::sources::GlobalDefaults::default(),
+        ));
+        let profiles = AuthProfiles::new(entry, HashSet::new(), registry, "svc".to_string());
+        let cow = profiles.resolve(None).await.expect("default resolves");
+        assert!(matches!(cow, Cow::Borrowed(_)));
+        assert_eq!(cow.name, "svc");
+        assert_eq!(cow.base_url.as_deref(), Some("https://default.example"));
+    }
+
+    #[tokio::test]
+    async fn resolve_concurrent_two_spawns_yield_same_profile_entry() {
+        let entry = auth_profile_entry("svc", &["admin"]);
+        let registry = Arc::new(ApiRegistry::from_entries(
+            vec![entry.clone()],
+            spall_config::sources::GlobalDefaults::default(),
+        ));
+        let mut validated = HashSet::new();
+        validated.insert("admin".to_string());
+        let profiles = Arc::new(AuthProfiles::new(
+            entry,
+            validated,
+            registry,
+            "svc".to_string(),
+        ));
+
+        let p1 = Arc::clone(&profiles);
+        let p2 = Arc::clone(&profiles);
+        let h1 = tokio::spawn(async move {
+            p1.resolve(Some("admin")).await.map(Cow::into_owned)
+        });
+        let h2 = tokio::spawn(async move {
+            p2.resolve(Some("admin")).await.map(Cow::into_owned)
+        });
+        let r1 = h1.await.expect("task 1").expect("resolve 1");
+        let r2 = h2.await.expect("task 2").expect("resolve 2");
+        assert_eq!(r1.base_url, r2.base_url);
+        assert_eq!(r1.base_url.as_deref(), Some("https://svc-admin.example"));
+    }
+
+    #[tokio::test]
+    async fn resolve_not_validated_surfaces_internal_attribution() {
+        let entry = auth_profile_entry("svc", &["admin"]);
+        let registry = Arc::new(ApiRegistry::from_entries(
+            vec![entry.clone()],
+            spall_config::sources::GlobalDefaults::default(),
+        ));
+        let profiles = AuthProfiles::new(entry, HashSet::new(), registry, "svc".to_string());
+        let err = profiles
+            .resolve(Some("ghost"))
+            .await
+            .expect_err("ghost is not validated");
+        assert_eq!(
+            format!("{}", err),
+            "internal: auth profile 'ghost' not validated at startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_registry_miss_surfaces_not_found_attribution() {
+        let entry = auth_profile_entry("svc", &["admin"]);
+        let empty_registry = Arc::new(ApiRegistry::from_entries(
+            Vec::new(),
+            spall_config::sources::GlobalDefaults::default(),
+        ));
+        let mut validated = HashSet::new();
+        validated.insert("admin".to_string());
+        let profiles =
+            AuthProfiles::new(entry, validated, empty_registry, "svc".to_string());
+        let err = profiles
+            .resolve(Some("admin"))
+            .await
+            .expect_err("registry has no api");
+        assert_eq!(
+            format!("{}", err),
+            "auth profile 'admin' resolution failed: not found in registry"
+        );
     }
 }

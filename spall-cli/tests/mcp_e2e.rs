@@ -1008,6 +1008,100 @@ token = "admin-secret"
     let _ = shutdown(server);
 }
 
+/// Issue #19: profiles referenced by `--spall-auth-tool` are resolved
+/// lazily on first dispatch. A profile that's validated at startup but
+/// never invoked must have zero wire footprint — wiremock's
+/// `.expect(0)` on the un-invoked profile's endpoint enforces this at
+/// the contract level rather than coupling the test to internal cache
+/// shape.
+#[tokio::test]
+async fn per_tool_auth_lazy_only_resolves_invoked_profile() {
+    let mock = MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/admin"))
+        .and(header("Authorization", "Bearer admin-tkn"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": "admin"})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/readonly"))
+        .and(header("Authorization", "Bearer readonly-tkn"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": "readonly"})))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("authed.json");
+    let spec = format!(
+        r#"{{
+  "openapi": "3.0.0",
+  "info": {{ "title": "Authed", "version": "1.0.0" }},
+  "servers": [{{ "url": "http://localhost:{port}" }}],
+  "paths": {{
+    "/admin":    {{ "get": {{ "operationId": "admin-op",    "responses": {{ "200": {{ "description": "OK" }} }} }} }},
+    "/readonly": {{ "get": {{ "operationId": "readonly-op", "responses": {{ "200": {{ "description": "OK" }} }} }} }}
+  }}
+}}"#,
+        port = mock.address().port()
+    );
+    std::fs::write(&spec_path, spec).unwrap();
+
+    let apis_dir = temp.path().join("spall").join("apis");
+    std::fs::create_dir_all(&apis_dir).unwrap();
+    let api_toml = format!(
+        r#"source = "{}"
+
+[profile.admin]
+[profile.admin.auth]
+kind = "bearer"
+token = "admin-tkn"
+
+[profile.readonly]
+[profile.readonly.auth]
+kind = "bearer"
+token = "readonly-tkn"
+"#,
+        spec_path.to_str().unwrap()
+    );
+    std::fs::write(apis_dir.join("authed.toml"), api_toml).unwrap();
+
+    let mut server = spawn(
+        &temp,
+        "authed",
+        &[
+            "--spall-auth-tool",
+            "admin-op=admin",
+            "--spall-auth-tool",
+            "readonly-op=readonly",
+        ],
+    );
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+    }));
+    let _ = server.recv();
+
+    // Invoke admin-op exactly once; never invoke readonly-op. The
+    // wiremock `.expect(0)` on /readonly verifies on drop that the
+    // un-invoked profile was never touched.
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "admin-op", "arguments": {} }
+    }));
+    let resp = server.recv();
+    assert_eq!(resp["result"]["isError"], false, "admin-op: {:?}", resp);
+
+    let _ = shutdown(server);
+    // `mock` drops at end of test scope → wiremock verifies expectations.
+}
+
 #[tokio::test]
 async fn unknown_tool_returns_is_error() {
     let mock = MockServer::start().await;
