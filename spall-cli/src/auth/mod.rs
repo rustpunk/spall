@@ -58,6 +58,8 @@ pub async fn resolve(
     if kind != AuthKind::OAuth2 {
         if let Some(url) = &cfg.token_url {
             let secret = hasp::get(url).map_err(|e| map_hasp_error(api_name, e))?;
+            // SECURITY: header-construction boundary; do not relocate `expose_secret`
+            // past a logging or serialization site.
             return Ok(resolve_from_config_and_token(
                 cfg,
                 kind,
@@ -155,6 +157,8 @@ pub fn apply(
             );
         }
         ResolvedAuth::Basic { username, password } => {
+            // SECURITY: header-construction boundary; do not relocate `expose_secret`
+            // past a logging or serialization site.
             let creds = format!("{}:{}", username, password.expose_secret());
             basic::apply(&SecretString::new(creds.into()), headers);
         }
