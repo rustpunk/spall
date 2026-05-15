@@ -5,8 +5,9 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use miette::Result;
 use spall_config::registry::{ApiEntry, ApiRegistry};
 use spall_core::value::SpallValue;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::SpallCliError;
 
@@ -202,15 +203,17 @@ fn parse_auth_tool_flags(
     Ok(out)
 }
 
-/// Pre-resolve every profile referenced by `--spall-auth-tool` or by
-/// an `x-mcp-auth-profile` extension into an `ApiEntry`. Profiles that
-/// don't exist in the API's `[profile.*]` block surface ALL unknown
-/// names at once with their call-site attribution (which flag /
-/// extension on which operation introduced them), sorted for
-/// deterministic output. The `[profile.*]` membership is the canonical
-/// validation here — we skip the secondary `registry.resolve_profile`
-/// existence check that would have produced a redundant "internal:"
-/// error.
+/// Validate every profile referenced by `--spall-auth-tool` or by an
+/// `x-mcp-auth-profile` extension. Profiles that don't exist in the
+/// API's `[profile.*]` block surface ALL unknown names at once with
+/// their call-site attribution (which flag / extension on which
+/// operation introduced them), sorted for deterministic output. The
+/// `[profile.*]` membership is the canonical validation here.
+///
+/// Per #19: profile resolution is deferred to first `tools/call`
+/// dispatch via [`crate::mcp::AuthProfiles::resolve`]. This function
+/// only builds the validated-name set + the registry/api_name needed
+/// for the lazy resolver; no `ApiEntry` overlay is materialized here.
 fn resolve_auth_profiles(
     api_name: &str,
     registry: &ApiRegistry,
@@ -239,19 +242,13 @@ fn resolve_auth_profiles(
     }
 
     let mut unknown: Vec<(String, Vec<String>)> = Vec::new();
-    let mut by_profile: HashMap<String, ApiEntry> = HashMap::new();
+    let mut validated: HashSet<String> = HashSet::new();
     for (profile, sources) in needed {
         if !default_entry.profiles.contains_key(&profile) {
             unknown.push((profile, sources));
             continue;
         }
-        // Already checked `profiles.contains_key`, so `resolve_profile`
-        // is guaranteed to find the entry — the registry walks the same
-        // map. unwrap is safe here.
-        let entry = registry
-            .resolve_profile(api_name, Some(&profile))
-            .expect("profile present in default_entry.profiles must resolve");
-        by_profile.insert(profile, entry);
+        validated.insert(profile);
     }
 
     if !unknown.is_empty() {
@@ -269,8 +266,10 @@ fn resolve_auth_profiles(
         .into());
     }
 
-    Ok(crate::mcp::AuthProfiles {
-        default: default_entry.clone(),
-        by_profile,
-    })
+    Ok(crate::mcp::AuthProfiles::new(
+        default_entry.clone(),
+        validated,
+        Arc::new(registry.clone()),
+        api_name.to_string(),
+    ))
 }

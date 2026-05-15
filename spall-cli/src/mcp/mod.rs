@@ -15,10 +15,12 @@ pub mod schema;
 
 use indexmap::IndexMap;
 use serde_json::{json, Value};
-use spall_config::registry::ApiEntry;
+use spall_config::registry::{ApiEntry, ApiRegistry};
 use spall_core::ir::{HttpMethod, ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSpec};
 use spall_core::value::SpallValue;
-use std::collections::{BTreeMap, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::execute::{execute_operation_programmatic, ProgrammaticArgs};
@@ -67,14 +69,115 @@ pub(crate) struct ToolEntry {
     auth_profile: Option<String>,
 }
 
-/// Pre-resolved `ApiEntry`s keyed by profile name. The `default` field
-/// holds the entry with no profile overlay; `by_profile` holds entries
-/// for each profile referenced by `--spall-auth-tool` or
-/// `x-mcp-auth-profile`. Validating profile existence at startup keeps
-/// the per-call dispatch path infallible.
+/// `ApiEntry`s for MCP tool dispatch — default + lazily-resolved overlays.
+///
+/// `default` is the no-overlay entry (used by tools without a profile
+/// override) and is materialized at startup.
+///
+/// `validated` is the set of profile names referenced by
+/// `--spall-auth-tool` or `x-mcp-auth-profile` and confirmed to exist
+/// in the API's `[profile.*]` block — typos surface at startup, not at
+/// first dispatch.
+///
+/// `cache` is populated lazily: the first `tools/call` against a tool
+/// with `auth_profile = Some(name)` calls `registry.resolve_profile`
+/// once and inserts the overlaid entry; subsequent calls reuse it.
+/// Profiles in `validated` but never invoked stay un-resolved for the
+/// server's lifetime — see issue #19 for the OAuth-refresh
+/// blast-radius motivation.
 pub struct AuthProfiles {
     pub default: ApiEntry,
-    pub by_profile: HashMap<String, ApiEntry>,
+    pub validated: HashSet<String>,
+    /// Cache holds the overlaid `ApiEntry`; per-call token freshness
+    /// is handled downstream in `crate::auth::resolve`.
+    cache: tokio::sync::RwLock<HashMap<String, ApiEntry>>,
+    registry: Arc<ApiRegistry>,
+    api_name: String,
+}
+
+/// Failure modes for [`AuthProfiles::resolve`]. `NotValidated` is an
+/// internal-bug sentinel — the dispatcher asked for a profile startup
+/// never approved. `RegistryMiss` means the registry rejected the
+/// resolution at first-call time (would require a registry mutation
+/// in flight; no current code path does this).
+pub(crate) enum ResolveErr {
+    NotValidated { name: String },
+    RegistryMiss { name: String },
+}
+
+impl std::fmt::Display for ResolveErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveErr::NotValidated { name } => write!(
+                f,
+                "internal: auth profile '{}' not validated at startup",
+                name
+            ),
+            ResolveErr::RegistryMiss { name } => write!(
+                f,
+                "auth profile '{}' resolution failed: not found in registry",
+                name
+            ),
+        }
+    }
+}
+
+impl AuthProfiles {
+    /// Build from the validated set + the registry/api_name needed for
+    /// lazy resolution. The cache starts empty.
+    pub fn new(
+        default: ApiEntry,
+        validated: HashSet<String>,
+        registry: Arc<ApiRegistry>,
+        api_name: String,
+    ) -> Self {
+        Self {
+            default,
+            validated,
+            cache: tokio::sync::RwLock::new(HashMap::new()),
+            registry,
+            api_name,
+        }
+    }
+
+    /// Resolve the dispatch target for a tool call. `None` returns a
+    /// borrow of the default entry; `Some(name)` consults the lazy
+    /// cache and on miss calls `registry.resolve_profile` exactly once
+    /// (double-checked lock — two concurrent first-callers race past
+    /// the read lock; the loser sees the winner's insert under the
+    /// write lock). The owned variant carries a clone out of the cache
+    /// so the read lock can be released before the dispatcher runs.
+    pub(crate) async fn resolve(
+        &self,
+        profile: Option<&str>,
+    ) -> Result<Cow<'_, ApiEntry>, ResolveErr> {
+        let Some(name) = profile else {
+            return Ok(Cow::Borrowed(&self.default));
+        };
+        if !self.validated.contains(name) {
+            return Err(ResolveErr::NotValidated {
+                name: name.to_string(),
+            });
+        }
+        {
+            let r = self.cache.read().await;
+            if let Some(entry) = r.get(name) {
+                return Ok(Cow::Owned(entry.clone()));
+            }
+        }
+        let mut w = self.cache.write().await;
+        if let Some(entry) = w.get(name) {
+            return Ok(Cow::Owned(entry.clone()));
+        }
+        let entry = self
+            .registry
+            .resolve_profile(&self.api_name, Some(name))
+            .ok_or_else(|| ResolveErr::RegistryMiss {
+                name: name.to_string(),
+            })?;
+        w.insert(name.to_string(), entry.clone());
+        Ok(Cow::Owned(entry))
+    }
 }
 
 /// Build the tool registry from `spec` applying the include/exclude tag
@@ -582,10 +685,11 @@ async fn handle_tools_call(
         Err(e) => return tool_error(&e),
     };
 
-    let entry = match tool.auth_profile.as_deref() {
-        Some(name) => profiles.by_profile.get(name).unwrap_or(&profiles.default),
-        None => &profiles.default,
+    let resolved = match profiles.resolve(tool.auth_profile.as_deref()).await {
+        Ok(r) => r,
+        Err(e) => return tool_error(&format!("{}", e)),
     };
+    let entry: &ApiEntry = &resolved;
 
     match execute_operation_programmatic(op, spec, entry, &prog_args).await {
         Ok(res) => {
