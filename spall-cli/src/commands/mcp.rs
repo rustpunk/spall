@@ -128,14 +128,23 @@ pub async fn handle_mcp(
     let auth_tool = parse_auth_tool_flags(matches.get_many::<String>("auth_tool"))?;
     let profiles = resolve_auth_profiles(&api_name, registry, &spec, &default_entry, &auth_tool)?;
 
+    // Reuses the workspace-global `--spall-verbose` flag declared in
+    // `main.rs::cli()` (also used by the request-execution path for
+    // header logging). For the MCP subcommand, this means: emit
+    // redacted per-call diagnostics to stderr per docs/operations/
+    // mcp.md#debugging. Stdout JSON-RPC discipline stays intact.
+    let verbose = matches.get_flag("spall-verbose");
+
     let transport = matches
         .get_one::<String>("transport")
         .map(String::as_str)
         .unwrap_or("stdio");
     match transport {
-        "stdio" => crate::mcp::run(api_name, spec, profiles, include, exclude, max_tools, auth_tool)
-            .await
-            .map_err(Into::into),
+        "stdio" => crate::mcp::run(
+            api_name, spec, profiles, include, exclude, max_tools, auth_tool, verbose,
+        )
+        .await
+        .map_err(Into::into),
         "http" => {
             let port = matches
                 .get_one::<u16>("port")
@@ -162,6 +171,7 @@ pub async fn handle_mcp(
                 auth_tool,
                 listen_addr,
                 allowed_origins,
+                verbose,
             )
             .await
             .map_err(Into::into)

@@ -12,6 +12,7 @@
 
 pub mod http;
 pub mod schema;
+pub(crate) mod verbose;
 
 use indexmap::IndexMap;
 use serde_json::{json, Value};
@@ -543,6 +544,7 @@ pub(crate) fn prepare_server(
 /// Server entry point. Builds the tool registry then serves stdio
 /// JSON-RPC until EOF on stdin.
 #[must_use = "ignoring this Result swallows server-side errors"]
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     api_name: String,
     spec: ResolvedSpec,
@@ -551,10 +553,15 @@ pub async fn run(
     exclude: Vec<String>,
     max_tools: Option<usize>,
     auth_tool: HashMap<String, String>,
+    verbose: bool,
 ) -> Result<(), crate::SpallCliError> {
     let registry = prepare_server(
         &api_name, "stdio", &spec, &include, &exclude, max_tools, &auth_tool,
     );
+
+    if verbose {
+        emit_verbose_startup(&api_name, "stdio", &registry, &profiles);
+    }
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -564,7 +571,7 @@ pub async fn run(
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_line(&line, &spec, &profiles, &registry).await;
+        let response = handle_line(&line, &spec, &profiles, &registry, verbose).await;
         if let Some(resp) = response {
             let mut bytes = match serde_json::to_vec(&resp) {
                 Ok(b) => b,
@@ -587,6 +594,32 @@ pub async fn run(
     Ok(())
 }
 
+/// Emit the verbose startup line to stderr (post-banner). Shared by
+/// stdio (`run`) and HTTP (`run_http`) entry points; both need access
+/// to `profiles.validated` for the sorted profile-name list.
+pub(crate) fn emit_verbose_startup(
+    api_name: &str,
+    transport: &str,
+    registry: &IndexMap<String, ToolEntry>,
+    profiles: &AuthProfiles,
+) {
+    let mut profile_names: Vec<&str> = profiles.validated.iter().map(String::as_str).collect();
+    profile_names.sort();
+    let profiles_str = if profile_names.is_empty() {
+        "<none>".to_string()
+    } else {
+        profile_names.join(",")
+    };
+    eprintln!(
+        "{} kind=startup api={} transport={} tools={} profiles={}",
+        verbose::SENTINEL,
+        api_name,
+        transport,
+        registry.len(),
+        profiles_str,
+    );
+}
+
 /// Parse one JSON-RPC frame and dispatch. Returns `None` for
 /// notifications (no `id`) and for parse errors that aren't recoverable
 /// into a JSON-RPC error envelope (notifications can't error per spec).
@@ -595,6 +628,7 @@ pub(crate) async fn handle_line(
     spec: &ResolvedSpec,
     profiles: &AuthProfiles,
     registry: &IndexMap<String, ToolEntry>,
+    verbose: bool,
 ) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -615,7 +649,7 @@ pub(crate) async fn handle_line(
         "ping" => Some(rpc_result(id, json!({}))),
         "tools/list" => Some(rpc_result(id, handle_tools_list(spec, registry))),
         "tools/call" => {
-            let result = handle_tools_call(&params, spec, profiles, registry).await;
+            let result = handle_tools_call(&params, spec, profiles, registry, verbose).await;
             Some(rpc_result(id, result))
         }
         "" => {
@@ -679,7 +713,9 @@ async fn handle_tools_call(
     spec: &ResolvedSpec,
     profiles: &AuthProfiles,
     registry: &IndexMap<String, ToolEntry>,
+    verbose: bool,
 ) -> Value {
+    let _ = verbose; // Wired in commit 2.
     let name = match params.get("name").and_then(Value::as_str) {
         Some(s) => s,
         None => return tool_error("missing 'name' in tools/call params"),
