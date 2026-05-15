@@ -20,13 +20,9 @@ use spall_config::auth::{ApiKeyLocation, AuthConfig, AuthKind, ResolvedAuth};
 /// 7. OAuth2 interactive flow — session token only (stub)
 /// 8. Interactive password prompt for Basic
 ///
-/// SECURITY note (per #13): "Credentials always wrapped in
-/// `SecretString`" is enforced from one statement past every ingress —
-/// clap delivers `--spall-auth` as `String`, `std::env::var` returns
-/// `String`, and inline-TOML wraps via `deserialize_secret_string` on
-/// read. Each plaintext widow at the FFI/OS boundary is closed within
-/// the same statement that crosses it; there is no path on which raw
-/// credential strings persist past one assignment.
+/// SECURITY note (per #13): credential ingresses (clap arg, env var,
+/// TOML field) wrap into `SecretString` within the same statement that
+/// crosses the FFI/OS boundary; see `deserialize_secret_string`.
 pub async fn resolve(
     api_name: &str,
     auth_config: Option<&AuthConfig>,
@@ -48,8 +44,7 @@ pub async fn resolve(
         eprintln!(
             "Warning: inline auth token in config is insecure. Use an env var or keyring instead."
         );
-        // SECURITY: header-construction boundary; do not relocate `expose_secret`
-        // past a logging or serialization site.
+        // SECURITY: header-construction boundary.
         return Ok(resolve_from_config_and_token(
             cfg,
             kind,
@@ -66,8 +61,7 @@ pub async fn resolve(
     if kind != AuthKind::OAuth2 {
         if let Some(url) = &cfg.token_url {
             let secret = hasp::get(url).map_err(|e| map_hasp_error(api_name, e))?;
-            // SECURITY: header-construction boundary; do not relocate `expose_secret`
-            // past a logging or serialization site.
+            // SECURITY: header-construction boundary.
             return Ok(resolve_from_config_and_token(
                 cfg,
                 kind,
@@ -165,8 +159,7 @@ pub fn apply(
             );
         }
         ResolvedAuth::Basic { username, password } => {
-            // SECURITY: header-construction boundary; do not relocate `expose_secret`
-            // past a logging or serialization site.
+            // SECURITY: header-construction boundary.
             let creds = format!("{}:{}", username, password.expose_secret());
             basic::apply(&SecretString::new(creds.into()), headers);
         }

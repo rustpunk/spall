@@ -11,32 +11,27 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use spall_config::auth::AuthConfig;
+use spall_config::auth::{deserialize_secret_string, AuthConfig};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Round-trip serde helpers for `SecretString` fields in [`OAuthTokens`].
+// Distinct from `spall_config::auth::serialize_always_none`: this file's
+// secrets MUST survive the on-disk JSON round-trip at
+// `$XDG_CACHE_HOME/spall/oauth2/<api>.json` (mode 0600). The serializers
+// emit the plaintext inside the wrapper; the SecretString type preserves
+// the in-memory invariants (Debug renders [REDACTED], zeroize-on-drop).
 //
-// These differ in intent from `spall-config::auth::serialize_redacted_secret`:
-// `OAuthTokens` MUST survive the on-disk JSON round-trip at
-// `$XDG_CACHE_HOME/spall/oauth2/<api>.json` (mode 0600). The on-disk file
-// is the intended storage boundary, so the serializer emits the plaintext
-// inside the wrapper. The `SecretString` type still gives us the in-memory
-// invariants: `Debug` renders `[REDACTED]`, the value zeroizes on drop,
-// and the redaction-audit test in `spall-cli/tests/redaction_audit.rs`
-// confirms no `expose_secret(` call here sits within 3 lines of a log
-// macro.
-//
-// Followup (tracked separately): consolidate these helpers + the
-// `serialize_redacted_secret` pair in `spall-config::auth` behind an
-// `InlineSecret`/`RoundTripSecret` newtype, exported from spall-config.
+// The Option-deserialize half delegates to spall-config's
+// `deserialize_secret_string` — same byte-identical wrapping. Followup
+// #21 consolidates all four into an `InlineSecret`/`RoundTripSecret`
+// newtype.
 
 fn serialize_round_trip_secret<S>(s: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    // SECURITY: on-disk storage boundary (file mode 0600); do not
-    // relocate `expose_secret` past a logging or wire-transport site.
+    // SECURITY: on-disk storage boundary (file mode 0600).
     serializer.serialize_str(s.expose_secret())
 }
 
@@ -56,18 +51,10 @@ where
     S: Serializer,
 {
     match s {
-        // SECURITY: on-disk storage boundary; see `serialize_round_trip_secret`.
+        // SECURITY: on-disk storage boundary.
         Some(secret) => serializer.serialize_some(secret.expose_secret()),
         None => serializer.serialize_none(),
     }
-}
-
-fn deserialize_round_trip_secret_opt<'de, D>(d: D) -> Result<Option<SecretString>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let opt = Option::<String>::deserialize(d)?;
-    Ok(opt.map(|s| SecretString::new(s.into())))
 }
 
 /// 30-second skew applied when checking access-token expiry so we never
@@ -76,8 +63,7 @@ const EXPIRY_SKEW_SECS: u64 = 30;
 
 /// Inject an OAuth2 access token as `Authorization: Bearer <token>`.
 pub fn apply(token: &SecretString, headers: &mut HeaderMap) {
-    // SECURITY: header-construction boundary; do not relocate `expose_secret`
-    // past a logging or serialization site.
+    // SECURITY: header-construction boundary.
     let value = format!("Bearer {}", token.expose_secret());
     headers.insert(
         AUTHORIZATION,
@@ -85,16 +71,12 @@ pub fn apply(token: &SecretString, headers: &mut HeaderMap) {
     );
 }
 
-/// Tokens persisted to disk after a successful authorization-code exchange
-/// or refresh.
-///
-/// `access_token` and `refresh_token` are `SecretString` for in-memory
-/// safety (Debug renders `[REDACTED]`, zeroize-on-drop); they round-trip
-/// to the on-disk cache at `$XDG_CACHE_HOME/spall/oauth2/<api>.json`
-/// (mode 0600) via the `serialize_round_trip_secret*` helpers above.
-/// The on-disk file is the intended storage boundary — keeping the
-/// secret unwrapped inside the wrapper preserves the file's role as a
-/// session-state cache that survives across process invocations.
+/// Tokens persisted to disk after a successful authorization-code
+/// exchange or refresh. `access_token` and `refresh_token` are
+/// `SecretString` for in-memory safety (Debug redacts, zeroize-on-drop);
+/// they round-trip through the on-disk cache file (see module-level
+/// docs for path + mode) via the `serialize_round_trip_secret*` helpers
+/// above. The cache file is the intended storage boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
     #[serde(
@@ -105,7 +87,7 @@ pub struct OAuthTokens {
     #[serde(
         default,
         serialize_with = "serialize_round_trip_secret_opt",
-        deserialize_with = "deserialize_round_trip_secret_opt"
+        deserialize_with = "deserialize_secret_string"
     )]
     pub refresh_token: Option<SecretString>,
     /// Seconds since `UNIX_EPOCH` when `access_token` stops being valid.
@@ -411,8 +393,7 @@ pub async fn refresh(
             message: "no refresh_token stored; run `spall auth login` again".to_string(),
         }
     })?;
-    // SECURITY: token-endpoint POST boundary (over TLS); do not relocate
-    // `expose_secret` past a logging site.
+    // SECURITY: token-endpoint POST boundary (over TLS).
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token.expose_secret()),
@@ -557,17 +538,16 @@ mod tests {
             client_id: "client-id".to_string(),
         };
         let json = serde_json::to_string(&t).expect("serialize");
-        // The on-disk file is the storage boundary (mode 0600) — the
-        // plaintext SHOULD appear in the serialized JSON. This is the
-        // intended round-trip behavior, distinct from AuthConfig's
-        // redact-to-None semantics.
+        // The on-disk file is the storage boundary — plaintext is
+        // expected in the JSON (distinct from AuthConfig's
+        // redact-to-None semantics).
         assert!(json.contains("\"AT\""), "access_token plaintext: {}", json);
         assert!(json.contains("\"RT\""), "refresh_token plaintext: {}", json);
         let back: OAuthTokens = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.access_token.expose_secret(), "AT");
         assert_eq!(
             back.refresh_token.as_ref().map(|s| s.expose_secret()),
-            Some("AT").map(|_| "RT"),
+            Some("RT"),
         );
     }
 

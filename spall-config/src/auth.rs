@@ -1,11 +1,15 @@
 use secrecy::SecretString;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Custom deserializer for optional inline secret fields. Accepts the
+/// Deserializer for optional inline secret fields. Accepts the
 /// existing TOML/JSON `field = "value"` form and wraps the raw string
 /// in `SecretString` on read, so callers never see the unwrapped value
 /// via `Debug` or accidental serialization.
-fn deserialize_secret_string<'de, D>(d: D) -> Result<Option<SecretString>, D::Error>
+///
+/// Public so `spall-cli`'s OAuth2 token cache can reuse the same
+/// wrapping logic (its serializer differs — secrets MUST round-trip
+/// through the on-disk file — but the deserialize side is identical).
+pub fn deserialize_secret_string<'de, D>(d: D) -> Result<Option<SecretString>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -13,14 +17,15 @@ where
     Ok(opt.map(|s| SecretString::new(s.into())))
 }
 
-/// Custom serializer for optional inline secret fields. Always emits
-/// `none`, regardless of whether the value is `Some` or `None`. This
-/// guarantees that no plaintext credential reaches a serialized
-/// representation (TOML, JSON, postcard, etc.) via the auto-derived
-/// `Serialize` on [`AuthConfig`]. A round-trip through serialize +
-/// deserialize is `None`-preserving by design: secrets do not survive
-/// a serialize hop, which is the safe failure mode.
-fn serialize_redacted_secret<S>(
+/// Serializer for optional inline secret fields. ALWAYS emits `none`
+/// — even when the value is `Some` — so no plaintext credential
+/// reaches a serialized representation (TOML, JSON, postcard, etc.)
+/// via the auto-derived `Serialize` on [`AuthConfig`]. Round-trip
+/// through serialize+deserialize is `None`-preserving by design:
+/// secrets do not survive a serialize hop, which is the safe failure
+/// mode for inline credentials. Use the `oauth2.rs` round-trip
+/// helpers for credentials that must survive on-disk persistence.
+fn serialize_always_none<S>(
     _: &Option<SecretString>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
@@ -75,7 +80,7 @@ pub struct AuthConfig {
     #[serde(
         default,
         deserialize_with = "deserialize_secret_string",
-        serialize_with = "serialize_redacted_secret"
+        serialize_with = "serialize_always_none"
     )]
     pub token: Option<SecretString>,
 
@@ -108,7 +113,7 @@ pub struct AuthConfig {
     #[serde(
         default,
         deserialize_with = "deserialize_secret_string",
-        serialize_with = "serialize_redacted_secret"
+        serialize_with = "serialize_always_none"
     )]
     pub password: Option<SecretString>,
     /// Environment variable holding the password.
@@ -119,7 +124,7 @@ pub struct AuthConfig {
     #[serde(
         default,
         deserialize_with = "deserialize_secret_string",
-        serialize_with = "serialize_redacted_secret"
+        serialize_with = "serialize_always_none"
     )]
     pub client_secret: Option<SecretString>,
     pub auth_url: Option<String>,

@@ -17,8 +17,7 @@ pub fn apply(
 ) {
     match &config.location {
         ApiKeyLocation::Header { name } => {
-            // SECURITY: header-construction boundary; do not relocate `expose_secret`
-            // past a logging or serialization site.
+            // SECURITY: header-construction boundary.
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes())
                     .unwrap_or_else(|_| HeaderName::from_static("x-api-key")),
@@ -27,8 +26,7 @@ pub fn apply(
             );
         }
         ApiKeyLocation::Query { name } => {
-            // SECURITY: query-string construction boundary; do not relocate `expose_secret`
-            // past a logging or serialization site.
+            // SECURITY: query-string construction boundary.
             query_pairs.push((name.clone(), config.key.expose_secret().to_string()));
         }
     }
