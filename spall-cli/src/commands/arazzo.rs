@@ -52,6 +52,12 @@ pub fn arazzo_cmd() -> Command {
                         .long("verbose")
                         .action(ArgAction::SetTrue)
                         .help("Emit a workflow-start banner showing source bindings"),
+                )
+                .arg(
+                    Arg::new("max-steps")
+                        .long("spall-max-steps")
+                        .value_parser(clap::value_parser!(usize))
+                        .help("Hard cap on per-workflow step executions (default 10000). Bounds infinite-goto loops in malformed workflows; counts retries and goto-revisits."),
                 ),
         )
         .subcommand(
@@ -143,11 +149,17 @@ async fn run(matches: &ArgMatches, registry: &ApiRegistry, cache_dir: &Path) -> 
             .await
             .map_err(into_cli_err)?;
 
+    let max_steps = matches
+        .get_one::<usize>("max-steps")
+        .copied()
+        .unwrap_or(crate::arazzo_runner::DEFAULT_MAX_STEPS);
+
     let opts = RunOptions {
         workflow_id,
         inputs,
         dry_run,
         verbose,
+        max_steps,
     };
 
     let http_config = crate::http::HttpConfig::default();

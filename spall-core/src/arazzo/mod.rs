@@ -17,7 +17,8 @@ pub use expressions::{
     ExprError, Operand, ResponseSnapshot, StepResult,
 };
 pub use model::{
-    ArazzoDocument, Info, Parameter, RequestBody, SourceDescription, Step, SuccessCriterion,
+    Action, ActionOrRef, ActionRef, ArazzoDocument, Components, Criterion, FailureAction,
+    FailureActionOrRef, Info, Parameter, RequestBody, SourceDescription, Step, SuccessCriterion,
     Workflow,
 };
 pub use sources::resolve_source_from_bytes;

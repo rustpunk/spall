@@ -40,17 +40,29 @@ Restart Claude; the tools appear in the sidebar.
 
 ```text
 spall mcp <api>
-    [--spall-transport stdio]
+    [--spall-transport stdio|http]
+    [--spall-port <N>]           # HTTP only; default 8765
+    [--spall-bind <addr>]        # HTTP only; default 127.0.0.1
+    [--spall-allowed-origin <origin>]  # HTTP only; repeatable
     [--spall-include <tag>]      # repeatable
     [--spall-exclude <tag>]      # repeatable
+    [--spall-max-tools <N>]
+    [--spall-list-tags]
 ```
 
-- `--spall-transport` accepts only `stdio` in v1. Streamable HTTP is a
-  followup (MCP deprecated the older HTTP+SSE transport in spec revision
-  2025-03-26).
+- `--spall-transport` selects the wire protocol:
+  - `stdio` (default) for Claude Desktop / config-launched servers.
+  - `http` for Streamable HTTP per MCP spec 2025-06-18 §HTTP; see
+    [Running over HTTP](#running-over-http) below.
 - `--spall-include <tag>` keeps only operations carrying that OpenAPI
   tag (repeatable; union semantics).
 - `--spall-exclude <tag>` removes operations carrying that tag.
+- `--spall-max-tools <N>` deterministically truncates the filtered
+  registry to `N` tools when the spec exceeds the cap. See
+  [Sizing your server](#sizing-your-server) for the ordering rule.
+- `--spall-list-tags` loads the spec, prints a
+  `tag\tcount\tsample-op-id` TSV to stdout, and exits without starting
+  the server. Useful for crafting an `--spall-include` filter.
 - Operations with no `tags` belong to a synthetic tag named `default` —
   you can include/exclude them by that name.
 
@@ -77,6 +89,76 @@ hasp → OAuth2 stored token → config field). You must configure
 credentials out-of-band before starting the server; MCP gives no
 opportunity to prompt interactively.
 
+### Per-tool auth profiles
+
+Some APIs mix public-read and admin-write endpoints, or carry separate
+keychain entries per operation class. Two surfaces let you pin
+specific tools to a non-default `[profile.*]` block from the API's
+config:
+
+```bash
+spall mcp github \
+    --spall-auth-tool delete-repo=admin \
+    --spall-auth-tool transfer-repo=admin
+```
+
+The flag is repeatable; `<tool>` matches either the sanitized tool
+name from `tools/list` or the raw `operationId` from the spec.
+
+Equivalently, declare the binding inline on the operation in your
+spec via the extension `x-mcp-auth-profile`:
+
+```yaml
+paths:
+  /repos/{id}:
+    delete:
+      operationId: delete-repo
+      x-mcp-auth-profile: admin
+      ...
+```
+
+When both forms target the same tool, the CLI flag wins.
+
+Profiles named via either path are validated at server start; an
+unknown profile name aborts startup with the list of configured
+profiles so typos surface immediately.
+
+## Tool annotations
+
+Each entry in `tools/list` carries an `annotations` block with
+client-confirmation hints derived from the HTTP method
+([MCP spec 2025-06-18 §tools][mcp-tools]):
+
+[mcp-tools]: https://modelcontextprotocol.io/specification/2025-06-18/server/tools
+
+| Method            | readOnlyHint | destructiveHint | idempotentHint |
+|-------------------|--------------|-----------------|----------------|
+| GET / HEAD / OPTIONS / TRACE | true | false | true |
+| PUT / DELETE      | false        | true            | true           |
+| PATCH             | false        | true            | false          |
+| POST              | (omitted)    | (omitted)       | (omitted)      |
+
+`POST` is intentionally hint-free — the server cannot infer intent.
+Override any hint with the operation-level `x-mcp-annotations`
+extension, which merges field-by-field over the derived defaults:
+
+```yaml
+paths:
+  /search:
+    post:
+      operationId: search
+      x-mcp-annotations:
+        readOnlyHint: true   # POST that is in fact read-only
+        idempotentHint: true
+      ...
+```
+
+Unknown keys (e.g. `openWorldHint`, `title`) pass through so future
+MCP spec additions don't require a spall release.
+
+Each tool entry also carries `_meta.spall.tags` with the OpenAPI tag
+list — useful for clients that surface tags in their UI.
+
 ## Limitations
 
 - **Tools only.** No MCP `resources` or `prompts` surfaces in v1.
@@ -91,14 +173,130 @@ opportunity to prompt interactively.
   depth guard emit `{ "description": "cyclic schema omitted" }` in
   place; clients see a permissive empty schema.
 
+## Running over HTTP
+
+`--spall-transport http` switches the server from line-delimited
+JSON-RPC over stdio to Streamable HTTP per [MCP spec 2025-06-18
+§HTTP][mcp-http]. The wire shape:
+
+- One POST endpoint at `/` (the bind root). Body is one JSON-RPC 2.0
+  request frame; response is the matching reply as `application/json`.
+- `Mcp-Session-Id` header is issued on `initialize` and required on
+  every subsequent request. Sessions live for the process lifetime;
+  restarting the server invalidates all existing sessions.
+- Streaming (`text/event-stream`) responses are documented in the
+  spec for long-running tools. spall's v1 tools are all
+  request/response; the server returns JSON regardless of which
+  format the client `Accept`s.
+
+[mcp-http]: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+
+```bash
+# Localhost by default (MCP spec recommendation; mitigates DNS rebinding).
+spall mcp petstore --spall-transport http --spall-port 8765
+
+# Bind on all interfaces — combine with a reverse proxy that adds auth + TLS.
+spall mcp petstore --spall-transport http --spall-port 8765 --spall-bind 0.0.0.0
+
+# Pass --spall-port 0 to let the kernel pick a free port. The bound
+# port is logged to stderr:
+spall mcp petstore --spall-transport http --spall-port 0
+# [spall-mcp] listening on http://127.0.0.1:54321/
+```
+
+### Origin allowlist (DNS rebinding mitigation)
+
+The spec requires the server to validate the `Origin` header to block
+DNS-rebinding attacks. spall's policy:
+
+- **Allowlist set** (`--spall-allowed-origin <origin>`, repeatable):
+  only listed origins succeed; all others get `403 Forbidden`. The
+  CORS preflight layer is configured against the same list so
+  browsers see a coherent preflight rejection rather than a generic
+  CORS error.
+
+  ```bash
+  spall mcp petstore --spall-transport http \
+      --spall-allowed-origin https://app.example.com \
+      --spall-allowed-origin https://staging.example.com
+  ```
+
+- **Allowlist empty** (default): non-browser callers (no Origin
+  header — curl, the MCP test client) and localhost browsers
+  (`http://localhost[:N]`, `http://127.0.0.1[:N]`, `http://[::1][:N]`,
+  same with `https`) succeed. Browsers with a remote Origin get
+  `403`. This closes the DNS-rebinding hole where an attacker-
+  controlled DNS record at `localhost.example.com → 127.0.0.1` could
+  otherwise drive a victim's browser into the local server.
+
+### Request body size
+
+Capped at 16 MiB. Larger requests get HTTP `413 Payload Too Large`.
+OpenAPI specs with very large multipart payloads should sit behind a
+reverse proxy that handles streaming uploads, or run as stdio.
+
+### TLS, auth on the HTTP endpoint
+
+Both are deliberately **not** in scope for the spall server itself. The
+expected deployment is a reverse proxy (Caddy / Nginx / Cloudflare /
+fly proxy / etc.) that terminates TLS and adds auth, with spall
+listening on a private port behind it. This matches the
+`claude-desktop` / `chatgpt-apps` deployment pattern and keeps spall's
+dep tree small.
+
+## Sizing your server
+
+MCP clients impose practical limits on how many tools they surface from
+a single server. Claude Desktop in particular silently truncates near
+**100 tools** (see [modelcontextprotocol/discussions/537][md-537]).
+Stripe / AWS / GitHub-class specs blow well past this in one server.
+
+[md-537]: https://github.com/orgs/modelcontextprotocol/discussions/537
+
+Spall surfaces this in three ways:
+
+1. **Startup warning.** When the filtered tool count exceeds 100, the
+   server emits a stderr warning naming the most populated tags so you
+   can pick a filter:
+
+   ```text
+   spall mcp: WARNING 247 tools exceeds the ~100-tool cap most MCP clients ...
+   spall mcp: top tags by population: users=42, orgs=38, repos=37, gists=21, billing=18
+   ```
+
+2. **Discovery flag.** `--spall-list-tags` dumps every tag in the
+   filtered registry as TSV without starting the server, so you can
+   shape your `--spall-include` list ahead of time:
+
+   ```text
+   $ spall mcp github --spall-list-tags
+   tag	count	sample-op-id
+   actions	48	actions/list-workflow-runs
+   billing	12	billing/get-shared-storage
+   ...
+   ```
+
+3. **Auto-truncation.** `--spall-max-tools <N>` deterministically caps
+   the registry. The ordering rule is:
+
+   - Bucket each operation by its **first** tag in spec order
+     (untagged operations land in `default`).
+   - Sort buckets alphabetically.
+   - Within each bucket, keep spec order.
+   - Take the first `N`; ties on count are broken by spec order.
+
+   The selected subset is stable across runs on the same spec — useful
+   for predictable CI behavior. An operation that's truncated out has
+   no way to come back without rerunning with a higher `N` or a
+   different filter.
+
 ## Troubleshooting
 
 ### Claude Desktop only shows some of my tools
 
-Claude Desktop caps the per-server tool count near 100 and may truncate
-above it. Use `--spall-include <tag>` to slice a large spec into a
-focused subset, or run multiple `spall mcp` instances with disjoint tag
-filters.
+See [Sizing your server](#sizing-your-server). The startup warning is
+your first signal; `--spall-list-tags` plus `--spall-include` or
+`--spall-max-tools` are the levers.
 
 ### "Server disconnected" / corrupted JSON-RPC stream
 

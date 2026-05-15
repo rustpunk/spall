@@ -10,13 +10,15 @@
 //! parse as a JSON-RPC message. Diagnostics go to stderr via
 //! `eprintln!`. No `tracing` dep — see plan doc for the rationale.
 
+pub mod http;
 pub mod schema;
 
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 use spall_config::registry::ApiEntry;
-use spall_core::ir::{ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSpec};
-use std::collections::BTreeMap;
+use spall_core::ir::{HttpMethod, ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSpec};
+use spall_core::value::SpallValue;
+use std::collections::{BTreeMap, HashMap};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::execute::{execute_operation_programmatic, ProgrammaticArgs};
@@ -32,6 +34,15 @@ const ERR_METHOD_NOT_FOUND: i32 = -32601;
 const ERR_INVALID_PARAMS: i32 = -32602;
 const ERR_PARSE: i32 = -32700;
 
+/// Claude Desktop silently truncates `tools/list` past ~100 entries
+/// (modelcontextprotocol/discussions/537). When the filtered registry
+/// exceeds this hint, `run()` emits a startup warning naming the most
+/// populated tags so the user can craft a `--spall-include` filter.
+const MAX_TOOL_COUNT_HINT: usize = 100;
+
+/// How many tag buckets to surface in the warning text.
+const WARNING_TAG_HISTOGRAM_TOP_N: usize = 5;
+
 /// One tool in the dispatch registry. Built once at startup and never
 /// mutated thereafter.
 ///
@@ -40,38 +51,247 @@ const ERR_PARSE: i32 = -32700;
 /// are the same instance for the server's lifetime — the spec is loaded
 /// once at startup and never reloaded. If hot-reload is ever added,
 /// store the operation by id instead.
-struct ToolEntry {
+///
+/// `annotations` is the per-MCP-spec hint block surfaced on
+/// `tools/list`. Derived from the HTTP method at build time and merged
+/// with the operation's `x-mcp-annotations` extension when present.
+///
+/// `auth_profile` is `Some(name)` when the operation should dispatch
+/// against a profile-overlaid `ApiEntry` rather than the default. The
+/// name resolves to a pre-cached entry in [`AuthProfiles`].
+pub(crate) struct ToolEntry {
     op_index: usize,
     description: String,
     input_schema: Value,
+    annotations: Value,
+    auth_profile: Option<String>,
+}
+
+/// Pre-resolved `ApiEntry`s keyed by profile name. The `default` field
+/// holds the entry with no profile overlay; `by_profile` holds entries
+/// for each profile referenced by `--spall-auth-tool` or
+/// `x-mcp-auth-profile`. Validating profile existence at startup keeps
+/// the per-call dispatch path infallible.
+pub struct AuthProfiles {
+    pub default: ApiEntry,
+    pub by_profile: HashMap<String, ApiEntry>,
 }
 
 /// Build the tool registry from `spec` applying the include/exclude tag
 /// filter. Returns tools in spec order (`IndexMap` preserves insertion).
+///
+/// When `max_tools` is `Some(N)` and the filtered count exceeds `N`,
+/// the registry is deterministically truncated to `N` entries before
+/// insertion — order documented in [`truncate_deterministically`].
+///
+/// `auth_tool` maps a finalized tool name to a profile name the
+/// dispatcher should use in place of the default `ApiEntry`. Entries in
+/// the map whose key doesn't match any final tool name are surfaced to
+/// the caller as `unmatched_auth_tool_keys` — `run()` warns about them
+/// on stderr.
 fn build_registry(
     spec: &ResolvedSpec,
     include: &[String],
     exclude: &[String],
-) -> IndexMap<String, ToolEntry> {
+    max_tools: Option<usize>,
+    auth_tool: &HashMap<String, String>,
+) -> (IndexMap<String, ToolEntry>, Vec<String>) {
+    let filtered: Vec<(usize, &ResolvedOperation)> = spec
+        .operations
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| tag_filter_admits(op, include, exclude))
+        .collect();
+
+    let ordered = match max_tools {
+        Some(cap) if filtered.len() > cap => truncate_deterministically(filtered, cap),
+        _ => filtered,
+    };
+
     let mut out: IndexMap<String, ToolEntry> = IndexMap::new();
-    for (idx, op) in spec.operations.iter().enumerate() {
-        if !tag_filter_admits(op, include, exclude) {
-            continue;
-        }
+    let mut matched_keys: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    for (idx, op) in ordered {
         let raw = sanitize_tool_name(&op.operation_id);
         let name = unique_name(&raw, &out);
         let description = build_description(op);
         let input_schema = schema::operation_input_schema(op);
+        let annotations = derive_annotations(op);
+        let auth_profile = resolve_auth_profile(op, &name, auth_tool, &mut matched_keys);
         out.insert(
             name,
             ToolEntry {
                 op_index: idx,
                 description,
                 input_schema,
+                annotations,
+                auth_profile,
             },
         );
     }
-    out
+
+    let unmatched: Vec<String> = auth_tool
+        .keys()
+        .filter(|k| !matched_keys.contains(k.as_str()))
+        .cloned()
+        .collect();
+    (out, unmatched)
+}
+
+/// MCP `annotations` block for one tool, per spec 2025-06-18 §tools.
+/// Defaults are derived from HTTP method; `x-mcp-annotations` on the
+/// operation overrides each hint field-by-field. Returns `{}` when no
+/// hints apply (POST without an override).
+fn derive_annotations(op: &ResolvedOperation) -> Value {
+    let mut map = serde_json::Map::new();
+    let (read_only, destructive, idempotent) = match op.method {
+        HttpMethod::Get | HttpMethod::Head | HttpMethod::Options | HttpMethod::Trace => {
+            (Some(true), Some(false), Some(true))
+        }
+        HttpMethod::Put | HttpMethod::Delete => (Some(false), Some(true), Some(true)),
+        HttpMethod::Patch => (Some(false), Some(true), Some(false)),
+        HttpMethod::Post => (None, None, None),
+    };
+    if let Some(b) = read_only {
+        map.insert("readOnlyHint".to_string(), Value::Bool(b));
+    }
+    if let Some(b) = destructive {
+        map.insert("destructiveHint".to_string(), Value::Bool(b));
+    }
+    if let Some(b) = idempotent {
+        map.insert("idempotentHint".to_string(), Value::Bool(b));
+    }
+
+    // Field-by-field override from x-mcp-annotations. Spec authors can
+    // flip any hint, set `openWorldHint` (which spall doesn't derive),
+    // or supply `title`. Unknown keys pass through so future MCP spec
+    // additions don't need a spall release.
+    if let Some(SpallValue::Object(over)) = op.extensions.get("x-mcp-annotations") {
+        for (k, v) in over {
+            map.insert(k.clone(), Value::from(v));
+        }
+    }
+
+    Value::Object(map)
+}
+
+/// Pick the auth profile a tool should dispatch against. CLI flag takes
+/// precedence over the `x-mcp-auth-profile` extension; the flag's key
+/// is matched against the finalized tool name AND the raw
+/// `operationId` so users can write either form. The matched key (if
+/// any) is recorded so `build_registry` can surface unmatched CLI keys.
+fn resolve_auth_profile<'a>(
+    op: &'a ResolvedOperation,
+    name: &str,
+    auth_tool: &'a HashMap<String, String>,
+    matched: &mut std::collections::HashSet<&'a str>,
+) -> Option<String> {
+    // Try the sanitized tool name first, fall back to the raw
+    // operationId. Dedupe so a tool whose sanitized form equals its
+    // operationId doesn't get probed twice. The two-form match exists
+    // because users may have only seen the post-sanitize name in
+    // tools/list output OR may write against the raw operationId from
+    // the spec.
+    let mut probes: Vec<&str> = vec![name];
+    if op.operation_id.as_str() != name {
+        probes.push(op.operation_id.as_str());
+    }
+    for key in probes {
+        if let Some((k, p)) = auth_tool.get_key_value(key) {
+            matched.insert(k.as_str());
+            return Some(p.clone());
+        }
+    }
+    if let Some(SpallValue::Str(s)) = op.extensions.get("x-mcp-auth-profile") {
+        return Some(s.clone());
+    }
+    None
+}
+
+/// Returns the first OpenAPI tag for an operation, or the synthetic
+/// `"default"` bucket when it has none. Used as the primary sort key
+/// for deterministic truncation and for tag-histogram bookkeeping.
+fn first_tag(op: &ResolvedOperation) -> &str {
+    op.tags.first().map(String::as_str).unwrap_or("default")
+}
+
+/// Pick the first `cap` operations under a deterministic ordering so
+/// truncation is stable across invocations on the same spec.
+///
+/// Order: alphabetical by first tag (or the synthetic `"default"`),
+/// then by operation index within that tag (spec order). After
+/// truncation the selected ops are re-sorted by index so the resulting
+/// `tools/list` still reads in spec order within the chosen subset.
+fn truncate_deterministically(
+    filtered: Vec<(usize, &ResolvedOperation)>,
+    cap: usize,
+) -> Vec<(usize, &ResolvedOperation)> {
+    let mut entries = filtered;
+    entries.sort_by(|a, b| first_tag(a.1).cmp(first_tag(b.1)).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(cap);
+    entries.sort_by_key(|a| a.0);
+    entries
+}
+
+/// Build `(tag, count)` pairs for the >100-tools warning. Each op
+/// contributes once to every tag it carries; untagged ops fall into
+/// `"default"`. Sorted by count desc then tag asc, capped at `top_n`.
+fn tag_histogram(
+    registry: &IndexMap<String, ToolEntry>,
+    spec: &ResolvedSpec,
+    top_n: usize,
+) -> Vec<(String, usize)> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in registry.values() {
+        let op = match spec.operations.get(entry.op_index) {
+            Some(op) => op,
+            None => continue,
+        };
+        if op.tags.is_empty() {
+            *counts.entry("default".to_string()).or_insert(0) += 1;
+        } else {
+            for tag in &op.tags {
+                *counts.entry(tag.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(top_n);
+    v
+}
+
+/// Print `tag\tcount\tsample-op-id` TSV for every tag in the filtered
+/// spec, then return. Used by the `--spall-list-tags` early-exit path;
+/// honors the same include/exclude filters the server would apply.
+///
+/// Untagged operations belong to the synthetic tag `"default"`. An op
+/// carrying multiple tags contributes once to each.
+pub fn list_tags(spec: &ResolvedSpec, include: &[String], exclude: &[String]) {
+    let mut buckets: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for op in spec
+        .operations
+        .iter()
+        .filter(|op| tag_filter_admits(op, include, exclude))
+    {
+        if op.tags.is_empty() {
+            let e = buckets
+                .entry("default".to_string())
+                .or_insert_with(|| (0, op.operation_id.clone()));
+            e.0 += 1;
+        } else {
+            for tag in &op.tags {
+                let e = buckets
+                    .entry(tag.clone())
+                    .or_insert_with(|| (0, op.operation_id.clone()));
+                e.0 += 1;
+            }
+        }
+    }
+    println!("tag\tcount\tsample-op-id");
+    for (tag, (count, sample)) in buckets {
+        println!("{}\t{}\t{}", tag, count, sample);
+    }
 }
 
 fn tag_filter_admits(op: &ResolvedOperation, include: &[String], exclude: &[String]) -> bool {
@@ -159,22 +379,63 @@ fn build_description(op: &ResolvedOperation) -> String {
     buf
 }
 
+/// Build the tool registry and emit the startup banner + any tool-count
+/// warnings to stderr. Shared by the stdio (`run`) and HTTP
+/// (`http::run_http`) entry points so banner / warning copy stays
+/// identical across transports.
+pub(crate) fn prepare_server(
+    api_name: &str,
+    transport_label: &str,
+    spec: &ResolvedSpec,
+    include: &[String],
+    exclude: &[String],
+    max_tools: Option<usize>,
+    auth_tool: &HashMap<String, String>,
+) -> IndexMap<String, ToolEntry> {
+    let (registry, unmatched_auth) = build_registry(spec, include, exclude, max_tools, auth_tool);
+    eprintln!(
+        "spall mcp: serving '{}' over {} ({} tool{})",
+        api_name,
+        transport_label,
+        registry.len(),
+        if registry.len() == 1 { "" } else { "s" }
+    );
+    for key in &unmatched_auth {
+        eprintln!(
+            "spall mcp: --spall-auth-tool key '{}' did not match any registered tool (filtered out, or unknown operationId)",
+            key,
+        );
+    }
+    if registry.len() > MAX_TOOL_COUNT_HINT {
+        let hist = tag_histogram(&registry, spec, WARNING_TAG_HISTOGRAM_TOP_N)
+            .into_iter()
+            .map(|(t, c)| format!("{}={}", t, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "spall mcp: WARNING {} tools exceeds the ~{}-tool cap most MCP clients (incl. Claude Desktop) silently truncate at; pass --spall-include <tag> or --spall-max-tools <N> to trim.",
+            registry.len(),
+            MAX_TOOL_COUNT_HINT,
+        );
+        eprintln!("spall mcp: top tags by population: {}", hist);
+    }
+    registry
+}
+
 /// Server entry point. Builds the tool registry then serves stdio
 /// JSON-RPC until EOF on stdin.
 #[must_use = "ignoring this Result swallows server-side errors"]
 pub async fn run(
     api_name: String,
     spec: ResolvedSpec,
-    entry: ApiEntry,
+    profiles: AuthProfiles,
     include: Vec<String>,
     exclude: Vec<String>,
+    max_tools: Option<usize>,
+    auth_tool: HashMap<String, String>,
 ) -> Result<(), crate::SpallCliError> {
-    let registry = build_registry(&spec, &include, &exclude);
-    eprintln!(
-        "spall mcp: serving '{}' over stdio ({} tool{})",
-        api_name,
-        registry.len(),
-        if registry.len() == 1 { "" } else { "s" }
+    let registry = prepare_server(
+        &api_name, "stdio", &spec, &include, &exclude, max_tools, &auth_tool,
     );
 
     let stdin = BufReader::new(tokio::io::stdin());
@@ -185,7 +446,7 @@ pub async fn run(
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_line(&line, &spec, &entry, &registry).await;
+        let response = handle_line(&line, &spec, &profiles, &registry).await;
         if let Some(resp) = response {
             let mut bytes = match serde_json::to_vec(&resp) {
                 Ok(b) => b,
@@ -211,10 +472,10 @@ pub async fn run(
 /// Parse one JSON-RPC frame and dispatch. Returns `None` for
 /// notifications (no `id`) and for parse errors that aren't recoverable
 /// into a JSON-RPC error envelope (notifications can't error per spec).
-async fn handle_line(
+pub(crate) async fn handle_line(
     line: &str,
     spec: &ResolvedSpec,
-    entry: &ApiEntry,
+    profiles: &AuthProfiles,
     registry: &IndexMap<String, ToolEntry>,
 ) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
@@ -234,9 +495,9 @@ async fn handle_line(
         "initialize" => Some(rpc_result(id, handle_initialize())),
         "notifications/initialized" | "notifications/cancelled" => None,
         "ping" => Some(rpc_result(id, json!({}))),
-        "tools/list" => Some(rpc_result(id, handle_tools_list(registry))),
+        "tools/list" => Some(rpc_result(id, handle_tools_list(spec, registry))),
         "tools/call" => {
-            let result = handle_tools_call(&params, spec, entry, registry).await;
+            let result = handle_tools_call(&params, spec, profiles, registry).await;
             Some(rpc_result(id, result))
         }
         "" => {
@@ -274,14 +535,21 @@ fn handle_initialize() -> Value {
     })
 }
 
-fn handle_tools_list(registry: &IndexMap<String, ToolEntry>) -> Value {
+fn handle_tools_list(spec: &ResolvedSpec, registry: &IndexMap<String, ToolEntry>) -> Value {
     let tools: Vec<Value> = registry
         .iter()
         .map(|(name, entry)| {
+            let tags: Vec<Value> = spec
+                .operations
+                .get(entry.op_index)
+                .map(|op| op.tags.iter().cloned().map(Value::String).collect())
+                .unwrap_or_default();
             json!({
                 "name": name,
                 "description": entry.description,
                 "inputSchema": entry.input_schema,
+                "annotations": entry.annotations,
+                "_meta": { "spall.tags": tags },
             })
         })
         .collect();
@@ -291,7 +559,7 @@ fn handle_tools_list(registry: &IndexMap<String, ToolEntry>) -> Value {
 async fn handle_tools_call(
     params: &Value,
     spec: &ResolvedSpec,
-    entry: &ApiEntry,
+    profiles: &AuthProfiles,
     registry: &IndexMap<String, ToolEntry>,
 ) -> Value {
     let name = match params.get("name").and_then(Value::as_str) {
@@ -312,6 +580,11 @@ async fn handle_tools_call(
     let prog_args = match build_programmatic_args(op, &arguments) {
         Ok(a) => a,
         Err(e) => return tool_error(&e),
+    };
+
+    let entry = match tool.auth_profile.as_deref() {
+        Some(name) => profiles.by_profile.get(name).unwrap_or(&profiles.default),
+        None => &profiles.default,
     };
 
     match execute_operation_programmatic(op, spec, entry, &prog_args).await {
@@ -554,6 +827,8 @@ mod tests {
                 op_index: 0,
                 description: String::new(),
                 input_schema: json!({}),
+                annotations: json!({}),
+                auth_profile: None,
             },
         );
         assert_eq!(unique_name("foo", &existing), "foo-2");
@@ -563,6 +838,8 @@ mod tests {
                 op_index: 1,
                 description: String::new(),
                 input_schema: json!({}),
+                annotations: json!({}),
+                auth_profile: None,
             },
         );
         assert_eq!(unique_name("foo", &existing), "foo-3");
@@ -597,9 +874,208 @@ mod tests {
             op("second", &["tagb"]),
             op("third", &["taga"]),
         ]);
-        let reg = build_registry(&spec, &["taga".into()], &[]);
+        let reg = build_registry(&spec, &["taga".into()], &[], None, &HashMap::new()).0;
         let names: Vec<&str> = reg.keys().map(String::as_str).collect();
         assert_eq!(names, vec!["first", "third"]);
+    }
+
+    #[test]
+    fn truncate_deterministic_picks_same_subset_across_runs() {
+        // Two tags, both populated, with operations interleaved in spec
+        // order. The truncation sort key (tag asc, then op_index asc)
+        // must produce a stable subset regardless of insertion timing.
+        let mut ops = Vec::new();
+        for i in 0..50 {
+            ops.push(op(&format!("alpha-{}", i), &["alpha"]));
+            ops.push(op(&format!("beta-{}", i), &["beta"]));
+        }
+        let spec = spec_of(ops);
+        let first = build_registry(&spec, &[], &[], Some(30), &HashMap::new()).0;
+        let second = build_registry(&spec, &[], &[], Some(30), &HashMap::new()).0;
+        let names_a: Vec<&str> = first.keys().map(String::as_str).collect();
+        let names_b: Vec<&str> = second.keys().map(String::as_str).collect();
+        assert_eq!(names_a.len(), 30);
+        assert_eq!(names_a, names_b, "truncation must be deterministic");
+        // 30 ops, alpha-bucket first (alphabetical). Alpha had 50 ops at
+        // even indices 0,2,...,98 → first 30 are alpha-0..alpha-29.
+        for name in &names_a {
+            assert!(
+                name.starts_with("alpha-"),
+                "expected alpha bucket to fill first, got {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_below_cap_keeps_all_ops_in_spec_order() {
+        let spec = spec_of(vec![
+            op("a", &["t1"]),
+            op("b", &["t2"]),
+            op("c", &["t1"]),
+        ]);
+        let reg = build_registry(&spec, &[], &[], Some(10), &HashMap::new()).0;
+        let names: Vec<&str> = reg.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn tag_histogram_sorts_by_count_desc_then_tag_asc() {
+        let spec = spec_of(vec![
+            op("a", &["users"]),
+            op("b", &["users"]),
+            op("c", &["users"]),
+            op("d", &["orgs"]),
+            op("e", &["orgs"]),
+            op("f", &["billing"]),
+            op("g", &[]),
+        ]);
+        let reg = build_registry(&spec, &[], &[], None, &HashMap::new()).0;
+        let hist = tag_histogram(&reg, &spec, 10);
+        assert_eq!(
+            hist,
+            vec![
+                ("users".to_string(), 3),
+                ("orgs".to_string(), 2),
+                ("billing".to_string(), 1),
+                ("default".to_string(), 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn tag_histogram_caps_to_top_n() {
+        let mut ops = Vec::new();
+        for tag in ["t1", "t2", "t3", "t4", "t5", "t6", "t7"] {
+            ops.push(op(&format!("op-{}", tag), &[tag]));
+        }
+        let spec = spec_of(ops);
+        let reg = build_registry(&spec, &[], &[], None, &HashMap::new()).0;
+        let hist = tag_histogram(&reg, &spec, 3);
+        assert_eq!(hist.len(), 3);
+    }
+
+    #[test]
+    fn multi_tag_op_contributes_to_every_tag_bucket() {
+        let spec = spec_of(vec![op("a", &["users", "admin"])]);
+        let reg = build_registry(&spec, &[], &[], None, &HashMap::new()).0;
+        let hist = tag_histogram(&reg, &spec, 10);
+        let map: BTreeMap<String, usize> = hist.into_iter().collect();
+        assert_eq!(map.get("users"), Some(&1));
+        assert_eq!(map.get("admin"), Some(&1));
+    }
+
+    fn op_with_method(id: &str, method: HttpMethod) -> ResolvedOperation {
+        let mut o = op(id, &[]);
+        o.method = method;
+        o
+    }
+
+    #[test]
+    fn annotations_derive_from_http_method() {
+        // GET / HEAD / OPTIONS / TRACE → readOnly + idempotent.
+        for m in [
+            HttpMethod::Get,
+            HttpMethod::Head,
+            HttpMethod::Options,
+            HttpMethod::Trace,
+        ] {
+            let ann = derive_annotations(&op_with_method("x", m));
+            assert_eq!(ann["readOnlyHint"], json!(true), "{:?}", m);
+            assert_eq!(ann["destructiveHint"], json!(false), "{:?}", m);
+            assert_eq!(ann["idempotentHint"], json!(true), "{:?}", m);
+        }
+        // PUT / DELETE → destructive + idempotent.
+        for m in [HttpMethod::Put, HttpMethod::Delete] {
+            let ann = derive_annotations(&op_with_method("x", m));
+            assert_eq!(ann["readOnlyHint"], json!(false), "{:?}", m);
+            assert_eq!(ann["destructiveHint"], json!(true), "{:?}", m);
+            assert_eq!(ann["idempotentHint"], json!(true), "{:?}", m);
+        }
+        // PATCH → destructive, NOT idempotent.
+        let ann = derive_annotations(&op_with_method("x", HttpMethod::Patch));
+        assert_eq!(ann["readOnlyHint"], json!(false));
+        assert_eq!(ann["destructiveHint"], json!(true));
+        assert_eq!(ann["idempotentHint"], json!(false));
+        // POST → no hints (server unknown intent).
+        let ann = derive_annotations(&op_with_method("x", HttpMethod::Post));
+        assert!(ann.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn x_mcp_annotations_extension_overrides_field_by_field() {
+        let mut o = op_with_method("x", HttpMethod::Get);
+        // Flip readOnlyHint and add openWorldHint (which spall doesn't
+        // derive). idempotentHint should retain the GET-derived true.
+        let mut override_map: IndexMap<String, SpallValue> = IndexMap::new();
+        override_map.insert("readOnlyHint".into(), SpallValue::Bool(false));
+        override_map.insert("openWorldHint".into(), SpallValue::Bool(true));
+        o.extensions
+            .insert("x-mcp-annotations".into(), SpallValue::Object(override_map));
+        let ann = derive_annotations(&o);
+        assert_eq!(ann["readOnlyHint"], json!(false));
+        assert_eq!(ann["openWorldHint"], json!(true));
+        assert_eq!(ann["idempotentHint"], json!(true));
+    }
+
+    #[test]
+    fn x_mcp_auth_profile_extension_picks_up_at_build_time() {
+        let mut o = op("authed", &[]);
+        o.extensions
+            .insert("x-mcp-auth-profile".into(), SpallValue::Str("admin".into()));
+        let spec = spec_of(vec![o]);
+        let reg = build_registry(&spec, &[], &[], None, &HashMap::new()).0;
+        let (_name, entry) = reg.iter().next().unwrap();
+        assert_eq!(entry.auth_profile.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn cli_auth_tool_flag_overrides_extension() {
+        let mut o = op("authed", &[]);
+        o.extensions
+            .insert("x-mcp-auth-profile".into(), SpallValue::Str("admin".into()));
+        let spec = spec_of(vec![o]);
+        let mut flags = HashMap::new();
+        flags.insert("authed".to_string(), "readonly".to_string());
+        let (reg, unmatched) = build_registry(&spec, &[], &[], None, &flags);
+        let (_name, entry) = reg.iter().next().unwrap();
+        assert_eq!(entry.auth_profile.as_deref(), Some("readonly"));
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn unmatched_auth_tool_key_is_reported() {
+        let spec = spec_of(vec![op("a", &[])]);
+        let mut flags = HashMap::new();
+        flags.insert("ghost-tool".to_string(), "admin".to_string());
+        let (_, unmatched) = build_registry(&spec, &[], &[], None, &flags);
+        assert_eq!(unmatched, vec!["ghost-tool".to_string()]);
+    }
+
+    #[test]
+    fn cli_auth_tool_matches_raw_operation_id_or_sanitized_name() {
+        // sanitize lowercases "Foo" → "foo", but the user may have
+        // written the raw operationId on the CLI. Either form should
+        // land on the same tool.
+        let spec = spec_of(vec![op("GetThing", &[])]);
+        let mut by_raw = HashMap::new();
+        by_raw.insert("GetThing".to_string(), "p".to_string());
+        let entry_a = build_registry(&spec, &[], &[], None, &by_raw)
+            .0
+            .iter()
+            .next()
+            .map(|(_, e)| e.auth_profile.clone())
+            .unwrap();
+        let mut by_sanitized = HashMap::new();
+        by_sanitized.insert("getthing".to_string(), "p".to_string());
+        let entry_b = build_registry(&spec, &[], &[], None, &by_sanitized)
+            .0
+            .iter()
+            .next()
+            .map(|(_, e)| e.auth_profile.clone())
+            .unwrap();
+        assert_eq!(entry_a, Some("p".to_string()));
+        assert_eq!(entry_b, Some("p".to_string()));
     }
 
     #[test]

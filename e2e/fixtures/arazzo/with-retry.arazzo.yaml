@@ -1,0 +1,28 @@
+arazzo: "1.0.1"
+info:
+  title: Retry on transient failure
+  version: "1.0.0"
+  summary: "A flaky upstream returns 503 a few times before settling; the runner's retry failureAction recovers it."
+sourceDescriptions:
+  - name: api
+    url: ./simple-openapi.json
+    type: openapi
+workflows:
+  - workflowId: retryFlow
+    summary: "One step pinned to a 'type: retry' failureAction with a 2-retry budget."
+    steps:
+      - stepId: probeStep
+        operationId: getItem
+        parameters:
+          - name: id
+            in: path
+            value: "1"
+        onFailure:
+          - name: try-again
+            type: retry
+            retryAfter: 0
+            retryLimit: 2
+        outputs:
+          item_id: $response.body#/id
+    outputs:
+      item_id: $steps.probeStep.outputs.item_id

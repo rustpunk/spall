@@ -215,16 +215,201 @@ $ spall arazzo run ./onboard.arazzo.yaml --input email=a@b.test --dry-run
             body: {"email":"a@b.test"}
 ```
 
+## Failure actions
+
+Step and workflow-level action chains let a workflow recover from
+HTTP failures and unmet `successCriteria` per Arazzo §4.6 / §4.7.
+Three action types are supported:
+
+### `type: end`
+
+Stops the workflow. Exit code depends on which side fired:
+
+- Success-side `type:end` (in `onSuccess` or `successActions`) →
+  exit 0 with workflow outputs.
+- Failure-side `type:end` (in `onFailure` or `failureActions`) →
+  exit non-zero with workflow + step attribution in stderr. The
+  workflow took its failure branch and CI pipelines need to surface
+  that.
+
+```yaml
+steps:
+  - stepId: probe
+    operationId: getProbeStatus
+    onFailure:
+      - name: known-4xx
+        type: end
+        criteria:
+          - condition: $response.statusCode == 404
+```
+
+If no `criteria` are listed, the action fires unconditionally. To
+absorb a known-OK 4xx into a zero exit, use `type: goto` to a
+cleanup step (see below), not `type: end` on the failure side.
+
+### `type: retry`
+
+Sleeps for `retryAfter` seconds then re-runs the current step, up to
+`retryLimit` times. When the limit is reached, the workflow exits
+non-zero with the last error attached:
+
+```yaml
+steps:
+  - stepId: callFlakyAPI
+    operationId: getThing
+    onFailure:
+      - name: try-again
+        type: retry
+        retryAfter: 0.5
+        retryLimit: 3
+```
+
+`retryLimit` defaults to `1` if omitted; `retryAfter` defaults to `0`.
+The runner clamps each retry sleep at 60 seconds — a buggy spec with
+`retryAfter: 999999` cannot hang the workflow indefinitely. The
+retry counter does NOT compose with `--spall-retry` (the HTTP-transport
+retry layer); they're orthogonal.
+
+`type: retry` also fires on transport errors (DNS / connection-reset /
+TLS handshake fails), not just HTTP 4xx/5xx — that's the exact case
+backoff exists for.
+
+### `type: goto`
+
+Jumps to the named step. `workflowId` (cross-workflow goto) is a v2
+feature and rejects at runtime if used:
+
+```yaml
+steps:
+  - stepId: probe
+    operationId: probe
+    onFailure:
+      - name: recover
+        type: goto
+        stepId: cleanupStep
+  - stepId: shouldBeSkipped
+    operationId: probe
+  - stepId: cleanupStep
+    operationId: cleanup
+```
+
+### Workflow-level fallback
+
+`workflow.successActions` and `workflow.failureActions` apply to every
+step that doesn't define its own `onSuccess` / `onFailure` chain.
+Step-level absence vs explicit-empty matter:
+
+- `onFailure` field absent on the step → workflow-level applies.
+- `onFailure: []` on the step → opt out of the workflow-level default,
+  no actions fire on failure (the underlying error bubbles up).
+- `onFailure: [...]` non-empty → step-level wins; workflow-level is
+  not consulted.
+
+```yaml
+workflows:
+  - workflowId: paranoid
+    failureActions:
+      - name: bail
+        type: end
+    steps:
+      - stepId: a
+        operationId: a-op            # workflow-level 'bail' applies
+      - stepId: b
+        operationId: b-op
+        onFailure: []                # opts out of workflow-level
+```
+
+### Reusable named actions
+
+Heavy uses can centralize actions under `components`:
+
+```yaml
+components:
+  failureActions:
+    bail:
+      name: bail
+      type: end
+workflows:
+  - workflowId: x
+    steps:
+      - stepId: probe
+        operationId: probe
+        onFailure:
+          - reference: $components.failureActions.bail
+```
+
+Reference paths must be exactly
+`$components.successActions.<name>` or
+`$components.failureActions.<name>` — typos error at workflow-start
+time so a malformed reference doesn't silently fall through.
+
+### Criterion `type`
+
+Action `criteria` reuse the same condition mini-language as
+`successCriteria`. v1 supports only `type: simple` (the default);
+`jsonpath` and `regex` are deferred to issue #5 and error hard at
+dispatch time so partial implementations don't sneak in via fixtures.
+A non-empty `context` field — only used by v2 jsonpath/regex — also
+errors hard so it can't be confused with simple-mode evaluation.
+
+### Step budget
+
+`spall arazzo run --spall-max-steps N` caps the total number of step
+executions per workflow (default `10000`). The counter increments on
+every step body run including retries and `goto`-revisits. A `goto X`
+from step X with always-true criteria — the textbook infinite-loop
+shape — bails with `StepBudgetExhausted` once the counter overshoots.
+
+## JSON output shape
+
+`spall arazzo run --output json` (the default) emits one workflow
+record to stdout per run:
+
+```jsonc
+{
+  "workflowId": "loginAndUseToken",
+  "outputs": { /* workflow-level outputs */ },
+  "steps": [
+    {
+      "stepId": "doLogin",
+      "status": 200,
+      "dryRun": false,
+      "outputs": { "token": "Bearer abc123" }
+      // failedVia omitted — step completed normally
+    },
+    {
+      "stepId": "maybeFail",
+      "status": 500,
+      "dryRun": false,
+      "outputs": {},
+      "failedVia": "on-failure-goto"   // absorbed via goto recovery
+    }
+  ]
+}
+```
+
+Per-step fields:
+
+| Field        | Type            | Meaning                                                                             |
+|--------------|-----------------|-------------------------------------------------------------------------------------|
+| `stepId`     | string          | The step's `stepId` from the .arazzo.yaml.                                          |
+| `status`     | integer         | HTTP status of the step's response, or `0` if no HTTP call ran (criteria-only fail). |
+| `dryRun`     | boolean         | `true` when the step body was skipped due to `--dry-run`.                            |
+| `outputs`    | object          | Values from the step's `outputs:` expressions. Empty when the step failed.           |
+| `failedVia`  | string \| absent | Only present when an `onFailure` action absorbed the step. Values: `"on-failure-end"`, `"on-failure-goto"`. Consumers use this to distinguish an absorbed-failure step from a true success. |
+
 ## v1 limitations
 
 | Feature              | v1                  | Tracking         |
 |----------------------|---------------------|------------------|
-| `failureActions`     | Not honored         | issue #5         |
-| `onSuccess` / `onFailure` actions | Not honored | issue #5         |
+| `failureActions` / `successActions` (workflow + step level) | **Implemented** (this release) | — |
+| `onSuccess` / `onFailure` actions | **Implemented** (this release) | — |
+| `$components.successActions` / `$components.failureActions` refs | **Implemented** (this release) | — |
 | `workflowId` (nested) | Errors at runtime  | issue #5         |
 | `replay` action       | Not implemented    | issue #5         |
 | `operationPath`       | Errors at runtime  | issue #5         |
 | `successCriteria.type: regex` / `jsonpath` | Skipped with a warning | issue #5 |
+| Action `criteria.type: regex` / `jsonpath` | Errors at dispatch | issue #5 |
 | `--spall-bind <source>=<api>` CLI override | Use `x-spall-api` extension | issue #5 |
 | Inputs JSON Schema validation | None — values are opaque strings | issue #5 |
 
