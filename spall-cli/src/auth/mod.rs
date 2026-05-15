@@ -19,6 +19,14 @@ use spall_config::auth::{ApiKeyLocation, AuthConfig, AuthKind, ResolvedAuth};
 /// 6. Global `SPALL_<API>_TOKEN` env var (Wave 1–2 compat)
 /// 7. OAuth2 interactive flow — session token only (stub)
 /// 8. Interactive password prompt for Basic
+///
+/// SECURITY note (per #13): "Credentials always wrapped in
+/// `SecretString`" is enforced from one statement past every ingress —
+/// clap delivers `--spall-auth` as `String`, `std::env::var` returns
+/// `String`, and inline-TOML wraps via `deserialize_secret_string` on
+/// read. Each plaintext widow at the FFI/OS boundary is closed within
+/// the same statement that crosses it; there is no path on which raw
+/// credential strings persist past one assignment.
 pub async fn resolve(
     api_name: &str,
     auth_config: Option<&AuthConfig>,

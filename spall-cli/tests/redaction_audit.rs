@@ -6,6 +6,18 @@
 //! intent is to catch a refactor that accidentally hoists an
 //! `expose_secret()` call into stderr / structured-log proximity.
 //!
+//! Scope and limits (do not overstate what this catches):
+//! - Grep-based proximity heuristic, NOT semantic data-flow analysis.
+//!   Will NOT catch `format!("{}", token.expose_secret())` whose
+//!   result later flows into `eprintln!` 10 lines away.
+//! - Does NOT catch `serde::Serialize` adjacency, `Display` impls, or
+//!   `Debug` derives — the in-source `// SECURITY:` comments name those
+//!   sites aspirationally; this test enforces only the log-proximity
+//!   subset.
+//! - Non-recursive: only scans top-level `.rs` files under `auth/`,
+//!   not subdirectories. A future `auth/providers/` submodule must
+//!   either be flat or this test must be extended.
+//!
 //! The matcher uses the literal substring `expose_secret(` (with open
 //! paren) so the `// SECURITY: ... `expose_secret` ...` comments don't
 //! trigger false positives — comment text uses backticks without a
@@ -14,6 +26,11 @@
 use std::fs;
 use std::path::Path;
 
+/// Proximity window in source lines. K=3 catches the immediate
+/// `let v = format!(...); eprintln!(v);` hoist pattern. The current
+/// `mod.rs` geometry (eprintln at line 40, nearest `expose_secret(`
+/// at line 48, distance 8) sits well outside the window; a refactor
+/// that closes that gap by 5+ lines trips this test.
 const K: usize = 3;
 const LOG_MARKERS: &[&str] = &[
     "eprintln!",

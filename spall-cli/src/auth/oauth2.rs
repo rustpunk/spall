@@ -32,6 +32,16 @@ pub fn apply(token: &SecretString, headers: &mut HeaderMap) {
 
 /// Tokens persisted to disk after a successful authorization-code exchange
 /// or refresh.
+///
+/// SECURITY (pre-existing, tracked as a follow-up to #13): `access_token`
+/// and `refresh_token` are raw `String` here because they MUST survive a
+/// `serde_json` round-trip to the on-disk cache at
+/// `$XDG_CACHE_HOME/spall/oauth2/<api>.json` (mode 0600). The
+/// `SecretString` migration in #13 addressed `AuthConfig` (inline TOML
+/// secrets, where serialize-redacts-to-None is the right answer);
+/// closing this loop requires a separate path that round-trips through
+/// a `SerializableSecret`-style wrapper, NOT `serialize_redacted_secret`
+/// — out of scope for #13.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access_token: String,
