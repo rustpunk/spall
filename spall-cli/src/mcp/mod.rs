@@ -266,6 +266,20 @@ fn derive_annotations(op: &ResolvedOperation) -> Value {
         map.insert("idempotentHint".to_string(), Value::Bool(b));
     }
 
+    // Auto-derive a human-readable `title` from `op.summary` so MCP
+    // clients (Claude Desktop, Cursor, ChatGPT Apps) get a friendly
+    // display string in tool pickers instead of the sanitized
+    // operationId. `entry().or_insert` is defensive — the override
+    // loop below uses unconditional `map.insert`, so an explicit
+    // `x-mcp-annotations.title` will still win even if this fires
+    // first. If `op.summary` is absent and no override is supplied,
+    // the field is omitted entirely (cleaner than synthesizing a
+    // title from operationId; clients fall back to the tool name).
+    if let Some(summary) = &op.summary {
+        map.entry("title".to_string())
+            .or_insert_with(|| Value::String(summary.clone()));
+    }
+
     // Field-by-field override from x-mcp-annotations. Spec authors can
     // flip any hint, set `openWorldHint` (which spall doesn't derive),
     // or supply `title`. Unknown keys pass through so future MCP spec
@@ -1121,6 +1135,49 @@ mod tests {
         assert_eq!(ann["readOnlyHint"], json!(false));
         assert_eq!(ann["openWorldHint"], json!(true));
         assert_eq!(ann["idempotentHint"], json!(true));
+    }
+
+    #[test]
+    fn op_summary_auto_derives_tool_title() {
+        let mut o = op_with_method("listPets", HttpMethod::Get);
+        o.summary = Some("List pets owned by the caller".to_string());
+        let ann = derive_annotations(&o);
+        assert_eq!(
+            ann["title"],
+            json!("List pets owned by the caller"),
+            "op.summary should auto-derive `title`",
+        );
+    }
+
+    #[test]
+    fn x_mcp_annotations_title_overrides_summary_derived() {
+        let mut o = op_with_method("listPets", HttpMethod::Get);
+        o.summary = Some("List pets owned by the caller".to_string());
+        let mut override_map: IndexMap<String, SpallValue> = IndexMap::new();
+        override_map.insert(
+            "title".into(),
+            SpallValue::Str("Show My Pets".to_string()),
+        );
+        o.extensions
+            .insert("x-mcp-annotations".into(), SpallValue::Object(override_map));
+        let ann = derive_annotations(&o);
+        assert_eq!(
+            ann["title"],
+            json!("Show My Pets"),
+            "explicit x-mcp-annotations.title must win over op.summary",
+        );
+    }
+
+    #[test]
+    fn absent_summary_and_no_override_omits_title_field() {
+        let o = op_with_method("listPets", HttpMethod::Get);
+        // No summary, no x-mcp-annotations override.
+        let ann = derive_annotations(&o);
+        assert!(
+            ann.get("title").is_none(),
+            "title must be omitted when no source is available; got {:?}",
+            ann,
+        );
     }
 
     #[test]

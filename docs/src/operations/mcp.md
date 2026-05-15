@@ -153,8 +153,16 @@ paths:
       ...
 ```
 
-Unknown keys (e.g. `openWorldHint`, `title`) pass through so future
-MCP spec additions don't require a spall release.
+Unknown keys (e.g. `openWorldHint`) pass through so future MCP spec
+additions don't require a spall release.
+
+The `title` annotation is auto-derived from the operation's
+`summary` field — MCP clients (Claude Desktop, Cursor, ChatGPT Apps)
+render this in their tool pickers as a human-readable display name
+in place of the sanitized tool slug. An explicit
+`x-mcp-annotations.title` in the spec overrides the summary-derived
+default; if neither is present, the field is omitted (clients fall
+back to the tool name).
 
 Each tool entry also carries `_meta.spall.tags` with the OpenAPI tag
 list — useful for clients that surface tags in their UI.
