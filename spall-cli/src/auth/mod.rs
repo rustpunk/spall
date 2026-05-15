@@ -40,7 +40,13 @@ pub async fn resolve(
         eprintln!(
             "Warning: inline auth token in config is insecure. Use an env var or keyring instead."
         );
-        return Ok(resolve_from_config_and_token(cfg, kind, token));
+        // SECURITY: header-construction boundary; do not relocate `expose_secret`
+        // past a logging or serialization site.
+        return Ok(resolve_from_config_and_token(
+            cfg,
+            kind,
+            token.expose_secret(),
+        ));
     }
 
     // 3. token_url (keyring:// / env://) — requires `hasp`.
@@ -305,7 +311,7 @@ mod tests {
     async fn inline_token_warns_and_resolves() {
         let cfg = AuthConfig {
             kind: Some(AuthKind::Bearer),
-            token: Some("tkn".to_string()),
+            token: Some(SecretString::new("tkn".to_string().into())),
             ..Default::default()
         };
         let result = resolve("test", Some(&cfg), None).await.unwrap();

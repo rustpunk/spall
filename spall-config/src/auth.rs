@@ -1,5 +1,34 @@
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Custom deserializer for optional inline secret fields. Accepts the
+/// existing TOML/JSON `field = "value"` form and wraps the raw string
+/// in `SecretString` on read, so callers never see the unwrapped value
+/// via `Debug` or accidental serialization.
+fn deserialize_secret_string<'de, D>(d: D) -> Result<Option<SecretString>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(d)?;
+    Ok(opt.map(|s| SecretString::new(s.into())))
+}
+
+/// Custom serializer for optional inline secret fields. Always emits
+/// `none`, regardless of whether the value is `Some` or `None`. This
+/// guarantees that no plaintext credential reaches a serialized
+/// representation (TOML, JSON, postcard, etc.) via the auto-derived
+/// `Serialize` on [`AuthConfig`]. A round-trip through serialize +
+/// deserialize is `None`-preserving by design: secrets do not survive
+/// a serialize hop, which is the safe failure mode.
+fn serialize_redacted_secret<S>(
+    _: &Option<SecretString>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_none()
+}
 
 /// Auth kind — inferred from context when omitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -43,7 +72,12 @@ pub struct AuthConfig {
     pub kind: Option<AuthKind>,
 
     /// Inline secret value (insecure, for quick testing only).
-    pub token: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_secret_string",
+        serialize_with = "serialize_redacted_secret"
+    )]
+    pub token: Option<SecretString>,
 
     /// Environment variable name for the token / credential.
     pub token_env: Option<String>,
@@ -71,13 +105,23 @@ pub struct AuthConfig {
     // Basic auth specific fields
     pub username: Option<String>,
     /// Inline password (insecure, prefer `password_env`).
-    pub password: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_secret_string",
+        serialize_with = "serialize_redacted_secret"
+    )]
+    pub password: Option<SecretString>,
     /// Environment variable holding the password.
     pub password_env: Option<String>,
 
     // OAuth2 specific fields
     pub client_id: Option<String>,
-    pub client_secret: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_secret_string",
+        serialize_with = "serialize_redacted_secret"
+    )]
+    pub client_secret: Option<SecretString>,
     pub auth_url: Option<String>,
     pub scopes: Option<Vec<String>>,
 
