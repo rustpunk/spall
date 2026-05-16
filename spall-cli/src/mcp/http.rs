@@ -118,6 +118,7 @@ pub async fn run_http(
     auth_tool: HashMap<String, String>,
     listen_addr: SocketAddr,
     allowed_origins: Vec<String>,
+    verbose: bool,
 ) -> Result<(), crate::SpallCliError> {
     let registry = super::prepare_server(
         &api_name,
@@ -129,12 +130,17 @@ pub async fn run_http(
         &auth_tool,
     );
 
+    if verbose {
+        super::emit_verbose_startup(&api_name, "http", &registry, &profiles);
+    }
+
     let state = Arc::new(HttpState {
         spec,
         profiles,
         registry,
         sessions: RwLock::new(HashMap::new()),
         allowed_origins: allowed_origins.into_iter().collect(),
+        verbose,
     });
 
     // Spawn the idle-session pruner. Holds a clone of the Arc so the
@@ -210,6 +216,9 @@ struct HttpState {
     /// slots periodically.
     sessions: RwLock<HashMap<String, Instant>>,
     allowed_origins: HashSet<String>,
+    /// `--spall-verbose` flag. Consumed by `handle_post` to emit
+    /// `[spall-mcp] kind=http-request ...` lines (commit 2 wires this).
+    verbose: bool,
 }
 
 async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, body: String) -> Response {
@@ -234,6 +243,33 @@ async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, bo
     } else {
         state.allowed_origins.contains(origin)
     };
+
+    if state.verbose {
+        let origin_str = if origin.is_empty() {
+            "<absent>".to_string()
+        } else {
+            origin.to_string()
+        };
+        let outcome = if state.allowed_origins.is_empty() {
+            if allowed {
+                "<any>".to_string()
+            } else {
+                "rejected:remote-origin-with-empty-allowlist".to_string()
+            }
+        } else if allowed {
+            origin.to_string()
+        } else {
+            "rejected:not-in-allowlist".to_string()
+        };
+        eprintln!(
+            "{} kind=http-request origin={} allowlist={} headers={}",
+            super::verbose::SENTINEL,
+            super::verbose::quote_if_needed(&origin_str),
+            super::verbose::quote_if_needed(&outcome),
+            super::verbose::format_headers(&headers),
+        );
+    }
+
     if !allowed {
         return (
             StatusCode::FORBIDDEN,
@@ -315,7 +351,8 @@ async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, bo
     }
 
     // Dispatch via the same line handler the stdio transport uses.
-    let response = handle_line(&body, &state.spec, &state.profiles, &state.registry).await;
+    let response =
+        handle_line(&body, &state.spec, &state.profiles, &state.registry, state.verbose).await;
 
     let mut headers_out = HeaderMap::new();
     if is_initialize {

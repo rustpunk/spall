@@ -9,11 +9,53 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use spall_config::auth::AuthConfig;
+use spall_config::auth::{deserialize_secret_string, AuthConfig};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// Round-trip serde helpers for `SecretString` fields in [`OAuthTokens`].
+// Distinct from `spall_config::auth::serialize_always_none`: this file's
+// secrets MUST survive the on-disk JSON round-trip at
+// `$XDG_CACHE_HOME/spall/oauth2/<api>.json` (mode 0600). The serializers
+// emit the plaintext inside the wrapper; the SecretString type preserves
+// the in-memory invariants (Debug renders [REDACTED], zeroize-on-drop).
+//
+// The Option-deserialize half delegates to spall-config's
+// `deserialize_secret_string` — same byte-identical wrapping. Followup
+// #21 consolidates all four into an `InlineSecret`/`RoundTripSecret`
+// newtype.
+
+fn serialize_round_trip_secret<S>(s: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    // SECURITY: on-disk storage boundary (file mode 0600).
+    serializer.serialize_str(s.expose_secret())
+}
+
+fn deserialize_round_trip_secret<'de, D>(d: D) -> Result<SecretString, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    Ok(SecretString::new(s.into()))
+}
+
+fn serialize_round_trip_secret_opt<S>(
+    s: &Option<SecretString>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match s {
+        // SECURITY: on-disk storage boundary.
+        Some(secret) => serializer.serialize_some(secret.expose_secret()),
+        None => serializer.serialize_none(),
+    }
+}
 
 /// 30-second skew applied when checking access-token expiry so we never
 /// inject a token that's about to expire mid-request.
@@ -21,6 +63,7 @@ const EXPIRY_SKEW_SECS: u64 = 30;
 
 /// Inject an OAuth2 access token as `Authorization: Bearer <token>`.
 pub fn apply(token: &SecretString, headers: &mut HeaderMap) {
+    // SECURITY: header-construction boundary.
     let value = format!("Bearer {}", token.expose_secret());
     headers.insert(
         AUTHORIZATION,
@@ -28,12 +71,25 @@ pub fn apply(token: &SecretString, headers: &mut HeaderMap) {
     );
 }
 
-/// Tokens persisted to disk after a successful authorization-code exchange
-/// or refresh.
+/// Tokens persisted to disk after a successful authorization-code
+/// exchange or refresh. `access_token` and `refresh_token` are
+/// `SecretString` for in-memory safety (Debug redacts, zeroize-on-drop);
+/// they round-trip through the on-disk cache file (see module-level
+/// docs for path + mode) via the `serialize_round_trip_secret*` helpers
+/// above. The cache file is the intended storage boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    #[serde(
+        serialize_with = "serialize_round_trip_secret",
+        deserialize_with = "deserialize_round_trip_secret"
+    )]
+    pub access_token: SecretString,
+    #[serde(
+        default,
+        serialize_with = "serialize_round_trip_secret_opt",
+        deserialize_with = "deserialize_secret_string"
+    )]
+    pub refresh_token: Option<SecretString>,
     /// Seconds since `UNIX_EPOCH` when `access_token` stops being valid.
     pub expires_at: u64,
     /// Original `token_url` — kept so refresh can re-target without re-reading config.
@@ -331,15 +387,16 @@ pub async fn refresh(
     api_name: &str,
     tokens: &OAuthTokens,
 ) -> Result<OAuthTokens, crate::SpallCliError> {
-    let refresh_token = tokens.refresh_token.as_deref().ok_or_else(|| {
+    let refresh_token = tokens.refresh_token.as_ref().ok_or_else(|| {
         crate::SpallCliError::AuthResolution {
             api: api_name.to_string(),
             message: "no refresh_token stored; run `spall auth login` again".to_string(),
         }
     })?;
+    // SECURITY: token-endpoint POST boundary (over TLS).
     let params = [
         ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
+        ("refresh_token", refresh_token.expose_secret()),
         ("client_id", tokens.client_id.as_str()),
     ];
     let mut fresh = post_token(api_name, &tokens.token_url, &params, &tokens.client_id).await?;
@@ -404,10 +461,11 @@ async fn post_token(
             message: "token response missing access_token".to_string(),
         })?
         .to_string();
+    let access_token = SecretString::new(access_token.into());
     let refresh_token = json
         .get("refresh_token")
         .and_then(|v| v.as_str())
-        .map(String::from);
+        .map(|s| SecretString::new(s.to_string().into()));
     let expires_in = json
         .get("expires_in")
         .and_then(|v| v.as_u64())
@@ -444,11 +502,11 @@ pub async fn ensure_fresh_token(api_name: &str) -> Result<Option<SecretString>, 
         return Ok(None);
     };
     if !tokens.is_expired_now() {
-        return Ok(Some(SecretString::new(tokens.access_token.clone().into())));
+        return Ok(Some(tokens.access_token.clone()));
     }
     let fresh = refresh(api_name, &tokens).await?;
     save_tokens(api_name, &fresh)?;
-    Ok(Some(SecretString::new(fresh.access_token.into())))
+    Ok(Some(fresh.access_token.clone()))
 }
 
 #[cfg(test)]
@@ -473,16 +531,24 @@ mod tests {
     #[test]
     fn tokens_serialize_round_trip() {
         let t = OAuthTokens {
-            access_token: "AT".to_string(),
-            refresh_token: Some("RT".to_string()),
+            access_token: SecretString::new("AT".to_string().into()),
+            refresh_token: Some(SecretString::new("RT".to_string().into())),
             expires_at: 1_700_000_000,
             token_url: "https://idp.example.com/token".to_string(),
             client_id: "client-id".to_string(),
         };
-        let json = serde_json::to_string(&t).unwrap();
-        let back: OAuthTokens = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.access_token, "AT");
-        assert_eq!(back.refresh_token, Some("RT".to_string()));
+        let json = serde_json::to_string(&t).expect("serialize");
+        // The on-disk file is the storage boundary — plaintext is
+        // expected in the JSON (distinct from AuthConfig's
+        // redact-to-None semantics).
+        assert!(json.contains("\"AT\""), "access_token plaintext: {}", json);
+        assert!(json.contains("\"RT\""), "refresh_token plaintext: {}", json);
+        let back: OAuthTokens = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.access_token.expose_secret(), "AT");
+        assert_eq!(
+            back.refresh_token.as_ref().map(|s| s.expose_secret()),
+            Some("RT"),
+        );
     }
 
     #[test]
@@ -492,7 +558,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let t = OAuthTokens {
-            access_token: "x".to_string(),
+            access_token: SecretString::new("x".to_string().into()),
             refresh_token: None,
             expires_at: now + 10, // within 30-second skew
             token_url: String::new(),

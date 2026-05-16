@@ -12,13 +12,16 @@
 
 pub mod http;
 pub mod schema;
+pub(crate) mod verbose;
 
 use indexmap::IndexMap;
 use serde_json::{json, Value};
-use spall_config::registry::ApiEntry;
+use spall_config::registry::{ApiEntry, ApiRegistry};
 use spall_core::ir::{HttpMethod, ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSpec};
 use spall_core::value::SpallValue;
-use std::collections::{BTreeMap, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::execute::{execute_operation_programmatic, ProgrammaticArgs};
@@ -67,14 +70,116 @@ pub(crate) struct ToolEntry {
     auth_profile: Option<String>,
 }
 
-/// Pre-resolved `ApiEntry`s keyed by profile name. The `default` field
-/// holds the entry with no profile overlay; `by_profile` holds entries
-/// for each profile referenced by `--spall-auth-tool` or
-/// `x-mcp-auth-profile`. Validating profile existence at startup keeps
-/// the per-call dispatch path infallible.
+/// `ApiEntry`s for MCP tool dispatch — default + lazily-resolved overlays.
+///
+/// `default` is the no-overlay entry (used by tools without a profile
+/// override) and is materialized at startup.
+///
+/// `validated` is the set of profile names referenced by
+/// `--spall-auth-tool` or `x-mcp-auth-profile` and confirmed to exist
+/// in the API's `[profile.*]` block — typos surface at startup, not at
+/// first dispatch.
+///
+/// `cache` is populated lazily: the first `tools/call` against a tool
+/// with `auth_profile = Some(name)` calls `registry.resolve_profile`
+/// once and inserts the overlaid entry; subsequent calls reuse it.
+/// Profiles in `validated` but never invoked stay un-resolved for the
+/// server's lifetime — see issue #19 for the OAuth-refresh
+/// blast-radius motivation.
 pub struct AuthProfiles {
     pub default: ApiEntry,
-    pub by_profile: HashMap<String, ApiEntry>,
+    pub validated: HashSet<String>,
+    /// Cache holds the overlaid `ApiEntry`; per-call token freshness
+    /// is handled downstream in `crate::auth::resolve`.
+    cache: tokio::sync::RwLock<HashMap<String, ApiEntry>>,
+    registry: Arc<ApiRegistry>,
+    api_name: String,
+}
+
+/// Failure modes for [`AuthProfiles::resolve`]. `NotValidated` is an
+/// internal-bug sentinel — the dispatcher asked for a profile startup
+/// never approved. `RegistryMiss` means the registry rejected the
+/// resolution at first-call time (would require a registry mutation
+/// in flight; no current code path does this).
+#[derive(Debug)]
+pub(crate) enum ResolveErr {
+    NotValidated { name: String },
+    RegistryMiss { name: String },
+}
+
+impl std::fmt::Display for ResolveErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveErr::NotValidated { name } => write!(
+                f,
+                "internal: auth profile '{}' not validated at startup",
+                name
+            ),
+            ResolveErr::RegistryMiss { name } => write!(
+                f,
+                "auth profile '{}' resolution failed: not found in registry",
+                name
+            ),
+        }
+    }
+}
+
+impl AuthProfiles {
+    /// Build from the validated set + the registry/api_name needed for
+    /// lazy resolution. The cache starts empty.
+    pub fn new(
+        default: ApiEntry,
+        validated: HashSet<String>,
+        registry: Arc<ApiRegistry>,
+        api_name: String,
+    ) -> Self {
+        Self {
+            default,
+            validated,
+            cache: tokio::sync::RwLock::new(HashMap::new()),
+            registry,
+            api_name,
+        }
+    }
+
+    /// Resolve the dispatch target for a tool call. `None` returns a
+    /// borrow of the default entry; `Some(name)` consults the lazy
+    /// cache and on miss calls `registry.resolve_profile` exactly once
+    /// (double-checked lock — two concurrent first-callers race past
+    /// the read lock; the loser sees the winner's insert under the
+    /// write lock). The owned variant carries a clone out of the cache
+    /// so the read lock can be released before the dispatcher runs.
+    pub(crate) async fn resolve(
+        &self,
+        profile: Option<&str>,
+    ) -> Result<Cow<'_, ApiEntry>, ResolveErr> {
+        let Some(name) = profile else {
+            return Ok(Cow::Borrowed(&self.default));
+        };
+        if !self.validated.contains(name) {
+            return Err(ResolveErr::NotValidated {
+                name: name.to_string(),
+            });
+        }
+        {
+            let r = self.cache.read().await;
+            if let Some(entry) = r.get(name) {
+                return Ok(Cow::Owned(entry.clone()));
+            }
+        }
+        let mut w = self.cache.write().await;
+        if let Some(entry) = w.get(name) {
+            return Ok(Cow::Owned(entry.clone()));
+        }
+        let entry = self
+            .registry
+            .resolve_profile(&self.api_name, Some(name))
+            .ok_or_else(|| ResolveErr::RegistryMiss {
+                name: name.to_string(),
+            })?;
+        w.insert(name.to_string(), entry.clone());
+        Ok(Cow::Owned(entry))
+    }
 }
 
 /// Build the tool registry from `spec` applying the include/exclude tag
@@ -160,6 +265,20 @@ fn derive_annotations(op: &ResolvedOperation) -> Value {
     }
     if let Some(b) = idempotent {
         map.insert("idempotentHint".to_string(), Value::Bool(b));
+    }
+
+    // Auto-derive a human-readable `title` from `op.summary` so MCP
+    // clients (Claude Desktop, Cursor, ChatGPT Apps) get a friendly
+    // display string in tool pickers instead of the sanitized
+    // operationId. `entry().or_insert` is defensive — the override
+    // loop below uses unconditional `map.insert`, so an explicit
+    // `x-mcp-annotations.title` will still win even if this fires
+    // first. If `op.summary` is absent and no override is supplied,
+    // the field is omitted entirely (cleaner than synthesizing a
+    // title from operationId; clients fall back to the tool name).
+    if let Some(summary) = &op.summary {
+        map.entry("title".to_string())
+            .or_insert_with(|| Value::String(summary.clone()));
     }
 
     // Field-by-field override from x-mcp-annotations. Spec authors can
@@ -425,6 +544,7 @@ pub(crate) fn prepare_server(
 /// Server entry point. Builds the tool registry then serves stdio
 /// JSON-RPC until EOF on stdin.
 #[must_use = "ignoring this Result swallows server-side errors"]
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     api_name: String,
     spec: ResolvedSpec,
@@ -433,10 +553,15 @@ pub async fn run(
     exclude: Vec<String>,
     max_tools: Option<usize>,
     auth_tool: HashMap<String, String>,
+    verbose: bool,
 ) -> Result<(), crate::SpallCliError> {
     let registry = prepare_server(
         &api_name, "stdio", &spec, &include, &exclude, max_tools, &auth_tool,
     );
+
+    if verbose {
+        emit_verbose_startup(&api_name, "stdio", &registry, &profiles);
+    }
 
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -446,7 +571,7 @@ pub async fn run(
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_line(&line, &spec, &profiles, &registry).await;
+        let response = handle_line(&line, &spec, &profiles, &registry, verbose).await;
         if let Some(resp) = response {
             let mut bytes = match serde_json::to_vec(&resp) {
                 Ok(b) => b,
@@ -469,6 +594,32 @@ pub async fn run(
     Ok(())
 }
 
+/// Emit the verbose startup line to stderr (post-banner). Shared by
+/// stdio (`run`) and HTTP (`run_http`) entry points; both need access
+/// to `profiles.validated` for the sorted profile-name list.
+pub(crate) fn emit_verbose_startup(
+    api_name: &str,
+    transport: &str,
+    registry: &IndexMap<String, ToolEntry>,
+    profiles: &AuthProfiles,
+) {
+    let mut profile_names: Vec<&str> = profiles.validated.iter().map(String::as_str).collect();
+    profile_names.sort();
+    let profiles_str = if profile_names.is_empty() {
+        "<none>".to_string()
+    } else {
+        profile_names.join(",")
+    };
+    eprintln!(
+        "{} kind=startup api={} transport={} tools={} profiles={}",
+        verbose::SENTINEL,
+        api_name,
+        transport,
+        registry.len(),
+        profiles_str,
+    );
+}
+
 /// Parse one JSON-RPC frame and dispatch. Returns `None` for
 /// notifications (no `id`) and for parse errors that aren't recoverable
 /// into a JSON-RPC error envelope (notifications can't error per spec).
@@ -477,6 +628,7 @@ pub(crate) async fn handle_line(
     spec: &ResolvedSpec,
     profiles: &AuthProfiles,
     registry: &IndexMap<String, ToolEntry>,
+    verbose: bool,
 ) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -497,7 +649,7 @@ pub(crate) async fn handle_line(
         "ping" => Some(rpc_result(id, json!({}))),
         "tools/list" => Some(rpc_result(id, handle_tools_list(spec, registry))),
         "tools/call" => {
-            let result = handle_tools_call(&params, spec, profiles, registry).await;
+            let result = handle_tools_call(&params, spec, profiles, registry, verbose).await;
             Some(rpc_result(id, result))
         }
         "" => {
@@ -561,6 +713,7 @@ async fn handle_tools_call(
     spec: &ResolvedSpec,
     profiles: &AuthProfiles,
     registry: &IndexMap<String, ToolEntry>,
+    verbose: bool,
 ) -> Value {
     let name = match params.get("name").and_then(Value::as_str) {
         Some(s) => s,
@@ -582,10 +735,36 @@ async fn handle_tools_call(
         Err(e) => return tool_error(&e),
     };
 
-    let entry = match tool.auth_profile.as_deref() {
-        Some(name) => profiles.by_profile.get(name).unwrap_or(&profiles.default),
-        None => &profiles.default,
+    let resolve_result = profiles.resolve(tool.auth_profile.as_deref()).await;
+    if verbose {
+        let (profile_field, status_field) = match (&tool.auth_profile, &resolve_result) {
+            (None, _) => ("<default>".to_string(), None),
+            (Some(name), Ok(_)) => (name.clone(), None),
+            (Some(_), Err(ResolveErr::NotValidated { name })) => {
+                (name.clone(), Some("resolve-not-validated"))
+            }
+            (Some(_), Err(ResolveErr::RegistryMiss { name })) => {
+                (name.clone(), Some("resolve-registry-miss"))
+            }
+        };
+        let status_suffix = status_field
+            .map(|s| format!(" status={}", s))
+            .unwrap_or_default();
+        eprintln!(
+            "{} kind=tools/call tool={} profile={} method={} url={}{}",
+            verbose::SENTINEL,
+            name,
+            profile_field,
+            op.method,
+            op.path_template,
+            status_suffix,
+        );
+    }
+    let resolved = match resolve_result {
+        Ok(r) => r,
+        Err(e) => return tool_error(&format!("{}", e)),
     };
+    let entry: &ApiEntry = &resolved;
 
     match execute_operation_programmatic(op, spec, entry, &prog_args).await {
         Ok(res) => {
@@ -1019,6 +1198,49 @@ mod tests {
     }
 
     #[test]
+    fn op_summary_auto_derives_tool_title() {
+        let mut o = op_with_method("listPets", HttpMethod::Get);
+        o.summary = Some("List pets owned by the caller".to_string());
+        let ann = derive_annotations(&o);
+        assert_eq!(
+            ann["title"],
+            json!("List pets owned by the caller"),
+            "op.summary should auto-derive `title`",
+        );
+    }
+
+    #[test]
+    fn x_mcp_annotations_title_overrides_summary_derived() {
+        let mut o = op_with_method("listPets", HttpMethod::Get);
+        o.summary = Some("List pets owned by the caller".to_string());
+        let mut override_map: IndexMap<String, SpallValue> = IndexMap::new();
+        override_map.insert(
+            "title".into(),
+            SpallValue::Str("Show My Pets".to_string()),
+        );
+        o.extensions
+            .insert("x-mcp-annotations".into(), SpallValue::Object(override_map));
+        let ann = derive_annotations(&o);
+        assert_eq!(
+            ann["title"],
+            json!("Show My Pets"),
+            "explicit x-mcp-annotations.title must win over op.summary",
+        );
+    }
+
+    #[test]
+    fn absent_summary_and_no_override_omits_title_field() {
+        let o = op_with_method("listPets", HttpMethod::Get);
+        // No summary, no x-mcp-annotations override.
+        let ann = derive_annotations(&o);
+        assert!(
+            ann.get("title").is_none(),
+            "title must be omitted when no source is available; got {:?}",
+            ann,
+        );
+    }
+
+    #[test]
     fn x_mcp_auth_profile_extension_picks_up_at_build_time() {
         let mut o = op("authed", &[]);
         o.extensions
@@ -1264,5 +1486,114 @@ mod tests {
             properties: IndexMap::new(),
             items: None,
         }
+    }
+
+    fn auth_profile_entry(name: &str, profiles: &[&str]) -> ApiEntry {
+        use spall_config::registry::ProfileConfig;
+        let mut map = std::collections::HashMap::new();
+        for p in profiles {
+            map.insert(
+                (*p).to_string(),
+                ProfileConfig {
+                    base_url: Some(format!("https://{}-{}.example", name, p)),
+                    headers: Vec::new(),
+                    auth: None,
+                    proxy: None,
+                },
+            );
+        }
+        ApiEntry {
+            name: name.to_string(),
+            source: format!("/tmp/{}.json", name),
+            config_path: None,
+            base_url: Some("https://default.example".to_string()),
+            default_headers: Vec::new(),
+            auth: None,
+            proxy: None,
+            profiles: map,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_default_returns_borrow_of_default_entry() {
+        let entry = auth_profile_entry("svc", &[]);
+        let registry = Arc::new(ApiRegistry::from_entries(
+            vec![entry.clone()],
+            spall_config::sources::GlobalDefaults::default(),
+        ));
+        let profiles = AuthProfiles::new(entry, HashSet::new(), registry, "svc".to_string());
+        let cow = profiles.resolve(None).await.expect("default resolves");
+        assert!(matches!(cow, Cow::Borrowed(_)));
+        assert_eq!(cow.name, "svc");
+        assert_eq!(cow.base_url.as_deref(), Some("https://default.example"));
+    }
+
+    #[tokio::test]
+    async fn resolve_concurrent_two_spawns_yield_same_profile_entry() {
+        let entry = auth_profile_entry("svc", &["admin"]);
+        let registry = Arc::new(ApiRegistry::from_entries(
+            vec![entry.clone()],
+            spall_config::sources::GlobalDefaults::default(),
+        ));
+        let mut validated = HashSet::new();
+        validated.insert("admin".to_string());
+        let profiles = Arc::new(AuthProfiles::new(
+            entry,
+            validated,
+            registry,
+            "svc".to_string(),
+        ));
+
+        let p1 = Arc::clone(&profiles);
+        let p2 = Arc::clone(&profiles);
+        let h1 = tokio::spawn(async move {
+            p1.resolve(Some("admin")).await.map(Cow::into_owned)
+        });
+        let h2 = tokio::spawn(async move {
+            p2.resolve(Some("admin")).await.map(Cow::into_owned)
+        });
+        let r1 = h1.await.expect("task 1").expect("resolve 1");
+        let r2 = h2.await.expect("task 2").expect("resolve 2");
+        assert_eq!(r1.base_url, r2.base_url);
+        assert_eq!(r1.base_url.as_deref(), Some("https://svc-admin.example"));
+    }
+
+    #[tokio::test]
+    async fn resolve_not_validated_surfaces_internal_attribution() {
+        let entry = auth_profile_entry("svc", &["admin"]);
+        let registry = Arc::new(ApiRegistry::from_entries(
+            vec![entry.clone()],
+            spall_config::sources::GlobalDefaults::default(),
+        ));
+        let profiles = AuthProfiles::new(entry, HashSet::new(), registry, "svc".to_string());
+        let err = profiles
+            .resolve(Some("ghost"))
+            .await
+            .expect_err("ghost is not validated");
+        assert_eq!(
+            format!("{}", err),
+            "internal: auth profile 'ghost' not validated at startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_registry_miss_surfaces_not_found_attribution() {
+        let entry = auth_profile_entry("svc", &["admin"]);
+        let empty_registry = Arc::new(ApiRegistry::from_entries(
+            Vec::new(),
+            spall_config::sources::GlobalDefaults::default(),
+        ));
+        let mut validated = HashSet::new();
+        validated.insert("admin".to_string());
+        let profiles =
+            AuthProfiles::new(entry, validated, empty_registry, "svc".to_string());
+        let err = profiles
+            .resolve(Some("admin"))
+            .await
+            .expect_err("registry has no api");
+        assert_eq!(
+            format!("{}", err),
+            "auth profile 'admin' resolution failed: not found in registry"
+        );
     }
 }

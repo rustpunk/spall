@@ -153,11 +153,83 @@ paths:
       ...
 ```
 
-Unknown keys (e.g. `openWorldHint`, `title`) pass through so future
-MCP spec additions don't require a spall release.
+Unknown keys (e.g. `openWorldHint`) pass through so future MCP spec
+additions don't require a spall release.
+
+The `title` annotation is auto-derived from the operation's
+`summary` field — MCP clients (Claude Desktop, Cursor, ChatGPT Apps)
+render this in their tool pickers as a human-readable display name
+in place of the sanitized tool slug. An explicit
+`x-mcp-annotations.title` in the spec overrides the summary-derived
+default; if neither is present, the field is omitted (clients fall
+back to the tool name).
 
 Each tool entry also carries `_meta.spall.tags` with the OpenAPI tag
 list — useful for clients that surface tags in their UI.
+
+## Debugging
+
+Pass `--spall-verbose` to `spall mcp <api>` (any transport) to dump
+server-lifecycle and per-call diagnostics to **stderr**. Stdout
+remains pure JSON-RPC; the verbose stream never crosses the protocol
+channel, so it's safe to enable while clients are connected.
+
+Each event is one stderr line prefixed with `[spall-mcp]`:
+
+```text
+[spall-mcp] kind=startup api=petstore transport=stdio tools=42 profiles=admin,readonly
+[spall-mcp] kind=tools/call tool=getpetbyid profile=<default> method=GET url=/pets/{petId}
+[spall-mcp] kind=http-request origin=https://app.example.com allowlist=https://app.example.com headers={...}
+```
+
+Profile names that appear in the `startup` line are the set spall
+validated against your config. A profile only appears on a
+`tools/call` line when a request actually triggered it — profile
+resolution is lazy, so profiles you never invoke stay un-resolved
+(and therefore can't leak via `expose_secret`).
+
+### What is redacted
+
+- **HTTP request headers** (case-insensitive name match):
+  - `Authorization` → rendered as `Bearer [REDACTED]`,
+    `Basic [REDACTED]`, or `[REDACTED]` for other schemes; the auth
+    scheme is preserved so "wrong auth kind" is still debuggable.
+  - `Cookie` → `[REDACTED]`.
+  - `Proxy-Authorization` → same as `Authorization`.
+
+  The list is hardcoded in `spall-cli/src/mcp/verbose.rs::REDACTED_HEADER_NAMES`
+  and a unit-test drift guard asserts every entry actually triggers
+  a redaction.
+
+### What is NOT redacted in v1
+
+This is the honest scope statement — do not assume the verbose
+stream is safe to share verbatim:
+
+- **URL query parameters.** The `tools/call` line emits the OpenAPI
+  `path_template` (e.g. `/pets/{petId}`), not the rendered URL with
+  query string. Path-segment values (the `{petId}` substitution) are
+  not in the verbose log because the actual rendering happens
+  downstream of the MCP dispatcher. A future version may render +
+  redact the URL with `?api_key=[REDACTED]` semantics.
+- **Request bodies** of the upstream API call.
+- **Response bodies** and **response headers** of the upstream API
+  call.
+- **Custom organization-specific header names** outside the
+  hardcoded list above. If your spec uses `X-Foo-Token` or similar
+  for a credential, do not enable `--spall-verbose` in environments
+  where stderr is captured to durable storage.
+- **Browser CORS preflight rejections** never reach the per-request
+  log; only POST requests that pass the CORS layer are visible.
+
+If you need to share a verbose dump, pipe through
+`--spall-verbose 2>&1 | tee debug.log` and review `debug.log`
+manually before sharing. The redactor closes the most common leakage
+path (Authorization headers) but is not exhaustive.
+
+`--spall-verbose` is also wired on the request-execution path (when
+you run `spall <api> <op>`) for header-trace debugging; the two uses
+of the flag are independent and may be combined.
 
 ## Limitations
 
