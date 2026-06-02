@@ -117,14 +117,21 @@ async fn run() -> miette::Result<()> {
         .unwrap_or_else(|| spall_config::sources::config_dir().join("cache"));
     std::fs::create_dir_all(&cache_dir).ok();
 
-    run_with_args(&args, &registry, &cache_dir).await
+    // Top-level dispatch has no downstream pipe consumer; use a throwaway sink.
+    let mut sink = crate::execute::ResponseContext::new();
+    run_with_args(&args, &registry, &cache_dir, &mut sink).await
 }
 
 /// Run spall with an explicit argument vector. Used by the REPL.
+///
+/// `sink` captures the last successful operation response so a REPL pipe or
+/// CLI chain can feed it into the next stage. Callers with no downstream
+/// consumer pass a throwaway [`crate::execute::ResponseContext`].
 pub async fn run_with_args(
     args: &[String],
     registry: &ApiRegistry,
     cache_dir: &std::path::Path,
+    sink: &mut crate::execute::ResponseContext,
 ) -> miette::Result<()> {
     // Fast path: `spall <api> --help` / `spall <api> -h` bypasses Phase 1
     // because Phase 1 stubs have disable_help_flag(true) and would error.
@@ -188,7 +195,15 @@ pub async fn run_with_args(
         Some(("__complete", sub)) => handle_complete(sub, registry).await,
         Some((api_name, api_matches)) => {
             let remaining = execute::collect_remaining_args(api_matches);
-            handle_api_operation(api_name, remaining, registry, &phase1_matches, cache_dir).await
+            handle_api_operation(
+                api_name,
+                remaining,
+                registry,
+                &phase1_matches,
+                cache_dir,
+                sink,
+            )
+            .await
         }
         None => {
             phase1
@@ -346,13 +361,37 @@ async fn show_api_help(
 }
 
 /// Phase 2: load spec, build command tree, parse remaining args, execute.
+///
+/// `sink` is forwarded to the operation dispatch (and the chain recursion) so
+/// a successful response is captured for a downstream pipe/chain stage.
 async fn handle_api_operation(
     api_name: &str,
     remaining: Vec<String>,
     registry: &ApiRegistry,
     phase1_matches: &ArgMatches,
     cache_dir: &std::path::Path,
+    sink: &mut crate::execute::ResponseContext,
 ) -> miette::Result<()> {
+    // #30: `--spall-chain` is global, so placing it *before* the API name binds
+    // it to the phase-1 root. The chain recursion reuses `phase1_matches`, so a
+    // root-bound expression would re-fire on every hop — an unbounded loop of
+    // real requests. Require the flag to follow the operation (where clap routes
+    // it into the phase-2 op matches, firing exactly one hop).
+    if phase1_matches
+        .try_get_one::<String>("spall-chain")
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Err(SpallCliError::Usage(
+            "--spall-chain must be placed after the operation \
+             (e.g. `spall <api> <op> [args] --spall-chain '<op2> --id $.id'`), \
+             not before the API name."
+                .to_string(),
+        )
+        .into());
+    }
+
     let profile = phase1_matches
         .get_one::<String>("profile")
         .map(|s| s.as_str());
@@ -415,32 +454,19 @@ async fn handle_api_operation(
     // Try direct operation match first.
     if let Some(op) = spec.operations.iter().find(|o| o.operation_id == tag_or_op) {
         let combined = execute::merge_matches(phase1_matches, op_matches);
-        let res = execute::execute_operation(
+        return dispatch_resolved_operation(
             op,
             &spec,
             &entry,
             op_matches,
+            &combined,
+            api_name,
+            registry,
             phase1_matches,
             cache_dir,
-            &registry.defaults,
+            sink,
         )
-        .await
-        .map_err(miette::Report::from)?;
-        execute::print_operation_result(&res, &combined).map_err(miette::Report::from)?;
-
-        if let Some(chain_expr_str) = combined.get_one::<String>("spall-chain") {
-            let chain = crate::chain::ChainExpr::parse(&chain_expr_str)?;
-            let next_args = chain.resolve(&res.value)?;
-            let fut = Box::pin(handle_api_operation(
-                api_name,
-                next_args,
-                registry,
-                phase1_matches,
-                cache_dir,
-            ));
-            return fut.await;
-        }
-        return Ok(());
+        .await;
     }
 
     // If not found directly, look for a tag subcommand.
@@ -458,35 +484,116 @@ async fn handle_api_operation(
             .ok_or_else(|| SpallCliError::Usage(format!("Unknown operation: {}", op_name)))?;
 
         let combined = execute::merge_matches(phase1_matches, inner_matches);
-        let res = execute::execute_operation(
+        return dispatch_resolved_operation(
             op,
             &spec,
             &entry,
             inner_matches,
+            &combined,
+            api_name,
+            registry,
             phase1_matches,
             cache_dir,
-            &registry.defaults,
+            sink,
         )
-        .await
-        .map_err(miette::Report::from)?;
-        execute::print_operation_result(&res, &combined).map_err(miette::Report::from)?;
-
-        if let Some(chain_expr_str) = combined.get_one::<String>("spall-chain") {
-            let chain = crate::chain::ChainExpr::parse(&chain_expr_str)?;
-            let next_args = chain.resolve(&res.value)?;
-            let fut = Box::pin(handle_api_operation(
-                api_name,
-                next_args,
-                registry,
-                phase1_matches,
-                cache_dir,
-            ));
-            return fut.await;
-        }
-        return Ok(());
+        .await;
     }
 
     Err(SpallCliError::Usage(format!("Unknown operation: {}", tag_or_op)).into())
+}
+
+/// Execute a resolved operation, emit its body, map an error status to the
+/// right exit code, and run a `--spall-chain` continuation on success.
+///
+/// `execute_operation` returns `None` for dry-run / preview — those print
+/// nothing, do not chain, and succeed. For a real response the body is emitted
+/// first (so 4xx/5xx diagnostics always reach the user), then the status is
+/// mapped to `Http4xx` / `Http5xx`; only a 2xx success proceeds to the chain.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_resolved_operation(
+    op: &spall_core::ir::ResolvedOperation,
+    spec: &spall_core::ir::ResolvedSpec,
+    entry: &spall_config::registry::ApiEntry,
+    op_matches: &ArgMatches,
+    combined: &crate::matches::MergedMatches<'_>,
+    api_name: &str,
+    registry: &ApiRegistry,
+    phase1_matches: &ArgMatches,
+    cache_dir: &std::path::Path,
+    sink: &mut crate::execute::ResponseContext,
+) -> miette::Result<()> {
+    let Some(res) = execute::execute_operation(
+        op,
+        spec,
+        entry,
+        op_matches,
+        phase1_matches,
+        cache_dir,
+        &registry.defaults,
+        sink,
+    )
+    .await
+    .map_err(miette::Report::from)?
+    else {
+        // Dry-run / preview: nothing to print, no response to chain.
+        return Ok(());
+    };
+
+    // Emit the body first so error responses still show their payload.
+    execute::print_operation_result(&res, combined).map_err(miette::Report::from)?;
+
+    // Map an error status to the exit code (body already emitted).
+    if res.status.is_client_error() {
+        return Err(SpallCliError::Http4xx(res.status.as_u16()).into());
+    }
+    if res.status.is_server_error() {
+        return Err(SpallCliError::Http5xx(res.status.as_u16()).into());
+    }
+
+    // 2xx success: a chain continuation may feed the response into another op.
+    //
+    // #30: read the expression from the phase-2 op matches only, never the
+    // merged (phase-1-fallback) view. The recursive `next_args` carry no
+    // `--spall-chain`, so reading from phase-2 makes the chain fire exactly
+    // once and terminate; the phase-1 fallback would re-trigger it forever.
+    if let Some(chain_expr_str) = op_matches
+        .try_get_one::<String>("spall-chain")
+        .ok()
+        .flatten()
+    {
+        let chain = crate::chain::ChainExpr::parse(chain_expr_str)?;
+
+        // #40: chaining stays within a single API. Resolve the target op in the
+        // current spec; a missing op is an actionable usage error rather than a
+        // recurse-into-the-wrong-API or a confusing "Unknown operation".
+        let target_op = spec
+            .operations
+            .iter()
+            .find(|o| o.operation_id == chain.target_op_id)
+            .ok_or_else(|| {
+                SpallCliError::Usage(format!(
+                    "chain target operation '{}' is not part of API '{}'. \
+                     Chaining stays within one API; check the operationId or \
+                     run `spall {} --help` to list operations.",
+                    chain.target_op_id, api_name, api_name
+                ))
+            })?;
+
+        // #34: resolve bindings against the target op's parameter metadata so a
+        // captured value lands on a path parameter positionally and on other
+        // locations as their `--long` flag.
+        let next_args = chain.resolve(&res.value, target_op)?;
+        let fut = Box::pin(handle_api_operation(
+            api_name,
+            next_args,
+            registry,
+            phase1_matches,
+            cache_dir,
+            sink,
+        ));
+        return fut.await;
+    }
+    Ok(())
 }
 
 /// Build Phase 1 command tree from the API registry.

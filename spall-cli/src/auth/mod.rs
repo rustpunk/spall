@@ -8,6 +8,7 @@ pub mod oauth2;
 use reqwest::header::HeaderMap;
 use secrecy::{ExposeSecret, SecretString};
 use spall_config::auth::{ApiKeyLocation, AuthConfig, AuthKind, ResolvedAuth};
+use spall_config::credentials::CredentialKind;
 
 /// Resolve authentication material following the priority chain:
 ///
@@ -207,17 +208,22 @@ fn parse_cli_auth(raw: &str) -> ResolvedAuth {
         }
     }
 
-    // User:pass shorthand (no space, contains exactly one colon).
-    if !raw.contains(' ') && raw.split(':').count() == 2 {
-        let (u, p) = raw.split_once(':').unwrap();
-        return ResolvedAuth::Basic {
-            username: u.to_string(),
-            password: SecretString::new(p.to_string().into()),
-        };
+    // Bare token (no explicit prefix): defer the Basic-vs-Bearer decision to the
+    // single shared classifier in spall-config, so this rule can never drift
+    // from other credential consumers. Basic is chosen only for an unambiguous
+    // `user:pass` (one colon, no whitespace, non-empty halves, not a scheme://
+    // URL); everything else — including `https://host` — is Bearer.
+    match spall_config::credentials::classify_bare_token(raw) {
+        CredentialKind::Basic => {
+            // classify_bare_token guarantees a single colon with non-empty halves.
+            let (u, p) = raw.split_once(':').unwrap_or((raw, ""));
+            ResolvedAuth::Basic {
+                username: u.to_string(),
+                password: SecretString::new(p.to_string().into()),
+            }
+        }
+        _ => ResolvedAuth::Bearer(SecretString::new(raw.to_string().into())),
     }
-
-    // Bare token → Bearer.
-    ResolvedAuth::Bearer(SecretString::new(raw.to_string().into()))
 }
 
 fn resolve_from_config_and_token(
@@ -309,6 +315,42 @@ mod tests {
             result,
             Some(ResolvedAuth::Basic { ref username, ref password })
             if username == "alice" && password.expose_secret() == "secret"
+        ));
+    }
+
+    // #38: a `--spall-auth` value that merely looks like `user:pass` because it
+    // contains one colon must not be misread as Basic. A `scheme://...` URL is
+    // the canonical trap (one colon, no space) and must classify as Bearer.
+    #[tokio::test]
+    async fn cli_override_url_shaped_is_bearer() {
+        let result = resolve("test", None, Some("https://example.com"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "https://example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cli_override_multi_colon_is_bearer() {
+        let result = resolve("test", None, Some("a:b:c")).await.unwrap();
+        assert!(matches!(
+            result,
+            Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "a:b:c"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cli_override_empty_half_is_bearer() {
+        // An empty username or password half is not valid Basic; fall to Bearer.
+        assert!(matches!(
+            resolve("test", None, Some(":secret")).await.unwrap(),
+            Some(ResolvedAuth::Bearer(_))
+        ));
+        assert!(matches!(
+            resolve("test", None, Some("user:")).await.unwrap(),
+            Some(ResolvedAuth::Bearer(_))
         ));
     }
 

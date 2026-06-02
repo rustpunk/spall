@@ -54,11 +54,10 @@ fn handle_search(matches: &ArgMatches, cache_dir: &std::path::Path) -> Result<()
     let status = matches.get_one::<u16>("status").copied();
     let method = matches.get_one::<String>("method").map(|s| s.as_str());
     let url = matches.get_one::<String>("url").map(|s| s.as_str());
-    let since = matches.get_one::<String>("since").and_then(|s| {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .ok()
-            .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp() as u64)
-    });
+    let since = matches
+        .get_one::<String>("since")
+        .map(|s| parse_since(s))
+        .transpose()?;
     let limit = matches.get_one::<usize>("limit").copied().unwrap_or(20);
 
     let rows = history
@@ -146,6 +145,25 @@ fn handle_clear(cache_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Parse a `--since` value (`YYYY-MM-DD`) into a midnight-UTC unix timestamp.
+///
+/// Returns [`crate::SpallCliError::Usage`] on any unparseable input so a malformed date
+/// surfaces as a clear usage error rather than being silently dropped.
+fn parse_since(s: &str) -> Result<u64, crate::SpallCliError> {
+    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
+        crate::SpallCliError::Usage(format!(
+            "Invalid --since value '{s}': expected a date in YYYY-MM-DD format"
+        ))
+    })?;
+    // Midnight UTC of a valid date always exists; map rather than unwrap to keep the
+    // CLI crate panic-free on this user-input path.
+    let ts = date
+        .and_hms_opt(0, 0, 0)
+        .map(|dt| dt.and_utc().timestamp() as u64)
+        .ok_or_else(|| crate::SpallCliError::Usage(format!("Invalid --since value '{s}'")))?;
+    Ok(ts)
+}
+
 fn format_timestamp(ts: u64) -> String {
     let dt = chrono::DateTime::from_timestamp(ts as i64, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH);
     dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
@@ -170,4 +188,42 @@ struct HistoryRecord {
     status: String,
     #[tabled(rename = "Duration")]
     duration: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_since_valid_date() {
+        // 2025-01-15T00:00:00Z == 1736899200.
+        let ts = parse_since("2025-01-15").unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2025, 1, 15)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp() as u64;
+        assert_eq!(ts, expected);
+        assert_eq!(ts, 1_736_899_200);
+    }
+
+    #[test]
+    fn parse_since_out_of_range_is_usage_error() {
+        let err = parse_since("2025-13-99").unwrap_err();
+        assert!(matches!(err, crate::SpallCliError::Usage(_)));
+        assert!(err.to_string().contains("Invalid --since"));
+    }
+
+    #[test]
+    fn parse_since_non_date_word_is_usage_error() {
+        let err = parse_since("yesterday").unwrap_err();
+        assert!(matches!(err, crate::SpallCliError::Usage(_)));
+    }
+
+    #[test]
+    fn parse_since_empty_is_usage_error() {
+        let err = parse_since("").unwrap_err();
+        assert!(matches!(err, crate::SpallCliError::Usage(_)));
+    }
 }

@@ -8,21 +8,38 @@ use spall_core::ir::{
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::sync::Mutex;
 use std::time::Instant;
 
-static LAST_RESPONSE: Mutex<Option<serde_json::Value>> = Mutex::new(None);
-
-/// Store the last successful response JSON for pipe/chain consumers.
-pub fn store_last_response(value: serde_json::Value) {
-    if let Ok(mut guard) = LAST_RESPONSE.lock() {
-        *guard = Some(value);
-    }
+/// The last successful response captured for a pipe/chain consumer.
+///
+/// Threaded explicitly through the dispatch path so there is no cross-command
+/// leak. A throwaway context is passed on paths that have no downstream
+/// consumer (top-level `run`, single-command REPL dispatch); `run_piped` owns a
+/// real one and reads it between stages. Only the 2xx success path writes into
+/// it — dry-run, preview, and 4xx/5xx responses leave it untouched, so a stage
+/// that never produced a response surfaces as a missing value rather than
+/// stale data.
+#[derive(Debug, Default)]
+pub struct ResponseContext {
+    last: Option<serde_json::Value>,
 }
 
-/// Take (consume) the last stored response JSON.
-pub fn take_last_response() -> Option<serde_json::Value> {
-    LAST_RESPONSE.lock().ok().and_then(|mut g| g.take())
+impl ResponseContext {
+    /// Create an empty context.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a successful response for the next pipe/chain stage.
+    pub fn set(&mut self, value: serde_json::Value) {
+        self.last = Some(value);
+    }
+
+    /// Consume the stored response, leaving the context empty.
+    pub fn take(&mut self) -> Option<serde_json::Value> {
+        self.last.take()
+    }
 }
 
 /// Collect remaining arguments after Phase 1 match.
@@ -43,13 +60,19 @@ pub fn collect_remaining_args(matches: &ArgMatches) -> Vec<String> {
 /// Structured return value from `execute_operation_programmatic` and the
 /// clap-driven [`execute_operation`].
 ///
-/// `headers` are stored with **lowercased** names so callers can do
-/// case-insensitive lookups per RFC 9110 without re-walking. Both 2xx
-/// and non-success responses populate this struct; callers that want
-/// 4xx/5xx surfaced as an error invoke [`raise_for_status`].
+/// `status` is the real HTTP status (read by the caller to decide the exit
+/// code). `raw` is the original response body bytes, preserved verbatim for
+/// byte-exact / binary / non-JSON output; it is `None` only for the
+/// paginate-merged path, which has no single original body. `value` is the
+/// parsed JSON (or a `from_utf8_lossy` string fallback) used for `--filter`
+/// and chaining. `headers` are stored with **lowercased** names so callers can
+/// do case-insensitive lookups per RFC 9110 without re-walking. Both 2xx and
+/// non-success responses populate this struct; callers that want 4xx/5xx
+/// surfaced as an error invoke [`raise_for_status`].
 #[derive(Debug)]
 pub struct OperationResult {
     pub status: reqwest::StatusCode,
+    pub raw: Option<Vec<u8>>,
     pub value: serde_json::Value,
     pub headers: BTreeMap<String, String>,
 }
@@ -169,7 +192,7 @@ pub fn raise_for_status(res: OperationResult) -> Result<OperationResult, crate::
 ///
 /// What this **does NOT do** (those belong in the clap wrapper):
 /// dry-run, preview, preflight validation, pagination, hypermedia
-/// follow, history recording, `store_last_response`, verbose/time
+/// follow, history recording, response-context recording, verbose/time
 /// stderr logging, response-schema warning emission.
 #[must_use = "the OperationResult carries the response body"]
 pub async fn execute_operation_programmatic(
@@ -184,6 +207,7 @@ pub async fn execute_operation_programmatic(
     });
     Ok(OperationResult {
         status,
+        raw: Some(body_bytes),
         value,
         headers: lowercase_headers(&resp_hdrs),
     })
@@ -345,11 +369,18 @@ pub(crate) fn build_url_with_path_args(
 /// it translates `ArgMatches` into `ProgrammaticArgs`, then layers
 /// CLI-only behavior (preflight validation, dry-run, preview,
 /// pagination, hypermedia follow, history recording, verbose/time
-/// stderr logging, response-schema warnings, `store_last_response`)
+/// stderr logging, response-schema warnings, response-context recording)
 /// around the shared [`prepare_and_send`] pipeline. The non-paginate,
 /// non-multipart, non-form single-shot path delegates directly to
 /// `execute_operation_programmatic`, which is the canonical pipeline
 /// the Arazzo runner and future MCP server also use.
+///
+/// Returns `Ok(None)` for dry-run / preview (nothing to print, no response to
+/// chain). Returns `Ok(Some(..))` for every real response, including 4xx/5xx —
+/// the status-to-exit-code decision is the caller's, made after the body is
+/// emitted. On a 2xx success the parsed value is also recorded into `sink` for
+/// a downstream pipe/chain stage.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_operation(
     op: &ResolvedOperation,
     spec: &ResolvedSpec,
@@ -358,7 +389,8 @@ pub async fn execute_operation(
     phase1_matches: &ArgMatches,
     cache_dir: &std::path::Path,
     defaults: &spall_config::sources::GlobalDefaults,
-) -> Result<OperationResult, crate::SpallCliError> {
+    sink: &mut ResponseContext,
+) -> Result<Option<OperationResult>, crate::SpallCliError> {
     let combined = merge_matches(phase1_matches, phase2_matches);
 
     // Preflight validation (Wave 2) — clap-only; missing/typed-wrong args
@@ -406,15 +438,10 @@ pub async fn execute_operation(
 
     let url = build_url(op, spec, entry, phase1_matches, phase2_matches)?;
 
-    // Dry run — clap-only, prints to stderr and returns Null.
+    // Dry run — clap-only. Nothing to print, no response to chain, sink untouched.
     if combined.get_flag("spall-dry-run") {
         eprintln!("Dry run: {} {}", op.method, url);
-        store_last_response(serde_json::Value::Null);
-        return Ok(OperationResult {
-            status: reqwest::StatusCode::OK,
-            value: serde_json::Value::Null,
-            headers: BTreeMap::new(),
-        });
+        return Ok(None);
     }
 
     // Preview (Phase D) — clap-only.
@@ -430,12 +457,7 @@ pub async fn execute_operation(
         }
         let body_slice = body_data.body.as_deref();
         crate::preview::print_preview(&op.method.to_string(), &url, &preview_headers, body_slice);
-        store_last_response(serde_json::Value::Null);
-        return Ok(OperationResult {
-            status: reqwest::StatusCode::OK,
-            value: serde_json::Value::Null,
-            headers: BTreeMap::new(),
-        });
+        return Ok(None);
     }
 
     // Pagination, multipart, and the form-urlencoded path that didn't
@@ -457,6 +479,7 @@ pub async fn execute_operation(
             defaults,
             body_data,
             url,
+            sink,
         )
         .await;
     }
@@ -518,10 +541,10 @@ pub async fn execute_operation(
         }
     }
 
-    let raised = raise_for_status(result)?;
-    let mut final_value = raised.value;
-    let resp_headers_lc = raised.headers;
-    let status = raised.status;
+    let status = result.status;
+    let mut final_value = result.value;
+    let mut raw = result.raw;
+    let resp_headers_lc = result.headers;
 
     // --spall-follow <rel>: chase one hypermedia link.
     //
@@ -529,7 +552,16 @@ pub async fn execute_operation(
     // so URL assembly and path-template substitution from the original
     // operation don't apply. We hit `send_one` directly with a fresh
     // client, reusing the same auth/header set as the primary request.
-    if let Some(rel) = combined.get_one::<String>("spall-follow") {
+    //
+    // Only follow from a 2xx primary response: an error body has no
+    // meaningful hypermedia links, and the caller maps the primary
+    // status to the exit code after this returns.
+    let follow_rel = if status.is_success() {
+        combined.get_one::<String>("spall-follow")
+    } else {
+        None
+    };
+    if let Some(rel) = follow_rel {
         let body_ref = if final_value.is_object() || final_value.is_array() {
             Some(&final_value)
         } else {
@@ -564,7 +596,7 @@ pub async fn execute_operation(
             {
                 crate::auth::apply(&a, &mut follow_headers, &mut empty_query);
             }
-            let (fstatus, _fhdrs, fbytes) = send_one(
+            let (fstatus, fhdrs, fbytes) = send_one(
                 &client,
                 HttpMethod::Get,
                 &followed_url,
@@ -576,16 +608,22 @@ pub async fn execute_operation(
                 args.retry_max_wait_secs,
             )
             .await?;
-            if fstatus.is_client_error() {
-                return Err(crate::SpallCliError::Http4xx(fstatus.as_u16()));
-            }
-            if fstatus.is_server_error() {
-                return Err(crate::SpallCliError::Http5xx(fstatus.as_u16()));
-            }
-            final_value =
+            // A failed follow is a hard error: the followed body is not the
+            // primary output, so 4xx/5xx is surfaced rather than emitted.
+            let followed_value =
                 serde_json::from_slice::<serde_json::Value>(&fbytes).unwrap_or_else(|_| {
                     serde_json::Value::String(String::from_utf8_lossy(&fbytes).to_string())
                 });
+            let followed = raise_for_status(OperationResult {
+                status: fstatus,
+                raw: Some(fbytes),
+                value: followed_value,
+                headers: lowercase_headers(&fhdrs),
+            })?;
+            // The followed body replaces the primary one for output, so its
+            // original bytes become the `raw` the unfiltered emitter prints.
+            final_value = followed.value;
+            raw = followed.raw;
         } else if combined.get_flag("spall-verbose") {
             eprintln!("No link with rel=\"{}\" found in response", rel);
         }
@@ -596,12 +634,19 @@ pub async fn execute_operation(
         eprintln!("Duration: {:?}", duration);
     }
 
-    store_last_response(final_value.clone());
-    Ok(OperationResult {
+    // Record for the next pipe/chain stage only on 2xx success; 4xx/5xx leave
+    // the sink untouched so a downstream stage sees no response. Every real
+    // response (including 4xx/5xx) is returned as `Some` — the caller emits the
+    // body and then maps the status to the exit code.
+    if status.is_success() {
+        sink.set(final_value.clone());
+    }
+    Ok(Some(OperationResult {
         status,
+        raw,
         value: final_value,
         headers: resp_headers_lc,
-    })
+    }))
 }
 
 /// Translate clap matches into [`ProgrammaticArgs`].
@@ -678,7 +723,8 @@ async fn execute_legacy_path(
     defaults: &spall_config::sources::GlobalDefaults,
     body_data: BodyData,
     url: String,
-) -> Result<OperationResult, crate::SpallCliError> {
+    sink: &mut ResponseContext,
+) -> Result<Option<OperationResult>, crate::SpallCliError> {
     let combined = merge_matches(phase1_matches, phase2_matches);
 
     let mut headers = HeaderMap::new();
@@ -796,10 +842,20 @@ async fn execute_legacy_path(
                 eprintln!("HTTP {} {}", status, current_url);
             }
             if !status.is_success() {
-                if status.is_client_error() {
-                    return Err(crate::SpallCliError::Http4xx(status.as_u16()));
-                }
-                return Err(crate::SpallCliError::Http5xx(status.as_u16()));
+                // Return the error page's body verbatim for emission; the
+                // caller maps the status to the exit code. Pages collected
+                // before the error are intentionally not concatenated with an
+                // error body — the error payload is the actionable diagnostic.
+                let error_value = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .unwrap_or_else(|_| {
+                        serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string())
+                    });
+                return Ok(Some(OperationResult {
+                    status,
+                    raw: Some(body_bytes),
+                    value: error_value,
+                    headers: lowercase_headers(&resp_headers),
+                }));
             }
             let body_json =
                 serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|e| {
@@ -838,12 +894,17 @@ async fn execute_legacy_path(
             &HeaderMap::new(),
             duration_ms,
         );
-        store_last_response(final_value.clone());
-        return Ok(OperationResult {
+
+        // Paginate succeeded (2xx): record for the next pipe/chain stage.
+        // No single original body survives the merge, so `raw` is None and the
+        // caller emits the parsed value.
+        sink.set(final_value.clone());
+        return Ok(Some(OperationResult {
             status: reqwest::StatusCode::OK,
+            raw: None,
             value: final_value,
             headers: BTreeMap::new(),
-        });
+        }));
     }
 
     // Multipart / form-urlencoded single shot.
@@ -891,28 +952,32 @@ async fn execute_legacy_path(
         }
     }
 
+    // Parse for filter/chain; the utf8-lossy String is only a fallback so those
+    // paths have *something*. The original bytes (`raw`) are what the unfiltered
+    // output path emits, preserving binary/non-JSON content.
     let body_json =
         serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_else(|_| {
             serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string())
         });
 
-    if status.is_client_error() {
-        return Err(crate::SpallCliError::Http4xx(status.as_u16()));
-    }
-    if status.is_server_error() {
-        return Err(crate::SpallCliError::Http5xx(status.as_u16()));
-    }
-
     let duration = start.elapsed();
     if combined.get_flag("spall-time") || combined.get_flag("spall-verbose") {
         eprintln!("Duration: {:?}", duration);
     }
-    store_last_response(body_json.clone());
-    Ok(OperationResult {
+
+    // Record for the next pipe/chain stage only on 2xx success; 4xx/5xx leave
+    // the sink untouched so a downstream stage sees no response. Every real
+    // response (including 4xx/5xx) is returned as `Some` — the caller emits the
+    // body and then maps the status to the exit code.
+    if status.is_success() {
+        sink.set(body_json.clone());
+    }
+    Ok(Some(OperationResult {
         status,
+        raw: Some(body_bytes),
         value: body_json,
         headers: lowercase_headers(&resp_headers),
-    })
+    }))
 }
 
 /// Send a single HTTP request, with transient-error retry.
@@ -1032,6 +1097,13 @@ fn resolve_next_url(current: &str, next: &str) -> Result<String, crate::SpallCli
 }
 
 /// Print an operation result to stdout, applying filter and output mode.
+///
+/// Byte-preserving on the unfiltered path: when no `--filter` is set and the
+/// original body bytes are available (`raw`), they are emitted via
+/// [`crate::output::emit_response`], which writes binary / download / raw
+/// bodies verbatim and only JSON-formats parseable bodies. A `--filter`, or the
+/// paginate-merged path (no single original body), falls through to
+/// [`crate::output::emit_json_value`] on the parsed value.
 pub fn print_operation_result(
     res: &OperationResult,
     combined: &MergedMatches,
@@ -1049,13 +1121,25 @@ pub fn print_operation_result(
                     "Warning: filter failed ({}). Falling back to unfiltered.",
                     e
                 );
-                crate::output::emit_json_value(&res.value, mode, save_path)
-                    .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))
+                emit_unfiltered(res, mode, save_path)
             }
         }
     } else {
-        crate::output::emit_json_value(&res.value, mode, save_path)
-            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))
+        emit_unfiltered(res, mode, save_path)
+    }
+}
+
+/// Emit a result without a filter, preserving original bytes where possible.
+fn emit_unfiltered(
+    res: &OperationResult,
+    mode: crate::output::OutputMode,
+    save_path: Option<&str>,
+) -> Result<(), crate::SpallCliError> {
+    match &res.raw {
+        Some(bytes) => crate::output::emit_response(bytes, mode, save_path)
+            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string())),
+        None => crate::output::emit_json_value(&res.value, mode, save_path)
+            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string())),
     }
 }
 
@@ -1860,10 +1944,20 @@ mod programmatic_tests {
         let phase2 = build_phase2_for_create_item();
         let cache = tempfile::tempdir().expect("tempdir");
         let defaults = spall_config::sources::GlobalDefaults::default();
-        let clap_res =
-            execute_operation(&op, &spec, &entry, &phase2, &phase1, cache.path(), &defaults)
-                .await
-                .expect("clap");
+        let mut sink = ResponseContext::new();
+        let clap_res = execute_operation(
+            &op,
+            &spec,
+            &entry,
+            &phase2,
+            &phase1,
+            cache.path(),
+            &defaults,
+            &mut sink,
+        )
+        .await
+        .expect("clap")
+        .expect("clap produced a response");
         assert_eq!(clap_res.status.as_u16(), 200);
 
         // Cross-check by inspecting received requests directly: every

@@ -1,56 +1,12 @@
-use secrecy::SecretString;
+//! Credential classification — the single source of truth for deciding whether
+//! a raw, prefix-less auth token is HTTP Basic (`user:pass`) or a Bearer token.
+//!
+//! Every consumer (the `--spall-auth` CLI override in `spall-cli`, and any
+//! future credential path) routes its Basic-vs-Bearer decision through
+//! [`classify_bare_token`], so the security-sensitive heuristic lives in exactly
+//! one place and cannot drift between call sites.
 
-/// Credential resolution stack for an API.
-///
-/// Priority (highest to lowest):
-/// 1. `--spall-auth` CLI pass-through (Wave 1)
-/// 2. Environment variable `SPALL_\u003cAPI\u003e_TOKEN` (hyphens → underscores)
-/// 3. OS keyring (Wave 3)
-/// 4. Config file reference (Wave 3)
-///
-/// All resolved credentials are wrapped in `SecretString`.
-#[derive(Debug, Clone)]
-pub struct CredentialResolver {
-    pub api_name: String,
-}
-
-impl CredentialResolver {
-    /// Resolve the best available credential for this API.
-    #[must_use]
-    pub fn resolve(&self, cli_auth: Option<&str>) -> Option<Credential> {
-        if let Some(raw) = cli_auth {
-            return Some(parse_cli_auth(raw));
-        }
-
-        let env_name = self.env_var_name();
-        if let Ok(token) = std::env::var(&env_name) {
-            if !token.is_empty() {
-                return Some(infer_auth(&token));
-            }
-        }
-
-        None
-    }
-
-    /// Build the environment variable name for an API token.
-    ///
-    /// Hyphens become underscores, and the name is uppercased.
-    pub fn env_var_name(&self) -> String {
-        format!(
-            "SPALL_{}_TOKEN",
-            self.api_name.to_uppercase().replace('-', "_")
-        )
-    }
-}
-
-/// A resolved credential with its type.
-#[derive(Debug, Clone)]
-pub struct Credential {
-    pub kind: CredentialKind,
-    pub value: SecretString,
-}
-
-/// Kind of credential.
+/// Kind of credential a raw token maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialKind {
     Bearer,
@@ -58,68 +14,31 @@ pub enum CredentialKind {
     ApiKey,
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn parse_cli_auth(raw: &str) -> Credential {
-    if let Some(token) = raw.strip_prefix("Bearer ") {
-        return Credential {
-            kind: CredentialKind::Bearer,
-            value: SecretString::new(token.to_string().into()),
-        };
+/// Classify a prefix-less token as Basic or Bearer.
+///
+/// Returns [`CredentialKind::Basic`] **only** when `token` is an unambiguous
+/// `user:pass`: no ASCII whitespace, exactly one colon, both halves non-empty,
+/// and the substring after the colon does not start with `//`. That last clause
+/// rejects every `scheme://...` URL (e.g. `https://host`, `keyring://svc`,
+/// `env://VAR`), which also contains a single colon but must never be read as
+/// credentials. Every other token is [`CredentialKind::Bearer`], the safe
+/// default. (`ApiKey` is never inferred from a bare token; callers select it
+/// explicitly from config.)
+///
+/// Callers that handle explicit `Bearer ` / `Basic ` prefixes should strip and
+/// resolve those first, then fall through to this classifier for the bare case.
+#[must_use]
+pub fn classify_bare_token(token: &str) -> CredentialKind {
+    if token.contains(|c: char| c.is_ascii_whitespace()) {
+        return CredentialKind::Bearer;
     }
-
-    if let Some(token) = raw.strip_prefix("Basic ") {
-        if let Ok(decoded) = base64_decode(token) {
-            if let Some((u, p)) = decoded.split_once(':') {
-                return Credential {
-                    kind: CredentialKind::Basic,
-                    value: SecretString::new(format!("{}:{}", u, p).into()),
-                };
-            }
+    if token.split(':').count() != 2 {
+        return CredentialKind::Bearer;
+    }
+    match token.split_once(':') {
+        Some((u, p)) if !u.is_empty() && !p.is_empty() && !p.starts_with("//") => {
+            CredentialKind::Basic
         }
-        if let Some((u, p)) = token.split_once(':') {
-            return Credential {
-                kind: CredentialKind::Basic,
-                value: SecretString::new(format!("{}:{}", u, p).into()),
-            };
-        }
+        _ => CredentialKind::Bearer,
     }
-
-    if !raw.contains(' ') && raw.split(':').count() == 2 {
-        if let Some((u, p)) = raw.split_once(':') {
-            return Credential {
-                kind: CredentialKind::Basic,
-                value: SecretString::new(format!("{}:{}", u, p).into()),
-            };
-        }
-    }
-
-    Credential {
-        kind: CredentialKind::Bearer,
-        value: SecretString::new(raw.to_string().into()),
-    }
-}
-
-fn infer_auth(token: &str) -> Credential {
-    if let Some((u, p)) = token.split_once(':') {
-        if !u.is_empty() && !p.is_empty() && !token.contains(' ') {
-            return Credential {
-                kind: CredentialKind::Basic,
-                value: SecretString::new(format!("{}:{}", u, p).into()),
-            };
-        }
-    }
-
-    Credential {
-        kind: CredentialKind::Bearer,
-        value: SecretString::new(token.to_string().into()),
-    }
-}
-
-fn base64_decode(input: &str) -> Result<String, Box<dyn std::error::Error>> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let decoded = STANDARD.decode(input)?;
-    Ok(String::from_utf8(decoded)?)
 }

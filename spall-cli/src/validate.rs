@@ -1,6 +1,6 @@
 //! Preflight validation of operation parameters and request bodies.
 
-use spall_core::ir::{ResolvedOperation, ResolvedSchema};
+use spall_core::ir::ResolvedOperation;
 use spall_core::validator::{validate_body, validate_param, ValidationError};
 
 /// Validate all operation parameters before execution.
@@ -131,10 +131,4 @@ pub fn format_errors(errors: &[ValidationError]) -> String {
         lines.push(format!("  {}: {}", err.pointer, err.message));
     }
     lines.join("\n")
-}
-
-/// Validate a raw CLI argument value against a schema for ad-hoc use.
-#[allow(dead_code)]
-pub fn validate_value_raw(value: &str, schema: &ResolvedSchema) -> Result<(), ValidationError> {
-    validate_param(value, schema)
 }
