@@ -14,7 +14,7 @@ path = "src/main.rs"
 spall-core = { path = "../spall-core" }
 spall-config = { path = "../spall-config" }
 clap = { version = "4", features = ["string"] }
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util", "io-std"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "multipart", "cookies", "socks", "query"] }
 miette = { version = "7", features = ["fancy"] }
 is-terminal = "0.4"
@@ -29,17 +29,23 @@ tabled = "0.20"
 csv = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 jmespath = "0.5"
+indexmap = "2"
 chrono = "0.4"
 base64 = "0.22"
 rpassword = "7"
 syntect = "5"
 rustyline = "14"
 shlex = "1"
+rand = "0.8"
+sha2 = "0.10"
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+tower-http = { version = "0.5", default-features = false, features = ["cors"] }
 hasp = { git = "https://github.com/rustpunk/hasp", default-features = false, features = ["env", "keyring", "file"], optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+indexmap = "2"
 
 [features]
 default = ["hasp"]

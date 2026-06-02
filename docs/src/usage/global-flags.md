@@ -20,10 +20,12 @@ All internal spall flags use the `--spall-*` prefix so they never collide with A
 | `--spall-server` | `-s` | Override base URL for this request |
 | `--spall-timeout` | `-t` | Timeout in seconds (default: 30) |
 | `--spall-retry` | | Retry count for failed requests (default: 1, max: 3) |
-| `--spall-follow` | `-L` | Follow HTTP redirects (default: off) |
+| `--spall-redirect` | `-L` | Follow HTTP 3xx redirects (default: off) |
 | `--spall-max-redirects` | | Maximum redirects (default: 10) |
 | `--spall-insecure` | | Skip TLS certificate verification |
-| `--spall-ca-cert` | | Path to custom CA certificate |
+| `--spall-ca-cert` | | Path to custom CA certificate (PEM or DER) |
+| `--spall-cert` | | Path to client certificate PEM (mTLS); requires `--spall-key` |
+| `--spall-key` | | Path to client private key PEM (mTLS); requires `--spall-cert` |
 | `--spall-proxy` | | HTTP/SOCKS proxy URL |
 | `--spall-no-proxy` | | Disable proxy for this request |
 
@@ -42,6 +44,8 @@ All internal spall flags use the `--spall-*` prefix so they never collide with A
 | `--spall-dry-run` | | Print curl equivalent without executing |
 | `--spall-preview` | | Show resolved URL, headers, and body without sending |
 | `--spall-paginate` | | Auto-follow `Link` header pagination |
+| `--spall-follow <REL>` | | Follow a hypermedia link (RFC 5988 `Link` header / HAL / JSON:API / Siren) once after a successful response |
+| `--spall-retry-max-wait` | | Maximum seconds to honor a `Retry-After` header before giving up (default: 60) |
 | `--spall-repeat` | | Replay the most recent request from history |
 | `--spall-chain` | | JMESPath chain expression for multi-stage requests |
 | `--profile` | | Active config profile (e.g., `staging`, `production`) |
@@ -65,8 +69,31 @@ spall petstore get-pet-by-id 1 \
 ### Retry with redirect following
 
 ```bash
-spall petstore get-pet-by-id 1 --spall-retry 3 --spall-follow
+spall petstore get-pet-by-id 1 --spall-retry 3 --spall-redirect
 ```
+
+### Hypermedia link following
+
+After a successful response, `--spall-follow <rel>` looks up that `rel`
+across the `Link` header (RFC 5988), HAL `_links`, JSON:API `links`, and
+Siren `links`, then issues a `GET` to the link's target and returns its body
+in place of the original.
+
+```bash
+spall github list-repos --spall-follow next
+spall hal-api get-order 1 --spall-follow self
+```
+
+### mTLS to a private API
+
+```bash
+spall corp list-things \
+  --spall-ca-cert ./corp-ca.pem \
+  --spall-cert ./client.pem \
+  --spall-key ./client-key.pem
+```
+
+The CA cert may be PEM or DER. The client cert and key must both be PEM; pass them as separate files.
 
 ### Replay last request
 

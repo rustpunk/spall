@@ -1,0 +1,41 @@
+arazzo: 1.0.1
+info:
+  title: Workflow with chained outputs
+  version: 1.0.0
+  summary: Capture a token from step 1, send it as the Authorization header in step 2.
+sourceDescriptions:
+  - name: api
+    url: ./simple-openapi.json
+    type: openapi
+workflows:
+  - workflowId: loginAndUseToken
+    summary: Step 1's outputs.token flows into step 2's Authorization header.
+    inputs:
+      type: object
+      properties:
+        email:
+          type: string
+    steps:
+      - stepId: doLogin
+        operationId: login
+        requestBody:
+          contentType: application/json
+          payload:
+            email: $inputs.email
+        successCriteria:
+          - condition: $response.statusCode == 200
+        outputs:
+          token: $response.body#/token
+      - stepId: fetchMe
+        operationId: getMe
+        parameters:
+          - name: Authorization
+            in: header
+            value: $steps.doLogin.outputs.token
+        successCriteria:
+          - condition: $response.statusCode == 200
+        outputs:
+          user_id: $response.body#/user_id
+    outputs:
+      user_id: $steps.fetchMe.outputs.user_id
+      token: $steps.doLogin.outputs.token

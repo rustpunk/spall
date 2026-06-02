@@ -1,0 +1,28 @@
+arazzo: 1.0.1
+info:
+  title: Workflow with success criteria
+  version: 1.0.0
+  summary: Exercise the runtime expression dialect.
+sourceDescriptions:
+  - name: api
+    url: ./simple-openapi.json
+    type: openapi
+workflows:
+  - workflowId: criteriaCheck
+    summary: Login and assert several response invariants.
+    inputs:
+      type: object
+      properties:
+        email:
+          type: string
+    steps:
+      - stepId: doLogin
+        operationId: login
+        requestBody:
+          contentType: application/json
+          payload:
+            email: $inputs.email
+        successCriteria:
+          - condition: $response.statusCode == 200
+          - condition: $response.body#/status == "ready"
+          - condition: $response.body#/token != ""

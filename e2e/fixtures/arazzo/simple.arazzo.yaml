@@ -1,0 +1,30 @@
+arazzo: 1.0.1
+info:
+  title: Simple two-step workflow
+  version: 1.0.0
+  summary: Login, then fetch /me.
+sourceDescriptions:
+  - name: api
+    url: ./simple-openapi.json
+    type: openapi
+workflows:
+  - workflowId: simpleLoginAndFetch
+    summary: A minimal two-step workflow with no criteria.
+    inputs:
+      type: object
+      properties:
+        email:
+          type: string
+    steps:
+      - stepId: doLogin
+        operationId: login
+        requestBody:
+          contentType: application/json
+          payload:
+            email: $inputs.email
+      - stepId: fetchMe
+        operationId: getMe
+        parameters:
+          - name: Authorization
+            in: header
+            value: Bearer placeholder

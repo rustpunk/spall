@@ -74,15 +74,55 @@ kind = "Bearer"
 token_url = "keyring://spall/github-token"
 ```
 
+### OAuth2 (Authorization Code + PKCE)
+
+For APIs that require interactive browser login, configure the IDP endpoints:
+
+```toml
+[auth]
+kind = "OAuth2"
+client_id = "your-app-client-id"
+auth_url = "https://idp.example.com/oauth/authorize"
+token_url = "https://idp.example.com/oauth/token"
+scopes = ["read:user", "repo"]
+```
+
+Then run `spall auth login <api>` once:
+
+```bash
+$ spall auth login github
+Open the following URL in your browser to authorize spall:
+
+    https://idp.example.com/oauth/authorize?response_type=code&client_id=...
+
+Waiting for the authorization callback on 127.0.0.1:53217 ...
+Successfully signed in to 'github'. Tokens stored locally.
+```
+
+Spall binds a one-shot loopback listener (random port), receives the OAuth2 callback,
+exchanges the authorization code at `token_url` using the PKCE verifier, and persists
+the `access_token` + `refresh_token` to `$XDG_CACHE_HOME/spall/oauth2/<api>.json`
+(mode `0600`). On every subsequent request spall refreshes the access token
+automatically when it is within 30 seconds of expiry; if the refresh fails you'll
+be asked to run `spall auth login` again.
+
+> **Note:** OAuth2 tokens are session state owned by spall — they live in the cache
+> dir, not in `hasp`. The `auth.token_url` field has a different meaning for the
+> `OAuth2` kind (the IDP token endpoint) than for `Bearer`/`ApiKey` (a hasp URL).
+
 ## Secret URLs with `hasp`
 
 Spall integrates with [`hasp`](https://github.com/rustpunk/hasp) for fetching secrets from multiple backends via URL-style references. This is the **recommended** way to manage credentials. The default build includes three backends:
 
 | Field | Auth Kinds | Example URL |
 |-------|------------|-------------|
-| `token_url` | `Bearer`, `ApiKey`, `OAuth2` | `env://MY_TOKEN`, `file:~/secrets/api.key`, `keyring://spall/api-token` |
+| `token_url` | `Bearer`, `ApiKey` | `env://MY_TOKEN`, `file:~/secrets/api.key`, `keyring://spall/api-token` |
 | `password_url` | `Basic` | `env://ALICE_PASSWORD`, `file:/run/secrets/password`, `keyring://spall/alice-pass` |
-| `client_secret_url` | `OAuth2` | `env://CLIENT_SECRET` (PKCE flow stub) |
+| `client_secret_url` | `OAuth2` (confidential clients) | `env://CLIENT_SECRET` |
+
+> For `kind = "OAuth2"`, `token_url` is the **IDP token endpoint** (e.g.
+> `https://idp.example/oauth/token`), not a hasp URL. See "OAuth2 (Authorization
+> Code + PKCE)" above.
 
 ### URL Schemes
 

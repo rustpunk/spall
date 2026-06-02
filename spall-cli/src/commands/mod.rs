@@ -3,5 +3,7 @@
 //! CLI subcommands.
 
 pub mod api;
+pub mod arazzo;
 pub mod auth;
 pub mod history;
+pub mod mcp;

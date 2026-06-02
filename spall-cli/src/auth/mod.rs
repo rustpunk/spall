@@ -20,7 +20,11 @@ use spall_config::credentials::CredentialKind;
 /// 6. Global `SPALL_<API>_TOKEN` env var (Wave 1–2 compat)
 /// 7. OAuth2 interactive flow — session token only (stub)
 /// 8. Interactive password prompt for Basic
-pub fn resolve(
+///
+/// SECURITY note (per #13): credential ingresses (clap arg, env var,
+/// TOML field) wrap into `SecretString` within the same statement that
+/// crosses the FFI/OS boundary; see `deserialize_secret_string`.
+pub async fn resolve(
     api_name: &str,
     auth_config: Option<&AuthConfig>,
     cli_auth: Option<&str>,
@@ -41,18 +45,30 @@ pub fn resolve(
         eprintln!(
             "Warning: inline auth token in config is insecure. Use an env var or keyring instead."
         );
-        return Ok(resolve_from_config_and_token(cfg, kind, token));
-    }
-
-    // 3. token_url (keyring:// / env://) — requires `hasp`.
-    #[cfg(feature = "hasp")]
-    if let Some(url) = &cfg.token_url {
-        let secret = hasp::get(url).map_err(|e| map_hasp_error(api_name, e))?;
+        // SECURITY: header-construction boundary.
         return Ok(resolve_from_config_and_token(
             cfg,
             kind,
-            secret.expose_secret(),
+            token.expose_secret(),
         ));
+    }
+
+    // 3. token_url (keyring:// / env://) — requires `hasp`.
+    //
+    // Skipped for `kind = oauth2`: for OAuth2 the `token_url` field is the
+    // IDP's token endpoint (an http(s) URL), not a hasp reference. Stored
+    // OAuth2 tokens live in spall's own cache dir, handled at step 8.
+    #[cfg(feature = "hasp")]
+    if kind != AuthKind::OAuth2 {
+        if let Some(url) = &cfg.token_url {
+            let secret = hasp::get(url).map_err(|e| map_hasp_error(api_name, e))?;
+            // SECURITY: header-construction boundary.
+            return Ok(resolve_from_config_and_token(
+                cfg,
+                kind,
+                secret.expose_secret(),
+            ));
+        }
     }
 
     // 4. Basic password_url takes precedence over password_env.
@@ -102,17 +118,11 @@ pub fn resolve(
         }
     }
 
-    // 8. OAuth2 client_secret_url (future-proofing; full PKCE flow not yet implemented).
-    #[cfg(feature = "hasp")]
+    // 8. OAuth2 stored tokens from `spall auth login`. Refresh transparently
+    //    when the cached access token is past (or within 30s of) its expiry.
     if kind == AuthKind::OAuth2 {
-        if let Some(_url) = &cfg.client_secret_url {
-            // TODO(Wave 3+): integrate into full OAuth2 PKCE flow.
-        }
-    }
-
-    // 9. OAuth2 session token (stub — no session persistence yet).
-    if kind == AuthKind::OAuth2 {
-        return Ok(None);
+        let stored = oauth2::ensure_fresh_token(api_name).await?;
+        return Ok(stored.map(ResolvedAuth::OAuth2));
     }
 
     // 9. Interactive password prompt for Basic.
@@ -150,6 +160,7 @@ pub fn apply(
             );
         }
         ResolvedAuth::Basic { username, password } => {
+            // SECURITY: header-construction boundary.
             let creds = format!("{}:{}", username, password.expose_secret());
             basic::apply(&SecretString::new(creds.into()), headers);
         }
@@ -280,26 +291,26 @@ fn resolve_from_config_and_token(
 mod tests {
     use super::*;
 
-    #[test]
-    fn cli_override_bearer() {
+    #[tokio::test]
+    async fn cli_override_bearer() {
         let cfg = AuthConfig {
             kind: Some(AuthKind::Bearer),
             ..Default::default()
         };
-        let result = resolve("test", Some(&cfg), Some("Bearer abc123")).unwrap();
+        let result = resolve("test", Some(&cfg), Some("Bearer abc123")).await.unwrap();
         assert!(matches!(
             result,
             Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "abc123"
         ));
     }
 
-    #[test]
-    fn cli_override_basic_shorthand() {
+    #[tokio::test]
+    async fn cli_override_basic_shorthand() {
         let cfg = AuthConfig {
             kind: Some(AuthKind::Basic),
             ..Default::default()
         };
-        let result = resolve("test", Some(&cfg), Some("alice:secret")).unwrap();
+        let result = resolve("test", Some(&cfg), Some("alice:secret")).await.unwrap();
         assert!(matches!(
             result,
             Some(ResolvedAuth::Basic { ref username, ref password })
@@ -310,53 +321,55 @@ mod tests {
     // #38: a `--spall-auth` value that merely looks like `user:pass` because it
     // contains one colon must not be misread as Basic. A `scheme://...` URL is
     // the canonical trap (one colon, no space) and must classify as Bearer.
-    #[test]
-    fn cli_override_url_shaped_is_bearer() {
-        let result = resolve("test", None, Some("https://example.com")).unwrap();
+    #[tokio::test]
+    async fn cli_override_url_shaped_is_bearer() {
+        let result = resolve("test", None, Some("https://example.com"))
+            .await
+            .unwrap();
         assert!(matches!(
             result,
             Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "https://example.com"
         ));
     }
 
-    #[test]
-    fn cli_override_multi_colon_is_bearer() {
-        let result = resolve("test", None, Some("a:b:c")).unwrap();
+    #[tokio::test]
+    async fn cli_override_multi_colon_is_bearer() {
+        let result = resolve("test", None, Some("a:b:c")).await.unwrap();
         assert!(matches!(
             result,
             Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "a:b:c"
         ));
     }
 
-    #[test]
-    fn cli_override_empty_half_is_bearer() {
+    #[tokio::test]
+    async fn cli_override_empty_half_is_bearer() {
         // An empty username or password half is not valid Basic; fall to Bearer.
         assert!(matches!(
-            resolve("test", None, Some(":secret")).unwrap(),
+            resolve("test", None, Some(":secret")).await.unwrap(),
             Some(ResolvedAuth::Bearer(_))
         ));
         assert!(matches!(
-            resolve("test", None, Some("user:")).unwrap(),
+            resolve("test", None, Some("user:")).await.unwrap(),
             Some(ResolvedAuth::Bearer(_))
         ));
     }
 
-    #[test]
-    fn inline_token_warns_and_resolves() {
+    #[tokio::test]
+    async fn inline_token_warns_and_resolves() {
         let cfg = AuthConfig {
             kind: Some(AuthKind::Bearer),
-            token: Some("tkn".to_string()),
+            token: Some(SecretString::new("tkn".to_string().into())),
             ..Default::default()
         };
-        let result = resolve("test", Some(&cfg), None).unwrap();
+        let result = resolve("test", Some(&cfg), None).await.unwrap();
         assert!(matches!(
             result,
             Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "tkn"
         ));
     }
 
-    #[test]
-    fn token_env_resolves() {
+    #[tokio::test]
+    async fn token_env_resolves() {
         let var = "SPALL_AUTH_TEST_TOKEN";
         std::env::set_var(var, "env-tkn");
         let cfg = AuthConfig {
@@ -364,7 +377,7 @@ mod tests {
             token_env: Some(var.to_string()),
             ..Default::default()
         };
-        let result = resolve("test", Some(&cfg), None).unwrap();
+        let result = resolve("test", Some(&cfg), None).await.unwrap();
         assert!(matches!(
             result,
             Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "env-tkn"
@@ -372,9 +385,9 @@ mod tests {
         std::env::remove_var(var);
     }
 
-    #[test]
-    fn no_auth_config_returns_none() {
-        let result = resolve("test", None, None).unwrap();
+    #[tokio::test]
+    async fn no_auth_config_returns_none() {
+        let result = resolve("test", None, None).await.unwrap();
         assert!(result.is_none());
     }
 

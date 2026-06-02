@@ -1,5 +1,7 @@
 //! spall-cli: Binary entry point. Two-phase clap parse and dispatch.
 
+mod arazzo_runner;
+mod arazzo_runner_actions;
 mod auth;
 mod chain;
 mod commands;
@@ -10,7 +12,9 @@ mod fetch;
 mod filter;
 mod history;
 mod http;
+mod links;
 mod matches;
+mod mcp;
 mod output;
 mod paginate;
 mod preview;
@@ -176,7 +180,9 @@ pub async fn run_with_args(
             // consistently.  If the subcommand is "discover" we ignore the flag.
             commands::api::handle_api_management(sub, cache_dir).await
         }
+        Some(("arazzo", sub)) => commands::arazzo::handle_arazzo(sub, registry, cache_dir).await,
         Some(("auth", sub)) => commands::auth::handle_auth(sub).await,
+        Some(("mcp", sub)) => commands::mcp::handle_mcp(sub, registry, cache_dir).await,
         Some(("completions", sub)) => {
             let shell = sub
                 .get_one::<String>("shell")
@@ -600,6 +606,8 @@ fn build_phase1(registry: &ApiRegistry) -> Command {
         .about("Break free. Hit the endpoint.")
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand(api_management_cmd())
+        .subcommand(commands::arazzo::arazzo_cmd())
+        .subcommand(commands::mcp::mcp_cmd())
         .subcommand(auth_cmd())
         .subcommand(history_cmd())
         .subcommand(
@@ -793,12 +801,12 @@ fn spall_global_args() -> Vec<Arg> {
             .value_parser(clap::value_parser!(u8).range(..=3))
             .global(true)
             .help("Retry count for failed requests (default: 1, max: 3)"),
-        Arg::new("spall-follow")
-            .long("spall-follow")
+        Arg::new("spall-redirect")
+            .long("spall-redirect")
             .short('L')
             .action(ArgAction::SetTrue)
             .global(true)
-            .help("Follow HTTP redirects (default: off)"),
+            .help("Follow HTTP 3xx redirects (default: off)"),
         Arg::new("spall-max-redirects")
             .long("spall-max-redirects")
             .default_value("10")
@@ -823,7 +831,15 @@ fn spall_global_args() -> Vec<Arg> {
         Arg::new("spall-ca-cert")
             .long("spall-ca-cert")
             .global(true)
-            .help("Path to custom CA certificate"),
+            .help("Path to custom CA certificate (PEM or DER)"),
+        Arg::new("spall-cert")
+            .long("spall-cert")
+            .global(true)
+            .help("Path to client certificate PEM (mTLS); requires --spall-key"),
+        Arg::new("spall-key")
+            .long("spall-key")
+            .global(true)
+            .help("Path to client private key PEM (mTLS); requires --spall-cert"),
         Arg::new("spall-no-proxy")
             .long("spall-no-proxy")
             .action(ArgAction::SetTrue)
@@ -843,6 +859,17 @@ fn spall_global_args() -> Vec<Arg> {
             .action(ArgAction::SetTrue)
             .global(true)
             .help("Auto-follow Link header pagination"),
+        Arg::new("spall-follow")
+            .long("spall-follow")
+            .global(true)
+            .value_name("REL")
+            .help("After a successful response, follow the hypermedia link with this rel (RFC 5988 / HAL / JSON:API / Siren)"),
+        Arg::new("spall-retry-max-wait")
+            .long("spall-retry-max-wait")
+            .default_value("60")
+            .value_parser(clap::value_parser!(u64))
+            .global(true)
+            .help("Maximum seconds to honor a Retry-After header before giving up (default: 60)"),
         Arg::new("spall-preview")
             .long("spall-preview")
             .action(ArgAction::SetTrue)

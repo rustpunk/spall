@@ -46,24 +46,7 @@ impl Paginator {
 /// Example input:
 /// `\u003chttps://api.example.com?page=2\u003e; rel="next", \u003chttps://api.example.com?page=1\u003e; rel="prev"`
 fn parse_link_header(link: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for part in link.split(',') {
-        let mut url = None;
-        let mut rel = None;
-        for segment in part.split(';') {
-            let seg = segment.trim();
-            if seg.starts_with('<') && seg.ends_with('>') {
-                url = Some(seg[1..seg.len() - 1].to_string());
-            } else if let Some(rest) = seg.strip_prefix("rel=") {
-                let clean = rest.trim().trim_matches('"').to_string();
-                rel = Some(clean);
-            }
-        }
-        if let (Some(u), Some(r)) = (url, rel) {
-            out.push((r, u));
-        }
-    }
-    out
+    crate::links::parse_rfc5988(link)
 }
 
 #[cfg(test)]

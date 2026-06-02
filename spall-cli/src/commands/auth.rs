@@ -23,7 +23,7 @@ async fn handle_status(matches: &ArgMatches) -> Result<()> {
         .find(api_name)
         .ok_or_else(|| crate::SpallCliError::Usage(format!("Unknown API: {}", api_name)))?;
 
-    let resolved = crate::auth::resolve(api_name, entry.auth.as_ref(), None)?;
+    let resolved = crate::auth::resolve(api_name, entry.auth.as_ref(), None).await?;
 
     if let Some(auth) = resolved {
         eprintln!("Auth for '{}': kind = {}", api_name, auth.kind_label());
@@ -61,10 +61,7 @@ async fn handle_login(matches: &ArgMatches) -> Result<()> {
         .unwrap_or(spall_config::auth::AuthKind::Bearer)
     {
         spall_config::auth::AuthKind::OAuth2 => {
-            eprintln!("OAuth2 login stub for '{}'", api_name);
-            eprintln!("In Wave 3 Independent, obtain a token manually and pass it via --spall-auth or SPALL_{}_TOKEN.",
-                api_name.to_uppercase().replace('-', "_"));
-            // TODO(Wave 3+): implement full PKCE browser flow.
+            crate::auth::oauth2::run_login(api_name, auth_config).await?;
         }
         spall_config::auth::AuthKind::Basic => {
             eprintln!("Basic auth for '{}' does not require login.", api_name);

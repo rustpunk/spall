@@ -1,0 +1,31 @@
+arazzo: "1.0.1"
+info:
+  title: Reusable named actions via $components
+  version: "1.0.0"
+  summary: "A step's onFailure chain references a named FailureAction from the components library instead of inlining it."
+sourceDescriptions:
+  - name: api
+    url: ./simple-openapi.json
+    type: openapi
+components:
+  failureActions:
+    bail:
+      name: bail
+      type: end
+  successActions:
+    keepGoing:
+      name: keepGoing
+      type: end
+workflows:
+  - workflowId: viaComponents
+    steps:
+      - stepId: probeStep
+        operationId: getItem
+        parameters:
+          - name: id
+            in: path
+            value: "1"
+        onFailure:
+          - reference: $components.failureActions.bail
+        onSuccess:
+          - reference: $components.successActions.keepGoing

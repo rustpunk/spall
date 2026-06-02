@@ -147,7 +147,7 @@ fn handle_clear(cache_dir: &std::path::Path) -> Result<()> {
 
 /// Parse a `--since` value (`YYYY-MM-DD`) into a midnight-UTC unix timestamp.
 ///
-/// Returns [`SpallCliError::Usage`] on any unparseable input so a malformed date
+/// Returns [`crate::SpallCliError::Usage`] on any unparseable input so a malformed date
 /// surfaces as a clear usage error rather than being silently dropped.
 fn parse_since(s: &str) -> Result<u64, crate::SpallCliError> {
     let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
