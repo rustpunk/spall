@@ -166,6 +166,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
                 let mut arg = Arg::new(id.clone())
                     .value_name(param.name.to_string())
                     .required(param.required)
+                    .allow_hyphen_values(true)
                     .help(param.description.unwrap_or_default().to_string());
                 if let Some(schema) = param.schema {
                     arg = apply_schema_parsing(arg, schema);
@@ -177,6 +178,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
                 let mut arg = Arg::new(id.clone())
                     .long(long_name.to_string())
                     .required(param.required)
+                    .allow_hyphen_values(true)
                     .help(param.description.unwrap_or_default().to_string());
                 if let Some(schema) = param.schema {
                     arg = apply_schema_parsing(arg, schema);
@@ -189,6 +191,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
                 let mut arg = Arg::new(id.clone())
                     .long(format!("header-{}", kebab))
                     .required(param.required)
+                    .allow_hyphen_values(true)
                     .help(param.description.unwrap_or_default().to_string());
                 if let Some(schema) = param.schema {
                     arg = apply_schema_parsing(arg, schema);
@@ -201,6 +204,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
                 let mut arg = Arg::new(id.clone())
                     .long(format!("cookie-{}", kebab))
                     .required(param.required)
+                    .allow_hyphen_values(true)
                     .help(param.description.unwrap_or_default().to_string());
                 if let Some(schema) = param.schema {
                     arg = apply_schema_parsing(arg, schema);
@@ -215,6 +219,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
             .long("data")
             .short('d')
             .action(ArgAction::Append)
+            .allow_hyphen_values(true)
             .help("Request body (JSON). Use @file.json or - for stdin.");
 
         if op.body_required {
@@ -234,6 +239,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
             Arg::new("form")
                 .long("form")
                 .action(ArgAction::Append)
+                .allow_hyphen_values(true)
                 .help("Multipart form field (e.g., file=@image.png)")
                 .conflicts_with("data")
                 .conflicts_with("field"),
@@ -243,6 +249,7 @@ fn build_op_cmd(op: &LightOp) -> Command {
             Arg::new("field")
                 .long("field")
                 .action(ArgAction::Append)
+                .allow_hyphen_values(true)
                 .help("URL-encoded form field (e.g., grant_type=client_credentials)")
                 .conflicts_with("data")
                 .conflicts_with("form"),
@@ -300,4 +307,90 @@ fn group_by_tag<'a>(ops: &'a [LightOp<'a>]) -> IndexMap<String, Vec<&'a LightOp<
     }
 
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn light_param(name: &'static str, location: ParameterLocation) -> LightParam<'static> {
+        LightParam {
+            name,
+            cli_name: None,
+            hidden: false,
+            location,
+            required: true,
+            description: None,
+            schema: None,
+        }
+    }
+
+    /// An op command must accept a positional path value and a `--long` query
+    /// value that begin with `-`, so chained dash-prefixed values (issue #36)
+    /// parse instead of being mistaken for flags.
+    #[test]
+    fn op_cmd_accepts_dash_prefixed_path_and_query_values() {
+        let op = LightOp {
+            operation_id: "update-thing",
+            cli_name: None,
+            hidden: false,
+            group: None,
+            summary: None,
+            deprecated: false,
+            tags: &[],
+            params: vec![
+                light_param("id", ParameterLocation::Path),
+                light_param("offset", ParameterLocation::Query),
+            ],
+            has_body: false,
+            body_required: false,
+        };
+
+        let cmd = build_op_cmd(&op);
+        let matches = cmd
+            .try_get_matches_from(["update-thing", "-5", "--offset", "-10"])
+            .expect("dash-prefixed positional path and --long query values must parse");
+
+        assert_eq!(
+            matches.get_one::<String>("path-id").map(String::as_str),
+            Some("-5"),
+            "positional path value beginning with '-' should be captured"
+        );
+        assert_eq!(
+            matches.get_one::<String>("query-offset").map(String::as_str),
+            Some("-10"),
+            "query value beginning with '-' should be captured"
+        );
+    }
+
+    /// A dash-prefixed `--data` body value must parse too (issue #36 covers the
+    /// body args as well as path/query/header/cookie params).
+    #[test]
+    fn op_cmd_accepts_dash_prefixed_data_body() {
+        let op = LightOp {
+            operation_id: "create-thing",
+            cli_name: None,
+            hidden: false,
+            group: None,
+            summary: None,
+            deprecated: false,
+            tags: &[],
+            params: vec![],
+            has_body: true,
+            body_required: false,
+        };
+
+        let cmd = build_op_cmd(&op);
+        let matches = cmd
+            .try_get_matches_from(["create-thing", "--data", "-not-a-flag"])
+            .expect("dash-prefixed --data value must parse");
+
+        assert_eq!(
+            matches
+                .get_many::<String>("data")
+                .map(|v| v.map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["-not-a-flag"]),
+            "data value beginning with '-' should be captured"
+        );
+    }
 }

@@ -1,6 +1,5 @@
 use crate::matches::MergedMatches;
 use reqwest::{redirect::Policy, Client, Proxy};
-use std::collections::HashMap;
 use std::time::Duration;
 
 /// Configuration for building the HTTP client.
@@ -15,8 +14,6 @@ pub struct HttpConfig {
     pub proxy: Option<String>,
     pub no_proxy: bool,
     pub base_url_override: Option<String>,
-    #[allow(dead_code)]
-    pub default_headers: HashMap<String, String>,
     pub user_agent: String,
     pub auth_header: Option<String>,
     pub custom_headers: Vec<(String, String)>,
@@ -34,7 +31,6 @@ impl Default for HttpConfig {
             proxy: None,
             no_proxy: false,
             base_url_override: None,
-            default_headers: HashMap::new(),
             user_agent: format!("spall/{}", env!("CARGO_PKG_VERSION")),
             auth_header: None,
             custom_headers: Vec::new(),
@@ -195,21 +191,4 @@ pub fn build_fetch_client(proxy_url: Option<&str>) -> Result<Client, reqwest::Er
     }
 
     builder.build()
-}
-
-/// Retry configuration.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    pub max_retries: u8,
-    pub base_delay_ms: u64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 1,
-            base_delay_ms: 500,
-        }
-    }
 }

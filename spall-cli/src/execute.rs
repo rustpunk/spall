@@ -7,21 +7,38 @@ use spall_core::ir::{
 };
 
 use std::io::Read;
-use std::sync::Mutex;
 use std::time::Instant;
 
-static LAST_RESPONSE: Mutex<Option<serde_json::Value>> = Mutex::new(None);
-
-/// Store the last successful response JSON for pipe/chain consumers.
-pub fn store_last_response(value: serde_json::Value) {
-    if let Ok(mut guard) = LAST_RESPONSE.lock() {
-        *guard = Some(value);
-    }
+/// The last successful response captured for a pipe/chain consumer.
+///
+/// Threaded explicitly through the dispatch path so there is no cross-command
+/// leak. A throwaway context is passed on paths that have no downstream
+/// consumer (top-level `run`, single-command REPL dispatch); `run_piped` owns a
+/// real one and reads it between stages. Only the 2xx success path writes into
+/// it — dry-run, preview, and 4xx/5xx responses leave it untouched, so a stage
+/// that never produced a response surfaces as a missing value rather than
+/// stale data.
+#[derive(Debug, Default)]
+pub struct ResponseContext {
+    last: Option<serde_json::Value>,
 }
 
-/// Take (consume) the last stored response JSON.
-pub fn take_last_response() -> Option<serde_json::Value> {
-    LAST_RESPONSE.lock().ok().and_then(|mut g| g.take())
+impl ResponseContext {
+    /// Create an empty context.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a successful response for the next pipe/chain stage.
+    pub fn set(&mut self, value: serde_json::Value) {
+        self.last = Some(value);
+    }
+
+    /// Consume the stored response, leaving the context empty.
+    pub fn take(&mut self) -> Option<serde_json::Value> {
+        self.last.take()
+    }
 }
 
 /// Collect remaining arguments after Phase 1 match.
@@ -40,13 +57,27 @@ pub fn collect_remaining_args(matches: &ArgMatches) -> Vec<String> {
 }
 
 /// Structured return value from `execute_operation`.
-#[allow(dead_code)]
+///
+/// `status` is the real HTTP status (read by the caller to decide the exit
+/// code). `raw` is the original response body bytes, preserved verbatim for
+/// byte-exact / binary / non-JSON output; it is `None` only for the
+/// paginate-merged path, which has no single original body. `value` is the
+/// parsed JSON (or a `from_utf8_lossy` string fallback) used for `--filter`
+/// and chaining.
 pub struct OperationResult {
     pub status: reqwest::StatusCode,
+    pub raw: Option<Vec<u8>>,
     pub value: serde_json::Value,
 }
 
 /// Execute a matched operation.
+///
+/// Returns `Ok(None)` for dry-run / preview (nothing to print, no response to
+/// chain). Returns `Ok(Some(..))` for every real response, including 4xx/5xx —
+/// the status-to-exit-code decision is the caller's, made after the body is
+/// emitted. On a 2xx success the parsed value is also recorded into `sink` for
+/// a downstream pipe/chain stage.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_operation(
     op: &ResolvedOperation,
     spec: &ResolvedSpec,
@@ -55,7 +86,8 @@ pub async fn execute_operation(
     phase1_matches: &ArgMatches,
     cache_dir: &std::path::Path,
     defaults: &spall_config::sources::GlobalDefaults,
-) -> Result<OperationResult, crate::SpallCliError> {
+    sink: &mut ResponseContext,
+) -> Result<Option<OperationResult>, crate::SpallCliError> {
     let url = build_url(op, spec, entry, phase1_matches, phase2_matches)?;
 
     let mut headers = HeaderMap::new();
@@ -147,26 +179,17 @@ pub async fn execute_operation(
     let client = crate::http::build_http_client(&http_config)
         .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))?;
 
-    // Dry run
+    // Dry run: nothing to print, no response to chain, sink untouched.
     if combined.get_flag("spall-dry-run") {
         eprintln!("Dry run: {} {}", op.method, url);
-        store_last_response(serde_json::Value::Null);
-        store_last_response(serde_json::Value::Null);
-        return Ok(OperationResult {
-            status: reqwest::StatusCode::OK,
-            value: serde_json::Value::Null,
-        });
+        return Ok(None);
     }
 
-    // Preview (Phase D)
+    // Preview (Phase D): nothing to print, no response to chain, sink untouched.
     if combined.get_flag("spall-preview") {
         let body_slice = body_data.body.as_deref();
         crate::preview::print_preview(&op.method.to_string(), &url, &headers, body_slice);
-        store_last_response(serde_json::Value::Null);
-        return Ok(OperationResult {
-            status: reqwest::StatusCode::OK,
-            value: serde_json::Value::Null,
-        });
+        return Ok(None);
     }
 
     let retry_count = combined.get_one::<u8>("spall-retry").unwrap_or(1);
@@ -211,11 +234,19 @@ pub async fn execute_operation(
             }
 
             if !status.is_success() {
-                if status.is_client_error() {
-                    return Err(crate::SpallCliError::Http4xx(status.as_u16()));
-                } else {
-                    return Err(crate::SpallCliError::Http5xx(status.as_u16()));
-                }
+                // Return the error page's body verbatim for emission; the
+                // caller maps the status to the exit code. Pages collected
+                // before the error are intentionally not concatenated with an
+                // error body — the error payload is the actionable diagnostic.
+                let error_value = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .unwrap_or_else(|_| {
+                        serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string())
+                    });
+                return Ok(Some(OperationResult {
+                    status,
+                    raw: Some(body_bytes),
+                    value: error_value,
+                }));
             }
 
             let body_json =
@@ -262,12 +293,15 @@ pub async fn execute_operation(
             duration_ms,
         );
 
-        store_last_response(final_value.clone());
-        // Return paginated result for caller-side filtering/output
-        Ok(OperationResult {
+        // Paginate succeeded (2xx): record for the next pipe/chain stage.
+        // No single original body survives the merge, so `raw` is None and the
+        // caller emits the parsed value.
+        sink.set(final_value.clone());
+        Ok(Some(OperationResult {
             status: reqwest::StatusCode::OK,
+            raw: None,
             value: final_value,
-        })
+        }))
     } else {
         let (status, resp_headers, body_bytes) = send_one(
             &client,
@@ -315,27 +349,30 @@ pub async fn execute_operation(
             }
         }
 
+        // Parse for filter/chain; the utf8-lossy String is only a fallback so
+        // those paths have *something*. The original bytes (`raw`) are what the
+        // unfiltered output path emits, preserving binary/non-JSON content.
         let body_json =
             serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_else(|_| {
                 serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string())
             });
-
-        if status.is_client_error() {
-            return Err(crate::SpallCliError::Http4xx(status.as_u16()));
-        } else if status.is_server_error() {
-            return Err(crate::SpallCliError::Http5xx(status.as_u16()));
-        }
 
         let duration = start.elapsed();
         if combined.get_flag("spall-time") || combined.get_flag("spall-verbose") {
             eprintln!("Duration: {:?}", duration);
         }
 
-        store_last_response(body_json.clone());
-        Ok(OperationResult {
+        // Record for the next pipe/chain stage only on 2xx success; 4xx/5xx
+        // leave the sink untouched so a downstream stage sees no response.
+        if status.is_success() {
+            sink.set(body_json.clone());
+        }
+
+        Ok(Some(OperationResult {
             status,
+            raw: Some(body_bytes),
             value: body_json,
-        })
+        }))
     }
 }
 
@@ -420,6 +457,13 @@ fn resolve_next_url(current: &str, next: &str) -> Result<String, crate::SpallCli
 }
 
 /// Print an operation result to stdout, applying filter and output mode.
+///
+/// Byte-preserving on the unfiltered path: when no `--filter` is set and the
+/// original body bytes are available (`raw`), they are emitted via
+/// [`crate::output::emit_response`], which writes binary / download / raw
+/// bodies verbatim and only JSON-formats parseable bodies. A `--filter`, or the
+/// paginate-merged path (no single original body), falls through to
+/// [`crate::output::emit_json_value`] on the parsed value.
 pub fn print_operation_result(
     res: &OperationResult,
     combined: &MergedMatches,
@@ -437,13 +481,25 @@ pub fn print_operation_result(
                     "Warning: filter failed ({}). Falling back to unfiltered.",
                     e
                 );
-                crate::output::emit_json_value(&res.value, mode, save_path)
-                    .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))
+                emit_unfiltered(res, mode, save_path)
             }
         }
     } else {
-        crate::output::emit_json_value(&res.value, mode, save_path)
-            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string()))
+        emit_unfiltered(res, mode, save_path)
+    }
+}
+
+/// Emit a result without a filter, preserving original bytes where possible.
+fn emit_unfiltered(
+    res: &OperationResult,
+    mode: crate::output::OutputMode,
+    save_path: Option<&str>,
+) -> Result<(), crate::SpallCliError> {
+    match &res.raw {
+        Some(bytes) => crate::output::emit_response(bytes, mode, save_path)
+            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string())),
+        None => crate::output::emit_json_value(&res.value, mode, save_path)
+            .map_err(|e| crate::SpallCliError::HttpClient(e.to_string())),
     }
 }
 

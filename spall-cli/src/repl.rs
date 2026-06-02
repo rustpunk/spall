@@ -20,6 +20,18 @@ enum PipeError {
     },
     #[error("Pipe failed at stage {stage}: no response from previous stage to feed into next stage\n  To debug:   ensure stage {} succeeded and returned JSON", stage - 1)]
     NoPreviousResponse { stage: usize },
+    #[error("Pipe failed at stage {stage}: chain target '{target}' is not an operation of API '{api}'\n  Reason:     chaining stays within a single API; to chain across APIs run them as separate pipes\n  To debug:   spall {api} --help")]
+    UnknownTarget {
+        stage: usize,
+        api: String,
+        target: String,
+    },
+    #[error("Pipe failed at stage {stage}: could not load the spec for API '{api}'\n  Reason:     {reason}")]
+    SpecLoad {
+        stage: usize,
+        api: String,
+        reason: String,
+    },
     #[error("Pipe failed at stage {stage}: request error\n  Reason:     {reason}")]
     Http { stage: usize, reason: String },
 }
@@ -88,9 +100,10 @@ pub async fn run(
                         // Prepend binary name so run_with_args sees correct argv[0].
                         let mut full_args = vec!["spall".to_string()];
                         full_args.extend(args);
-                        // Dispatch in a boxed future to avoid async recursion.
+                        // Single-command dispatch has no downstream consumer.
                         let dispatch = async move {
-                            crate::run_with_args(&full_args, registry, cache_dir).await
+                            let mut sink = crate::execute::ResponseContext::new();
+                            crate::run_with_args(&full_args, registry, cache_dir, &mut sink).await
                         };
                         if let Err(e) = Box::pin(dispatch).await {
                             let code = match e.downcast_ref::<crate::SpallCliError>() {
@@ -147,6 +160,23 @@ fn show_history(cache_dir: &Path) -> Result<(), crate::SpallCliError> {
     Ok(())
 }
 
+/// Load the resolved spec for a registered API, used to resolve and validate
+/// chain targets in a pipe (the stage-0 API governs every later stage).
+async fn load_api_spec(
+    api_name: &str,
+    registry: &spall_config::registry::ApiRegistry,
+    cache_dir: &Path,
+) -> Result<spall_core::ir::ResolvedSpec, String> {
+    let entry = registry
+        .resolve_profile(api_name, None)
+        .ok_or_else(|| format!("unknown API '{}'", api_name))?;
+    let proxy = crate::http::resolve_env_proxy();
+    let raw = crate::fetch::load_raw(&entry.source, cache_dir, proxy.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    spall_core::cache::load_or_resolve(&entry.source, &raw, cache_dir).map_err(|e| e.to_string())
+}
+
 async fn run_piped(
     stages: &[&str],
     registry: &spall_config::registry::ApiRegistry,
@@ -178,7 +208,20 @@ async fn run_piped(
     let mut full_args = vec!["spall".to_string()];
     full_args.extend(stage0_args.clone());
 
-    match Box::pin(crate::run_with_args(&full_args, registry, cache_dir)).await {
+    // Explicit per-pipe response context (replaces the former global static).
+    // Each stage writes into it only on a successful operation; a stage that
+    // never reaches `execute_operation` (e.g. `history list`) leaves it empty,
+    // so the next stage sees `NoPreviousResponse` instead of stale data.
+    let mut sink = crate::execute::ResponseContext::new();
+
+    match Box::pin(crate::run_with_args(
+        &full_args,
+        registry,
+        cache_dir,
+        &mut sink,
+    ))
+    .await
+    {
         Ok(()) => {}
         Err(e) => {
             return Err(PipeError::Http {
@@ -188,10 +231,18 @@ async fn run_piped(
         }
     }
 
-    // Stages 1+ are chain expressions against the previous response.
+    // Stages 1+ are chain expressions against the previous response. They all
+    // dispatch against the stage-0 API; its spec resolves and validates chain
+    // targets (#34, #40). It is loaded lazily on first need — only once a stage
+    // actually has a response to chain — so a non-operation stage-0 (e.g.
+    // `history list`) still surfaces as `NoPreviousResponse` (#37) rather than a
+    // spec-load failure for the non-API stage-0 token.
+    let mut spec: Option<spall_core::ir::ResolvedSpec> = None;
+
     for (i, stage) in stages.iter().skip(1).enumerate() {
         let stage_num = i + 1;
-        let response = crate::execute::take_last_response()
+        let response = sink
+            .take()
             .ok_or(PipeError::NoPreviousResponse { stage: stage_num })?;
 
         let chain = crate::chain::ChainExpr::parse(stage).map_err(|e| PipeError::Parse {
@@ -199,16 +250,56 @@ async fn run_piped(
             expr: stage.to_string(),
             reason: e.to_string(),
         })?;
-        let next_args = chain.resolve(&response).map_err(|e| PipeError::JmesPath {
-            stage: stage_num,
-            expr: stage.to_string(),
-            reason: e.to_string(),
-        })?;
+
+        // Load (and cache) the stage-0 API spec the first time a real response
+        // reaches a chain stage.
+        if spec.is_none() {
+            spec = Some(load_api_spec(api_name, registry, cache_dir).await.map_err(
+                |reason| PipeError::SpecLoad {
+                    stage: stage_num,
+                    api: api_name.to_string(),
+                    reason,
+                },
+            )?);
+        }
+        let spec_ref = spec
+            .as_ref()
+            .ok_or(PipeError::NoPreviousResponse { stage: stage_num })?;
+
+        // #40: the chain target must be an operation of the stage-0 API.
+        // Resolving it here yields an actionable error instead of dispatching
+        // against the wrong API or a confusing "Unknown operation".
+        let target_op = spec_ref
+            .operations
+            .iter()
+            .find(|o| o.operation_id == chain.target_op_id)
+            .ok_or_else(|| PipeError::UnknownTarget {
+                stage: stage_num,
+                api: api_name.to_string(),
+                target: chain.target_op_id.clone(),
+            })?;
+
+        // #34: resolve bindings against the target op's parameter metadata.
+        let next_args =
+            chain
+                .resolve(&response, target_op)
+                .map_err(|e| PipeError::JmesPath {
+                    stage: stage_num,
+                    expr: stage.to_string(),
+                    reason: e.to_string(),
+                })?;
 
         let mut full_args = vec!["spall".to_string(), api_name.to_string()];
         full_args.extend(next_args);
 
-        match Box::pin(crate::run_with_args(&full_args, registry, cache_dir)).await {
+        match Box::pin(crate::run_with_args(
+            &full_args,
+            registry,
+            cache_dir,
+            &mut sink,
+        ))
+        .await
+        {
             Ok(()) => {}
             Err(e) => {
                 return Err(PipeError::Http {
