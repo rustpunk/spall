@@ -1,0 +1,20 @@
+[package]
+name = "spall-openapi"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+# edition + rust-version are set EXPLICITLY (not workspace-inherited): this crate
+# is edition 2024 per #29, which requires rustc >= 1.85. The rest of the
+# workspace stays on edition 2021.
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+spall-core = { path = "../spall-core" }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+indexmap = { version = "2", features = ["serde"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,51 @@
+# cargo-deny configuration for the spall workspace.
+#
+# Scope (milestone #1 / issue #24): a minimal, honest policy over the licenses
+# and advisories already present in the tree. The dedicated cargo-deny CI job is
+# deferred to #29; this file lets `cargo deny check` run locally and in that
+# future job without surprises.
+
+[advisories]
+# Fail the build on any security advisory affecting a dependency.
+version = 2
+yanked = "deny"
+
+[licenses]
+# Allow the permissive licenses actually present across the workspace tree.
+# cargo-deny evaluates SPDX expressions, so an `A OR B` crate passes when either
+# operand is listed here. The set below covers every license observed via
+# `cargo metadata` on the current lockfile.
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    # Weak, file-scoped copyleft used by a single transitive build-time dep
+    # (option-ext, via dirs). No source modifications are distributed, so the
+    # MPL file-level obligation is satisfied by using it unmodified.
+    "MPL-2.0",
+]
+# Confidence threshold for license-text matching (0.0..=1.0).
+confidence-threshold = 0.8
+
+[bans]
+# Multiple versions of the same crate are a warning, not an error: the current
+# tree has some duplicate transitive versions we do not control yet.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Only crates.io is an allowed registry source.
+unknown-registry = "deny"
+unknown-git = "deny"
