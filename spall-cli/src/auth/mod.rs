@@ -8,6 +8,7 @@ pub mod oauth2;
 use reqwest::header::HeaderMap;
 use secrecy::{ExposeSecret, SecretString};
 use spall_config::auth::{ApiKeyLocation, AuthConfig, AuthKind, ResolvedAuth};
+use spall_config::credentials::CredentialKind;
 
 /// Resolve authentication material following the priority chain:
 ///
@@ -196,24 +197,22 @@ fn parse_cli_auth(raw: &str) -> ResolvedAuth {
         }
     }
 
-    // User:pass shorthand: no ASCII whitespace, exactly one colon, both halves
-    // non-empty, and the part after the colon not starting with `//`. The last
-    // clause rejects every `scheme://...` URL (e.g. `https://host`), which also
-    // contains a single colon but must never be read as Basic credentials.
-    // Anything failing these checks falls through to Bearer, the safe default.
-    if !raw.contains(|c: char| c.is_ascii_whitespace()) && raw.split(':').count() == 2 {
-        if let Some((u, p)) = raw.split_once(':') {
-            if !u.is_empty() && !p.is_empty() && !p.starts_with("//") {
-                return ResolvedAuth::Basic {
-                    username: u.to_string(),
-                    password: SecretString::new(p.to_string().into()),
-                };
+    // Bare token (no explicit prefix): defer the Basic-vs-Bearer decision to the
+    // single shared classifier in spall-config, so this rule can never drift
+    // from other credential consumers. Basic is chosen only for an unambiguous
+    // `user:pass` (one colon, no whitespace, non-empty halves, not a scheme://
+    // URL); everything else — including `https://host` — is Bearer.
+    match spall_config::credentials::classify_bare_token(raw) {
+        CredentialKind::Basic => {
+            // classify_bare_token guarantees a single colon with non-empty halves.
+            let (u, p) = raw.split_once(':').unwrap_or((raw, ""));
+            ResolvedAuth::Basic {
+                username: u.to_string(),
+                password: SecretString::new(p.to_string().into()),
             }
         }
+        _ => ResolvedAuth::Bearer(SecretString::new(raw.to_string().into())),
     }
-
-    // Bare token → Bearer.
-    ResolvedAuth::Bearer(SecretString::new(raw.to_string().into()))
 }
 
 fn resolve_from_config_and_token(
