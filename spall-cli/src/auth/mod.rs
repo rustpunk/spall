@@ -196,13 +196,20 @@ fn parse_cli_auth(raw: &str) -> ResolvedAuth {
         }
     }
 
-    // User:pass shorthand (no space, contains exactly one colon).
-    if !raw.contains(' ') && raw.split(':').count() == 2 {
-        let (u, p) = raw.split_once(':').unwrap();
-        return ResolvedAuth::Basic {
-            username: u.to_string(),
-            password: SecretString::new(p.to_string().into()),
-        };
+    // User:pass shorthand: no ASCII whitespace, exactly one colon, both halves
+    // non-empty, and the part after the colon not starting with `//`. The last
+    // clause rejects every `scheme://...` URL (e.g. `https://host`), which also
+    // contains a single colon but must never be read as Basic credentials.
+    // Anything failing these checks falls through to Bearer, the safe default.
+    if !raw.contains(|c: char| c.is_ascii_whitespace()) && raw.split(':').count() == 2 {
+        if let Some((u, p)) = raw.split_once(':') {
+            if !u.is_empty() && !p.is_empty() && !p.starts_with("//") {
+                return ResolvedAuth::Basic {
+                    username: u.to_string(),
+                    password: SecretString::new(p.to_string().into()),
+                };
+            }
+        }
     }
 
     // Bare token → Bearer.
@@ -298,6 +305,40 @@ mod tests {
             result,
             Some(ResolvedAuth::Basic { ref username, ref password })
             if username == "alice" && password.expose_secret() == "secret"
+        ));
+    }
+
+    // #38: a `--spall-auth` value that merely looks like `user:pass` because it
+    // contains one colon must not be misread as Basic. A `scheme://...` URL is
+    // the canonical trap (one colon, no space) and must classify as Bearer.
+    #[test]
+    fn cli_override_url_shaped_is_bearer() {
+        let result = resolve("test", None, Some("https://example.com")).unwrap();
+        assert!(matches!(
+            result,
+            Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "https://example.com"
+        ));
+    }
+
+    #[test]
+    fn cli_override_multi_colon_is_bearer() {
+        let result = resolve("test", None, Some("a:b:c")).unwrap();
+        assert!(matches!(
+            result,
+            Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "a:b:c"
+        ));
+    }
+
+    #[test]
+    fn cli_override_empty_half_is_bearer() {
+        // An empty username or password half is not valid Basic; fall to Bearer.
+        assert!(matches!(
+            resolve("test", None, Some(":secret")).unwrap(),
+            Some(ResolvedAuth::Bearer(_))
+        ));
+        assert!(matches!(
+            resolve("test", None, Some("user:")).unwrap(),
+            Some(ResolvedAuth::Bearer(_))
         ));
     }
 
