@@ -1721,7 +1721,7 @@ mod programmatic_tests {
         }
     }
 
-    /// Mirror of the arg shape `spall_core::command::build_operations_cmd`
+    /// Mirror of the arg shape `crate::command::build_operations_cmd`
     /// would emit: `path-{name}`, `query-{name}`, `header-{name}`, plus
     /// the body knobs `--data` / `--no-data` / `--spall-content-type`.
     /// We also register the **typed** global args (spall-timeout u64,

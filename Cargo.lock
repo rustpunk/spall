@@ -3950,7 +3950,6 @@ dependencies = [
 name = "spall-core"
 version = "0.1.0"
 dependencies = [
- "clap",
  "indexmap",
  "openapiv3",
  "postcard",

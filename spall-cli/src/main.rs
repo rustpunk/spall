@@ -4,6 +4,7 @@ mod arazzo_runner;
 mod arazzo_runner_actions;
 mod auth;
 mod chain;
+mod command;
 mod commands;
 mod completions;
 mod discover;
@@ -299,8 +300,7 @@ async fn show_api_help(
                     "⚠  Could not load spec for '{}'. Showing cached operation list from {}.",
                     api_name, index.cached_at
                 );
-                let mut phase2 =
-                    spall_core::command::build_operations_cmd_from_index(api_name, &index);
+                let mut phase2 = crate::command::build_operations_cmd_from_index(api_name, &index);
                 for arg in spall_global_args() {
                     phase2 = phase2.arg(arg);
                 }
@@ -328,8 +328,7 @@ async fn show_api_help(
                     "⚠  Could not load spec for '{}'. Showing cached operation list from {}.",
                     api_name, index.cached_at
                 );
-                let mut phase2 =
-                    spall_core::command::build_operations_cmd_from_index(api_name, &index);
+                let mut phase2 = crate::command::build_operations_cmd_from_index(api_name, &index);
                 for arg in spall_global_args() {
                     phase2 = phase2.arg(arg);
                 }
@@ -349,7 +348,7 @@ async fn show_api_help(
         }
     };
 
-    let mut phase2 = spall_core::command::build_operations_cmd(api_name, &spec);
+    let mut phase2 = crate::command::build_operations_cmd(api_name, &spec);
     for arg in spall_global_args() {
         phase2 = phase2.arg(arg);
     }
@@ -421,7 +420,7 @@ async fn handle_api_operation(
         }
     })?;
 
-    let mut phase2 = spall_core::command::build_operations_cmd(api_name, &spec);
+    let mut phase2 = crate::command::build_operations_cmd(api_name, &spec);
     for arg in spall_global_args() {
         phase2 = phase2.arg(arg);
     }
