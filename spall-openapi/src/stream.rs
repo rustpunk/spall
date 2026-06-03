@@ -41,6 +41,76 @@ use thiserror::Error;
 /// pathological nesting bombs.
 const MAX_NESTING_DEPTH: usize = 128;
 
+/// Default ceiling on the bytes of a **single captured array element** (#44).
+///
+/// 64 MiB. Why this value: a single record (one element of the item array) is
+/// the smallest unit the streamer can hand to a caller, and 64 MiB is already
+/// far larger than any sane single API record while leaving ~3 GiB of headroom
+/// below a 32-bit-ish working set. An element bigger than this is almost
+/// certainly a pathological / mis-pathed response, and capturing it whole is
+/// exactly the OOM the guard prevents: enforcement aborts the capture mid-flight
+/// inside [`JsonSkimmer::next_element`] so the oversized element is never fully
+/// materialized.
+pub const DEFAULT_MAX_ITEM_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default ceiling on the bytes of a **single whole-value buffered page** (#44).
+///
+/// 256 MiB. Why this value: the only inherently-buffered case in the streamer
+/// is a non-array top-level page captured whole (the `concat_results` parity
+/// case; see [`JsonSkimmer::seek_top_level_lenient`]). That value is indivisible
+/// — there is no array to stream element-by-element — so the guard can only cap
+/// its size, not stream it. 256 MiB (4x the per-element cap) tolerates a large
+/// single-object envelope while still refusing a response that would blow up the
+/// process. Enforcement likewise aborts mid-capture.
+pub const DEFAULT_MAX_BUFFERED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Configurable, constant-memory-by-construction size guards for the streamer
+/// (#44).
+///
+/// Why: a pathological response — a single enormous array element, one
+/// indivisible giant JSON object, or an opaque non-JSON blob — must fail fast
+/// with actionable guidance instead of being buffered into an OOM. These are
+/// **simple byte caps checked while reading**, not an RSS-accounting budget: the
+/// streamer compares its running capture length against the relevant cap as each
+/// byte is appended and aborts the moment it *would* exceed it, so the oversized
+/// value is never fully resident. That mid-capture abort is the constant-memory
+/// property; the caps only bound the one buffer the streamer would otherwise
+/// grow without limit.
+///
+/// Two caps because the streamer has two distinct capture sites:
+///
+/// * [`StreamLimits::max_item_bytes`] bounds a single **array element** capture
+///   (the common streaming path, [`JsonSkimmer::next_element`]).
+/// * [`StreamLimits::max_buffered_bytes`] bounds the one **whole-value** capture
+///   the lenient top-level path performs for a non-array page
+///   ([`JsonSkimmer::seek_top_level_lenient`]).
+///
+/// [`StreamLimits::default`] uses [`DEFAULT_MAX_ITEM_BYTES`] (64 MiB) and
+/// [`DEFAULT_MAX_BUFFERED_BYTES`] (256 MiB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamLimits {
+    /// Hard ceiling on the bytes of any single captured array element. Exceeding
+    /// it aborts the capture mid-flight and yields
+    /// [`StreamError::ItemTooLarge`]; the element is never fully buffered.
+    pub max_item_bytes: usize,
+    /// Hard ceiling on the bytes of the one whole-value capture the lenient
+    /// top-level path performs for a non-array page. Exceeding it aborts the
+    /// capture mid-flight and yields [`StreamError::ResponseNotStreamable`].
+    pub max_buffered_bytes: usize,
+}
+
+impl Default for StreamLimits {
+    /// 64 MiB per element, 256 MiB for a whole non-array page — see
+    /// [`DEFAULT_MAX_ITEM_BYTES`] and [`DEFAULT_MAX_BUFFERED_BYTES`] for the
+    /// rationale.
+    fn default() -> Self {
+        StreamLimits {
+            max_item_bytes: DEFAULT_MAX_ITEM_BYTES,
+            max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
+        }
+    }
+}
+
 /// An error produced while streaming items out of a response body.
 ///
 /// Why: the skimmer must never panic on malformed input (untrusted server
@@ -70,6 +140,45 @@ pub enum StreamError {
     /// formatted serde_json message (no internal types leak out).
     #[error("failed to parse JSON element: {0}")]
     Json(String),
+    /// A single array element exceeded the configured `max_item_bytes` cap while
+    /// being captured (#44). The capture is aborted mid-flight — the oversized
+    /// element is never fully buffered — so this is a constant-memory failure,
+    /// not a post-hoc size check.
+    ///
+    /// The `Display` is actionable: it names the cap and tells the caller the
+    /// response is not record-streamable at this size and to write the raw body
+    /// to a file and process it from disk. The low-level [`ResponseStream`]
+    /// (Layer 1) is the escape hatch that hands over the raw streaming body for
+    /// exactly that.
+    #[error(
+        "a single record exceeds the {limit_bytes}-byte item cap and is not record-streamable; \
+         re-run capturing the raw response body to a file (the low-level ResponseStream / \
+         --spall-download escape hatch) and process it from disk"
+    )]
+    ItemTooLarge {
+        /// The `max_item_bytes` cap that was exceeded.
+        limit_bytes: usize,
+    },
+    /// An indivisible response value exceeded the configured `max_buffered_bytes`
+    /// cap while being captured whole (#44) — e.g. one giant non-array JSON
+    /// object at the data path, which has no array to stream element-by-element.
+    /// The capture is aborted mid-flight, so the value is never fully buffered.
+    ///
+    /// The `Display` is actionable: it names the cap and tells the caller the
+    /// response is not record-streamable and to write the raw body to a file and
+    /// process it from disk via the low-level [`ResponseStream`] (Layer 1)
+    /// escape hatch. `detail` names the offending shape for diagnostics.
+    #[error(
+        "response is not record-streamable ({detail}): it exceeds the {limit_bytes}-byte buffer \
+         cap; re-run capturing the raw response body to a file (the low-level ResponseStream / \
+         --spall-download escape hatch) and process it from disk"
+    )]
+    ResponseNotStreamable {
+        /// The `max_buffered_bytes` cap that was exceeded.
+        limit_bytes: usize,
+        /// A short description of the offending value (e.g. the data-path shape).
+        detail: String,
+    },
 }
 
 /// The shape of a [`DataPath::TopLevel`] document, as resolved by
@@ -101,29 +210,54 @@ pub enum TopLevelShape {
 ///
 /// Memory model: **streams**. The only meaningful allocation is the
 /// per-element capture buffer in [`JsonSkimmer::next_element`], which holds at
-/// most one element's bytes and is reused across calls. Navigation allocates
-/// nothing beyond transient key strings.
+/// most one element's bytes and is reused across calls and is **hard-capped** by
+/// [`StreamLimits`] (#44) so it can never grow without bound. Navigation
+/// allocates nothing beyond transient key strings.
 pub struct JsonSkimmer<R: Read> {
     reader: BufReader<R>,
     /// One byte of pushback: `Some(b)` means `b` has been peeked but not
     /// consumed. This gives the single-byte lookahead the grammar needs.
     peeked: Option<u8>,
     /// Reused element-capture buffer, so repeated elements do not re-allocate.
+    /// Its growth is bounded by [`JsonSkimmer::limits`] (#44): capture aborts the
+    /// instant appending the next byte would breach the active cap.
     scratch: Vec<u8>,
+    /// The #44 byte-cap guards applied during element / whole-value capture.
+    limits: StreamLimits,
 }
 
 impl<R: Read> JsonSkimmer<R> {
-    /// Wraps a reader in a new skimmer positioned at the start of the document.
+    /// Wraps a reader in a new skimmer positioned at the start of the document,
+    /// using the default [`StreamLimits`] (64 MiB item / 256 MiB buffer).
     ///
     /// Why: callers hand us the raw streaming body; we add buffering and the
     /// one-byte peek the grammar walk needs. Allocates only the `BufReader`'s
     /// internal buffer; reads nothing yet.
+    ///
+    /// Memory model: identical to [`JsonSkimmer::with_limits`] — capture is
+    /// bounded by [`StreamLimits::default`].
     #[must_use]
     pub fn new(reader: R) -> Self {
+        Self::with_limits(reader, StreamLimits::default())
+    }
+
+    /// Wraps a reader in a new skimmer positioned at the start of the document
+    /// with explicit [`StreamLimits`] (#44).
+    ///
+    /// Why: the CLI threads a caller-overridable `--spall-max-item-bytes` /
+    /// `--spall-max-buffer-bytes` here so the byte-cap guards are configurable.
+    /// Allocates only the `BufReader`'s internal buffer; reads nothing yet.
+    ///
+    /// Memory model: capture buffers at most one value's bytes *and* aborts the
+    /// moment that buffer would exceed the relevant cap, so peak heap is bounded
+    /// by `min(value size, cap)` rather than by the page.
+    #[must_use]
+    pub fn with_limits(reader: R, limits: StreamLimits) -> Self {
         JsonSkimmer {
             reader: BufReader::new(reader),
             peeked: None,
             scratch: Vec::new(),
+            limits,
         }
     }
 
@@ -216,7 +350,10 @@ impl<R: Read> JsonSkimmer<R> {
     /// Memory model: the array case **streams** (nothing captured yet). The
     /// single-value case is **inherently buffered** for that one value — the
     /// same buffering `concat_results` performed when it wrapped a non-array
-    /// page. #44 adds the `max_buffered_bytes` guard around this capture.
+    /// page — but #44 caps that buffer at [`StreamLimits::max_buffered_bytes`]
+    /// and aborts the capture mid-flight if the value would exceed it, yielding
+    /// [`StreamError::ResponseNotStreamable`]. The giant indivisible object is
+    /// therefore never fully materialized.
     #[must_use = "navigation can fail and the Result must be handled"]
     pub fn seek_top_level_lenient(&mut self) -> Result<TopLevelShape, StreamError> {
         self.skip_ws()?;
@@ -228,9 +365,11 @@ impl<R: Read> JsonSkimmer<R> {
             }
             None => Err(StreamError::NotJson),
             Some(_) => {
-                // A non-array root: capture the whole value as a single item.
+                // A non-array root: capture the whole value as a single item,
+                // bounded by the buffer cap (an indivisible value has no array
+                // to stream, so the cap is the only defense against OOM).
                 self.scratch.clear();
-                self.capture_value()?;
+                self.capture_value(CaptureKind::WholeValue)?;
                 let value = serde_json::from_slice::<Value>(&self.scratch)
                     .map_err(|e| StreamError::Json(e.to_string()))?;
                 Ok(TopLevelShape::Single(value))
@@ -456,14 +595,19 @@ impl<R: Read> JsonSkimmer<R> {
     /// scan as the internal value-skip but *records* the bytes so the final
     /// parse delegates to `serde_json::from_slice`. The buffer holds exactly
     /// one element, so peak memory is bounded by the largest element — never by
-    /// the page. This is precisely where #44 adds a hard `max_item_bytes` cap.
+    /// the page. #44's hard `max_item_bytes` cap is enforced *during* this
+    /// capture: the instant appending the next byte would breach the cap the
+    /// capture aborts with [`StreamError::ItemTooLarge`], so an oversized element
+    /// is never fully materialized (the constant-memory property).
     ///
     /// # Errors
     /// [`StreamError::DepthExceeded`] on over-nesting,
+    /// [`StreamError::ItemTooLarge`] if the element exceeds `max_item_bytes`,
     /// [`StreamError::Json`] if the captured slice is not valid JSON,
     /// [`StreamError::Io`] / [`StreamError::NotJson`] on read/structure faults.
     ///
-    /// Memory model: streams element-by-element; reuses one buffer.
+    /// Memory model: streams element-by-element; reuses one buffer hard-capped
+    /// at `max_item_bytes`.
     #[must_use = "the next element Result must be handled"]
     pub fn next_element(&mut self) -> Result<Option<Value>, StreamError> {
         self.skip_ws()?;
@@ -476,9 +620,9 @@ impl<R: Read> JsonSkimmer<R> {
             Some(_) => {}
         }
 
-        // Capture exactly one element's bytes.
+        // Capture exactly one element's bytes, bounded by the item cap.
         self.scratch.clear();
-        self.capture_value()?;
+        self.capture_value(CaptureKind::Element)?;
 
         let value = serde_json::from_slice::<Value>(&self.scratch)
             .map_err(|e| StreamError::Json(e.to_string()))?;
@@ -494,7 +638,20 @@ impl<R: Read> JsonSkimmer<R> {
     /// Like [`JsonSkimmer::skip_value`] but appends every consumed byte of the
     /// value to `self.scratch`. Stops at the value's structural end, leaving any
     /// following `,`/`]` unconsumed for the caller.
-    fn capture_value(&mut self) -> Result<(), StreamError> {
+    ///
+    /// The byte cap selected by `kind` is enforced on **every** append via
+    /// [`JsonSkimmer::push_capped`]: the running `scratch` length is checked
+    /// *before* each byte is buffered, so the capture aborts the instant it
+    /// would exceed the cap and the oversized value is never fully materialized.
+    /// That mid-capture abort — not a post-hoc `scratch.len()` check — is #44's
+    /// constant-memory property.
+    ///
+    /// # Errors
+    /// [`StreamError::ItemTooLarge`] / [`StreamError::ResponseNotStreamable`]
+    /// (per `kind`) on a cap breach, [`StreamError::DepthExceeded`] on
+    /// over-nesting, [`StreamError::Io`] / [`StreamError::NotJson`] on
+    /// read/structure faults.
+    fn capture_value(&mut self, kind: CaptureKind) -> Result<(), StreamError> {
         self.skip_ws()?;
         let mut depth: usize = 0;
         let mut in_string = false;
@@ -514,7 +671,7 @@ impl<R: Read> JsonSkimmer<R> {
 
             if in_string {
                 let _ = self.read_byte()?;
-                self.scratch.push(b);
+                self.push_capped(b, kind)?;
                 if escaped {
                     escaped = false;
                 } else if b == b'\\' {
@@ -531,13 +688,13 @@ impl<R: Read> JsonSkimmer<R> {
             match b {
                 b'"' => {
                     let _ = self.read_byte()?;
-                    self.scratch.push(b);
+                    self.push_capped(b, kind)?;
                     started = true;
                     in_string = true;
                 }
                 b'{' | b'[' => {
                     let _ = self.read_byte()?;
-                    self.scratch.push(b);
+                    self.push_capped(b, kind)?;
                     started = true;
                     depth += 1;
                     if depth > MAX_NESTING_DEPTH {
@@ -550,7 +707,7 @@ impl<R: Read> JsonSkimmer<R> {
                         return Ok(());
                     }
                     let _ = self.read_byte()?;
-                    self.scratch.push(b);
+                    self.push_capped(b, kind)?;
                     depth -= 1;
                     if depth == 0 {
                         return Ok(());
@@ -562,7 +719,7 @@ impl<R: Read> JsonSkimmer<R> {
                         return Ok(());
                     }
                     let _ = self.read_byte()?;
-                    self.scratch.push(b);
+                    self.push_capped(b, kind)?;
                 }
                 b' ' | b'\t' | b'\n' | b'\r' => {
                     let _ = self.read_byte()?;
@@ -571,14 +728,71 @@ impl<R: Read> JsonSkimmer<R> {
                         // not record trailing whitespace.
                         return Ok(());
                     }
-                    self.scratch.push(b);
+                    self.push_capped(b, kind)?;
                 }
                 _ => {
                     let _ = self.read_byte()?;
-                    self.scratch.push(b);
+                    self.push_capped(b, kind)?;
                     started = true;
                 }
             }
+        }
+    }
+
+    /// Appends one captured byte to `self.scratch`, enforcing the #44 byte cap
+    /// for `kind` *before* the buffer grows.
+    ///
+    /// Why before, not after: checking `self.scratch.len() == cap` before the
+    /// push means the buffer is never allowed to grow past the cap by even one
+    /// byte, so peak resident capture bytes are bounded by `cap` regardless of
+    /// how large the underlying value is. A cap of `0` is treated as "the very
+    /// first byte already breaches it", so no value can be captured — callers
+    /// pick sane non-zero caps via [`StreamLimits`].
+    ///
+    /// # Errors
+    /// [`StreamError::ItemTooLarge`] for [`CaptureKind::Element`] or
+    /// [`StreamError::ResponseNotStreamable`] for [`CaptureKind::WholeValue`]
+    /// when the cap would be exceeded.
+    fn push_capped(&mut self, b: u8, kind: CaptureKind) -> Result<(), StreamError> {
+        let cap = match kind {
+            CaptureKind::Element => self.limits.max_item_bytes,
+            CaptureKind::WholeValue => self.limits.max_buffered_bytes,
+        };
+        if self.scratch.len() >= cap {
+            return Err(kind.too_large(cap));
+        }
+        self.scratch.push(b);
+        Ok(())
+    }
+}
+
+/// Which #44 byte cap a [`JsonSkimmer::capture_value`] call enforces, and which
+/// [`StreamError`] a breach produces.
+///
+/// Why an enum rather than a raw `usize` cap: the two capture sites must surface
+/// *different* actionable errors — an oversized array element is
+/// [`StreamError::ItemTooLarge`] (the array is otherwise streamable), while an
+/// oversized indivisible whole value is [`StreamError::ResponseNotStreamable`]
+/// (there is no array to stream at all). Carrying the kind keeps that mapping in
+/// one place.
+#[derive(Debug, Clone, Copy)]
+enum CaptureKind {
+    /// Capturing one array element; bounded by `max_item_bytes`.
+    Element,
+    /// Capturing a whole non-array value; bounded by `max_buffered_bytes`.
+    WholeValue,
+}
+
+impl CaptureKind {
+    /// Builds the actionable [`StreamError`] for a cap breach of this kind,
+    /// naming `cap` so the message tells the user exactly which limit fired.
+    fn too_large(self, cap: usize) -> StreamError {
+        match self {
+            CaptureKind::Element => StreamError::ItemTooLarge { limit_bytes: cap },
+            CaptureKind::WholeValue => StreamError::ResponseNotStreamable {
+                limit_bytes: cap,
+                detail: "a single indivisible non-array value at the data path".to_string(),
+            },
         }
     }
 }
@@ -642,6 +856,9 @@ struct PaginatedSource {
     /// True once the current page is known to be a streaming array (so further
     /// `next` calls pull elements rather than re-running the lenient seek).
     page_is_array: bool,
+    /// The #44 byte caps, applied to every page's skimmer — including pages
+    /// fetched lazily across `rel=next` boundaries — so the guard is uniform.
+    limits: StreamLimits,
 }
 
 /// Layer 2: a lazy, bounded-memory iterator of response items.
@@ -695,10 +912,29 @@ impl ItemStream {
     /// not by rewriting this type.
     ///
     /// Memory model: streams; construction allocates only the skimmer buffer.
+    /// Per-element capture is bounded by [`StreamLimits::default`]; use
+    /// [`ItemStream::single_with_limits`] to override the caps.
     #[must_use]
     pub fn single(resp: ResponseStream, data_path: DataPath) -> ItemStream {
+        Self::single_with_limits(resp, data_path, StreamLimits::default())
+    }
+
+    /// Like [`ItemStream::single`] but with explicit [`StreamLimits`] (#44).
+    ///
+    /// Why: callers that surface a configurable `--spall-max-item-bytes` thread
+    /// the chosen caps here so an oversized single element fails fast with
+    /// [`StreamError::ItemTooLarge`] instead of being buffered into an OOM.
+    ///
+    /// Memory model: identical to [`ItemStream::single`], with the per-element
+    /// capture buffer hard-capped at `limits.max_item_bytes`.
+    #[must_use]
+    pub fn single_with_limits(
+        resp: ResponseStream,
+        data_path: DataPath,
+        limits: StreamLimits,
+    ) -> ItemStream {
         ItemStream {
-            source: PageSource::Single(JsonSkimmer::new(resp.body)),
+            source: PageSource::Single(JsonSkimmer::with_limits(resp.body, limits)),
             sought: false,
             data_path,
             done: false,
@@ -736,6 +972,8 @@ impl ItemStream {
     /// Memory model: **streams** across pages — one page's skimmer at a time;
     /// pages are fetched lazily and never accumulated. A non-array top-level
     /// page is the one buffered case (same as `concat_results`; #44 guards it).
+    /// Per-page capture is bounded by [`StreamLimits::default`]; use
+    /// [`ItemStream::paginated_with_limits`] to override the caps.
     #[must_use]
     pub fn paginated(
         first: ResponseStream,
@@ -743,8 +981,30 @@ impl ItemStream {
         paginator: Paginator,
         fetch: PageFetch,
     ) -> ItemStream {
+        Self::paginated_with_limits(first, data_path, paginator, fetch, StreamLimits::default())
+    }
+
+    /// Like [`ItemStream::paginated`] but with explicit [`StreamLimits`] (#44).
+    ///
+    /// Why: this is the constructor the CLI's `--spall-paginate` path uses so a
+    /// caller-overridable `--spall-max-item-bytes` / `--spall-max-buffer-bytes`
+    /// applies to every page. An oversized array element on any page fails fast
+    /// with [`StreamError::ItemTooLarge`]; a giant non-array top-level page (the
+    /// indivisible case) fails with [`StreamError::ResponseNotStreamable`].
+    ///
+    /// Memory model: identical to [`ItemStream::paginated`]; the same `limits`
+    /// are installed on the first page's skimmer *and* on every page fetched
+    /// lazily thereafter, so the cap is uniform across the whole chain.
+    #[must_use]
+    pub fn paginated_with_limits(
+        first: ResponseStream,
+        data_path: DataPath,
+        paginator: Paginator,
+        fetch: PageFetch,
+        limits: StreamLimits,
+    ) -> ItemStream {
         let source = PaginatedSource {
-            skimmer: JsonSkimmer::new(first.body),
+            skimmer: JsonSkimmer::with_limits(first.body, limits),
             headers: first.headers,
             paginator,
             fetch,
@@ -752,6 +1012,7 @@ impl ItemStream {
             page_sought: false,
             pending_single: None,
             page_is_array: false,
+            limits,
         };
         ItemStream {
             source: PageSource::Paginated(Box::new(source)),
@@ -822,8 +1083,9 @@ impl PaginatedSource {
 
             let next_page = (self.fetch)(&next_url)?;
             // Install the fresh page: new skimmer + headers, reset per-page
-            // state, and loop to navigate and stream it.
-            self.skimmer = JsonSkimmer::new(next_page.body);
+            // state, and loop to navigate and stream it. The same #44 caps apply
+            // to every fetched page, not just the first.
+            self.skimmer = JsonSkimmer::with_limits(next_page.body, self.limits);
             self.headers = next_page.headers;
             self.page_count += 1;
             self.page_sought = false;
@@ -1332,5 +1594,215 @@ mod tests {
             TopLevelShape::Single(v) => assert_eq!(v, serde_json::json!({"a": 1})),
             TopLevelShape::Array => panic!("object should be a single value"),
         }
+    }
+
+    // ----- #44: configurable, constant-memory byte guards -----
+
+    /// Defaults are the documented constants.
+    #[test]
+    fn stream_limits_default_matches_constants() {
+        let l = StreamLimits::default();
+        assert_eq!(l.max_item_bytes, DEFAULT_MAX_ITEM_BYTES);
+        assert_eq!(l.max_buffered_bytes, DEFAULT_MAX_BUFFERED_BYTES);
+        assert_eq!(l.max_item_bytes, 64 * 1024 * 1024);
+        assert_eq!(l.max_buffered_bytes, 256 * 1024 * 1024);
+    }
+
+    /// A `Read` that lazily emits a top-level array whose single element is a
+    /// huge string, far larger than the cap — without ever holding the whole
+    /// element in memory. Used to prove the capture aborts mid-flight (the
+    /// constant-memory property), since the producer itself never buffers it.
+    struct HugeElementGen {
+        /// Bytes of string content still owed inside the one giant element.
+        remaining: usize,
+        phase: u8,
+    }
+
+    impl HugeElementGen {
+        fn new(content_len: usize) -> Self {
+            HugeElementGen {
+                remaining: content_len,
+                phase: 0,
+            }
+        }
+    }
+
+    impl Read for HugeElementGen {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            match self.phase {
+                // Opening `["` of the array + the giant string element.
+                0 => {
+                    self.phase = 1;
+                    buf[0] = b'[';
+                    Ok(1)
+                }
+                1 => {
+                    self.phase = 2;
+                    buf[0] = b'"';
+                    Ok(1)
+                }
+                // Stream the string content one chunk at a time ('x' bytes).
+                2 => {
+                    if self.remaining == 0 {
+                        self.phase = 3;
+                        buf[0] = b'"';
+                        return Ok(1);
+                    }
+                    let n = buf.len().min(self.remaining);
+                    for b in buf.iter_mut().take(n) {
+                        *b = b'x';
+                    }
+                    self.remaining -= n;
+                    Ok(n)
+                }
+                // Closing `]`.
+                3 => {
+                    self.phase = 4;
+                    buf[0] = b']';
+                    Ok(1)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    /// A single array element larger than `max_item_bytes` fires
+    /// [`StreamError::ItemTooLarge`], and the capture aborts long before the
+    /// whole element is materialized: a 4 KiB cap over a multi-megabyte element
+    /// means scratch never grows past the cap.
+    #[test]
+    fn oversized_array_element_errors_item_too_large() {
+        const CAP: usize = 4 * 1024;
+        // 8 MiB of string content — 2000x the cap, and never buffered by the
+        // generator, so any buffering must be the parser's (which is capped).
+        let content_len = 8 * 1024 * 1024;
+        let resp = ResponseStream {
+            status: Status(200),
+            headers: Default::default(),
+            body: Box::new(HugeElementGen::new(content_len)),
+        };
+        let limits = StreamLimits {
+            max_item_bytes: CAP,
+            max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
+        };
+        let mut stream = ItemStream::single_with_limits(resp, DataPath::TopLevel, limits);
+        let first = stream.next();
+        assert!(
+            matches!(first, Some(Err(StreamError::ItemTooLarge { limit_bytes })) if limit_bytes == CAP),
+            "expected ItemTooLarge with the cap, got {first:?}"
+        );
+        // The error fuses the stream.
+        assert!(stream.next().is_none());
+    }
+
+    /// The actionable Display names the cap and points at the raw-body escape.
+    #[test]
+    fn item_too_large_display_is_actionable() {
+        let msg = StreamError::ItemTooLarge { limit_bytes: 4096 }.to_string();
+        assert!(msg.contains("4096"), "must name the cap: {msg}");
+        assert!(
+            msg.contains("not record-streamable"),
+            "must say not record-streamable: {msg}"
+        );
+        assert!(
+            msg.contains("file") && msg.contains("disk"),
+            "must point at writing the raw body to a file and processing from disk: {msg}"
+        );
+    }
+
+    /// A non-array TopLevel page larger than `max_buffered_bytes` fires
+    /// [`StreamError::ResponseNotStreamable`] (the indivisible giant-object
+    /// case), aborting the whole-value capture before it is fully buffered.
+    #[test]
+    fn oversized_non_array_top_level_page_errors_not_streamable() {
+        const CAP: usize = 2 * 1024;
+        // A big bare JSON string is a non-array TopLevel value; the lenient seek
+        // captures it whole, which the buffer cap aborts. Built lazily-ish here
+        // as one Vec since it only needs to exceed the small cap.
+        let mut body = Vec::with_capacity(CAP * 4);
+        body.push(b'"');
+        body.extend(std::iter::repeat_n(b'y', CAP * 3));
+        body.push(b'"');
+        let resp = ResponseStream {
+            status: Status(200),
+            headers: Default::default(),
+            body: Box::new(std::io::Cursor::new(body)),
+        };
+        let limits = StreamLimits {
+            max_item_bytes: DEFAULT_MAX_ITEM_BYTES,
+            max_buffered_bytes: CAP,
+        };
+        // The paginated TopLevel path applies concat_results leniency, so a
+        // non-array page goes through the whole-value (buffered) capture.
+        let fetch: PageFetch = Box::new(|_url: &str| panic!("no further pages"));
+        let mut stream = ItemStream::paginated_with_limits(
+            resp,
+            DataPath::TopLevel,
+            Paginator::default(),
+            fetch,
+            limits,
+        );
+        let first = stream.next();
+        assert!(
+            matches!(first, Some(Err(StreamError::ResponseNotStreamable { limit_bytes, .. })) if limit_bytes == CAP),
+            "expected ResponseNotStreamable with the cap, got {first:?}"
+        );
+        assert!(stream.next().is_none());
+    }
+
+    /// The actionable Display for the indivisible case names the cap, the shape,
+    /// and the raw-body escape.
+    #[test]
+    fn response_not_streamable_display_is_actionable() {
+        let msg = StreamError::ResponseNotStreamable {
+            limit_bytes: 2048,
+            detail: "a single indivisible non-array value at the data path".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("2048"), "must name the cap: {msg}");
+        assert!(
+            msg.contains("not record-streamable"),
+            "must say not record-streamable: {msg}"
+        );
+        assert!(
+            msg.contains("file") && msg.contains("disk"),
+            "must point at raw-body->file->disk: {msg}"
+        );
+    }
+
+    /// A normal `{"root":[...]}` of small elements under the caps streams
+    /// unaffected: the guard never fires on well-formed, sane responses.
+    #[test]
+    fn small_elements_under_caps_stream_unaffected() {
+        let body = br#"{"root": [1, "two", {"k": 3}, [4, 5]]}"#;
+        let resp = ResponseStream {
+            status: Status(200),
+            headers: Default::default(),
+            body: Box::new(std::io::Cursor::new(body.to_vec())),
+        };
+        // Tiny caps that still comfortably fit each small element.
+        let limits = StreamLimits {
+            max_item_bytes: 64,
+            max_buffered_bytes: 64,
+        };
+        let items: Vec<Value> = ItemStream::single_with_limits(
+            resp,
+            DataPath::Pointer(vec!["root".to_string()]),
+            limits,
+        )
+        .map(Result::unwrap)
+        .collect();
+        assert_eq!(
+            items,
+            vec![
+                Value::from(1),
+                Value::from("two"),
+                serde_json::json!({"k": 3}),
+                serde_json::json!([4, 5]),
+            ]
+        );
     }
 }

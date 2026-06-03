@@ -956,8 +956,13 @@ async fn execute_legacy_path(
         let data_path = resolve_data_path(op, entry)?;
 
         // Drain the de-paginating ItemStream into a single array, the streaming
-        // replacement for `concat_results`. #44 will guard this collect's size.
-        let final_value = collect_paginated(queued, data_path)?;
+        // replacement for `concat_results`. #44's byte caps (default 64 MiB
+        // item / 256 MiB buffer, or the `--spall-max-item-bytes` /
+        // `--spall-max-buffer-bytes` overrides) guard this collect: an oversized
+        // record / indivisible page aborts the capture mid-flight and surfaces
+        // as a NotRecordStreamable diagnostic rather than an OOM.
+        let stream_limits = resolve_stream_limits(&combined);
+        let final_value = collect_paginated(queued, data_path, stream_limits)?;
 
         if let Some(first) = first_status {
             let warnings = crate::validate::response_validate(
@@ -1097,9 +1102,19 @@ fn resolve_data_path(
 /// returned in order by a fetch closure that pops the pre-fetched queue (all
 /// HTTP I/O already happened in the caller, so this closure does no I/O and
 /// needs no async-to-sync bridge).
+///
+/// `limits` carries the #44 byte caps (default 64 MiB item / 256 MiB buffer, or
+/// the `--spall-max-item-bytes` / `--spall-max-buffer-bytes` overrides). A
+/// record or indivisible page that would exceed a cap aborts the capture
+/// mid-flight (the library never buffers the oversized value) and surfaces as
+/// [`crate::SpallCliError::NotRecordStreamable`] — an actionable message that
+/// points the user at raising the cap or capturing the raw body to a file with
+/// `--spall-download`. A genuinely non-JSON / malformed body still maps to a
+/// usage error.
 fn collect_paginated(
     queued: Vec<spall_openapi::ResponseStream>,
     data_path: spall_openapi::DataPath,
+    limits: spall_openapi::StreamLimits,
 ) -> Result<serde_json::Value, crate::SpallCliError> {
     let mut pages = queued.into_iter();
     let Some(first) = pages.next() else {
@@ -1119,21 +1134,45 @@ fn collect_paginated(
         })
     });
 
-    let stream = spall_openapi::ItemStream::paginated(
+    let stream = spall_openapi::ItemStream::paginated_with_limits(
         first,
         data_path,
         spall_openapi::Paginator::default(),
         fetch,
+        limits,
     );
 
     let mut items = Vec::new();
     for item in stream {
-        let value = item.map_err(|e| {
-            crate::SpallCliError::Usage(format!("Pagination requires JSON responses: {e}"))
+        let value = item.map_err(|e| match e {
+            // The #44 guards: the message names the cap and the raw-body escape;
+            // route them to the dedicated diagnostic rather than a bare usage
+            // error so the miette help (raise the cap / --spall-download) shows.
+            spall_openapi::StreamError::ItemTooLarge { .. }
+            | spall_openapi::StreamError::ResponseNotStreamable { .. } => {
+                crate::SpallCliError::NotRecordStreamable(e.to_string())
+            }
+            other => {
+                crate::SpallCliError::Usage(format!("Pagination requires JSON responses: {other}"))
+            }
         })?;
         items.push(value);
     }
     Ok(serde_json::Value::Array(items))
+}
+
+/// Resolve the #44 [`spall_openapi::StreamLimits`] from the merged CLI flags,
+/// falling back to [`spall_openapi::StreamLimits::default`] (64 MiB item /
+/// 256 MiB buffer) for any flag the caller did not set.
+fn resolve_stream_limits(combined: &MergedMatches) -> spall_openapi::StreamLimits {
+    let mut limits = spall_openapi::StreamLimits::default();
+    if let Some(n) = combined.get_one::<usize>("spall-max-item-bytes") {
+        limits.max_item_bytes = n;
+    }
+    if let Some(n) = combined.get_one::<usize>("spall-max-buffer-bytes") {
+        limits.max_buffered_bytes = n;
+    }
+    limits
 }
 
 /// Send a single HTTP request, with transient-error retry.

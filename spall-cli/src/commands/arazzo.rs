@@ -80,10 +80,9 @@ pub async fn handle_arazzo(
     match matches.subcommand() {
         Some(("run", sub)) => run(sub, registry, cache_dir).await,
         Some(("validate", sub)) => validate(sub),
-        _ => Err(SpallCliError::Usage(
-            "Usage: spall arazzo <run|validate> <file>".to_string(),
-        )
-        .into()),
+        _ => Err(
+            SpallCliError::Usage("Usage: spall arazzo <run|validate> <file>".to_string()).into(),
+        ),
     }
 }
 
@@ -101,7 +100,11 @@ fn validate(matches: &ArgMatches) -> Result<()> {
             doc.workflows.len(),
             if doc.workflows.len() == 1 { "" } else { "s" },
             doc.source_descriptions.len(),
-            if doc.source_descriptions.len() == 1 { "" } else { "s" },
+            if doc.source_descriptions.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
         );
         return Ok(());
     }
@@ -144,10 +147,9 @@ async fn run(matches: &ArgMatches, registry: &ApiRegistry, cache_dir: &Path) -> 
     // default-shaped HttpConfig. Per-source proxy overrides + global
     // --spall-* flags can be wired through in a follow-up.
     let proxy = crate::http::resolve_env_proxy();
-    let sources =
-        prepare_sources(&doc, path, registry, cache_dir, proxy.as_deref(), verbose)
-            .await
-            .map_err(into_cli_err)?;
+    let sources = prepare_sources(&doc, path, registry, cache_dir, proxy.as_deref(), verbose)
+        .await
+        .map_err(into_cli_err)?;
 
     let max_steps = matches
         .get_one::<usize>("max-steps")

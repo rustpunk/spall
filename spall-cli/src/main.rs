@@ -78,6 +78,20 @@ If this API requires a VPN, ensure you're connected."
 
     #[error("Auth resolution failed for '{api}': {message}")]
     AuthResolution { api: String, message: String },
+
+    /// A paginated response could not be streamed within the configured byte
+    /// caps (#44): a single record, or one indivisible non-array page, was too
+    /// large. The guard aborts the capture mid-flight so spall never buffers the
+    /// oversized value into an OOM. The message itself is the actionable
+    /// diagnostic produced by [`spall_openapi::StreamError`].
+    #[error("Response is not record-streamable: {0}")]
+    #[diagnostic(help(
+        "A single record (or one indivisible non-array page) exceeded the streaming byte cap. \
+Raise the cap with `--spall-max-item-bytes <N>` / `--spall-max-buffer-bytes <N>` if you truly \
+need it, or capture the raw body to a file with `--spall-download <path>` (or `-o <path>`) \
+and process it from disk."
+    ))]
+    NotRecordStreamable(String),
 }
 
 impl SpallCliError {
@@ -93,6 +107,7 @@ impl SpallCliError {
             SpallCliError::Http5xx(_) => EXIT_HTTP_5XX,
             SpallCliError::ValidationFailed => EXIT_VALIDATION,
             SpallCliError::AuthResolution { .. } => EXIT_USAGE,
+            SpallCliError::NotRecordStreamable(_) => EXIT_USAGE,
         }
     }
 }
@@ -858,6 +873,22 @@ fn spall_global_args() -> Vec<Arg> {
             .action(ArgAction::SetTrue)
             .global(true)
             .help("Auto-follow Link header pagination"),
+        Arg::new("spall-max-item-bytes")
+            .long("spall-max-item-bytes")
+            .value_parser(clap::value_parser!(usize))
+            .global(true)
+            .help(
+                "Max bytes for a single streamed record on the paginate path before it is \
+rejected as not record-streamable (default: 64 MiB)",
+            ),
+        Arg::new("spall-max-buffer-bytes")
+            .long("spall-max-buffer-bytes")
+            .value_parser(clap::value_parser!(usize))
+            .global(true)
+            .help(
+                "Max bytes for one indivisible non-array page captured whole on the paginate \
+path (default: 256 MiB)",
+            ),
         Arg::new("spall-follow")
             .long("spall-follow")
             .global(true)

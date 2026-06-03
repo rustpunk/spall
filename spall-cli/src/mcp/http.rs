@@ -221,7 +221,11 @@ struct HttpState {
     verbose: bool,
 }
 
-async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, body: String) -> Response {
+async fn handle_post(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     // Origin policy:
     // - Empty allowlist + Origin absent → allow (curl, MCP test
     //   clients, same-process). Most browsers always send Origin on
@@ -351,18 +355,25 @@ async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, bo
     }
 
     // Dispatch via the same line handler the stdio transport uses.
-    let response =
-        handle_line(&body, &state.spec, &state.profiles, &state.registry, state.verbose).await;
+    let response = handle_line(
+        &body,
+        &state.spec,
+        &state.profiles,
+        &state.registry,
+        state.verbose,
+    )
+    .await;
 
     let mut headers_out = HeaderMap::new();
     if is_initialize {
         let sid = new_session_id();
-        state.sessions.write().await.insert(sid.clone(), Instant::now());
+        state
+            .sessions
+            .write()
+            .await
+            .insert(sid.clone(), Instant::now());
         if let Ok(v) = HeaderValue::from_str(&sid) {
-            headers_out.insert(
-                HeaderName::from_static(HEADER_SESSION_ID),
-                v,
-            );
+            headers_out.insert(HeaderName::from_static(HEADER_SESSION_ID), v);
         }
     }
 
@@ -375,10 +386,15 @@ async fn handle_post(State(state): State<Arc<HttpState>>, headers: HeaderMap, bo
 /// in [`handle_post`] to ride alongside the spec's DNS-rebinding
 /// guidance.
 fn is_localhost_origin(origin: &str) -> bool {
-    matches!(origin, "http://localhost" | "https://localhost"
-        | "http://127.0.0.1" | "https://127.0.0.1"
-        | "http://[::1]" | "https://[::1]")
-        || origin.starts_with("http://localhost:")
+    matches!(
+        origin,
+        "http://localhost"
+            | "https://localhost"
+            | "http://127.0.0.1"
+            | "https://127.0.0.1"
+            | "http://[::1]"
+            | "https://[::1]"
+    ) || origin.starts_with("http://localhost:")
         || origin.starts_with("https://localhost:")
         || origin.starts_with("http://127.0.0.1:")
         || origin.starts_with("https://127.0.0.1:")

@@ -154,9 +154,10 @@ pub async fn handle_mcp(
                 .get_one::<String>("bind")
                 .map(String::as_str)
                 .unwrap_or(crate::mcp::http::DEFAULT_BIND);
-            let listen_addr: std::net::SocketAddr = format!("{}:{}", bind, port).parse().map_err(
-                |e| SpallCliError::Usage(format!("invalid --spall-bind '{}:{}': {}", bind, port, e)),
-            )?;
+            let listen_addr: std::net::SocketAddr =
+                format!("{}:{}", bind, port).parse().map_err(|e| {
+                    SpallCliError::Usage(format!("invalid --spall-bind '{}:{}': {}", bind, port, e))
+                })?;
             let allowed_origins: Vec<String> = matches
                 .get_many::<String>("allowed_origin")
                 .map(|vals| vals.cloned().collect())
@@ -244,10 +245,10 @@ fn resolve_auth_profiles(
     }
     for op in &spec.operations {
         if let Some(SpallValue::Str(p)) = op.extensions.get("x-mcp-auth-profile") {
-            needed
-                .entry(p.clone())
-                .or_default()
-                .push(format!("x-mcp-auth-profile on operation '{}'", op.operation_id));
+            needed.entry(p.clone()).or_default().push(format!(
+                "x-mcp-auth-profile on operation '{}'",
+                op.operation_id
+            ));
         }
     }
 

@@ -77,4 +77,7 @@ pub use paginate::Paginator;
 pub use request::{Headers, HttpRequestSpec, MultipartField, MultipartValue, RequestBody};
 pub use response::ResponseStream;
 pub use status::Status;
-pub use stream::{ItemStream, JsonSkimmer, PageFetch, StreamError, TopLevelShape};
+pub use stream::{
+    DEFAULT_MAX_BUFFERED_BYTES, DEFAULT_MAX_ITEM_BYTES, ItemStream, JsonSkimmer, PageFetch,
+    StreamError, StreamLimits, TopLevelShape,
+};

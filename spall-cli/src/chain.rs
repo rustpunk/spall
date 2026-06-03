@@ -308,7 +308,9 @@ mod tests {
                 param("limit", ParameterLocation::Query),
             ],
         );
-        let args = c.resolve(&json!({"id": "7", "limit": "5"}), &target).unwrap();
+        let args = c
+            .resolve(&json!({"id": "7", "limit": "5"}), &target)
+            .unwrap();
         assert_eq!(args, vec!["op2", "7", "--limit", "5"]);
     }
 
@@ -334,9 +336,7 @@ mod tests {
     fn resolve_nested_jmespath() {
         let c = ChainExpr::parse("op2 --name data.name").unwrap();
         let target = op("op2", vec![param("name", ParameterLocation::Query)]);
-        let args = c
-            .resolve(&json!({"data": {"name": "x"}}), &target)
-            .unwrap();
+        let args = c.resolve(&json!({"data": {"name": "x"}}), &target).unwrap();
         assert_eq!(args, vec!["op2", "--name", "x"]);
     }
 
