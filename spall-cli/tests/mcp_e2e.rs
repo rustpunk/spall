@@ -516,7 +516,10 @@ async fn max_tools_truncates_deterministically_across_invocations() {
     let first = names_for_run();
     let second = names_for_run();
     assert_eq!(first.len(), 30, "max-tools cap must truncate to 30");
-    assert_eq!(first, second, "truncation must be deterministic across runs");
+    assert_eq!(
+        first, second,
+        "truncation must be deterministic across runs"
+    );
     // The sort key buckets by first tag alphabetically; with 50 ops in
     // each of alpha/beta/gamma, the 30-entry slice is fully inside the
     // alpha bucket.
@@ -570,8 +573,16 @@ async fn list_tags_prints_tsv_then_exits_without_starting_server() {
     let body: Vec<&str> = lines.collect();
     assert_eq!(body.len(), 2, "expected 2 tag rows, got: {:?}", body);
     // BTreeMap iteration order: alphabetical → orgs then users.
-    assert!(body[0].starts_with("orgs\t3\torgs-op-"), "row 0: {}", body[0]);
-    assert!(body[1].starts_with("users\t3\tusers-op-"), "row 1: {}", body[1]);
+    assert!(
+        body[0].starts_with("orgs\t3\torgs-op-"),
+        "row 0: {}",
+        body[0]
+    );
+    assert!(
+        body[1].starts_with("users\t3\tusers-op-"),
+        "row 1: {}",
+        body[1]
+    );
 }
 
 /// Spec with one operation per HTTP method, no body, returning 200.
@@ -698,7 +709,9 @@ async fn http_transport_round_trips_initialize_then_tools_list() {
         .expect("send tools/list");
     assert_eq!(list.status(), reqwest::StatusCode::OK);
     let list_body: Value = list.json().await.expect("list body");
-    let tools = list_body["result"]["tools"].as_array().expect("tools array");
+    let tools = list_body["result"]["tools"]
+        .as_array()
+        .expect("tools array");
     assert_eq!(tools.len(), 2);
 
     let _ = child.kill();
@@ -891,7 +904,9 @@ async fn tools_list_carries_annotations_and_meta_tags() {
         ("deleteitem", false, true, true),
     ];
     for (name, ro, dest, idem) in cases {
-        let tool = by_name.get(name).unwrap_or_else(|| panic!("missing tool {}", name));
+        let tool = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("missing tool {}", name));
         let ann = &tool["annotations"];
         if name == "createitem" {
             // POST → no derived hints.
@@ -903,11 +918,26 @@ async fn tools_list_carries_annotations_and_meta_tags() {
             );
         } else {
             assert_eq!(ann["readOnlyHint"], json!(ro), "{}: readOnlyHint", name);
-            assert_eq!(ann["destructiveHint"], json!(dest), "{}: destructiveHint", name);
-            assert_eq!(ann["idempotentHint"], json!(idem), "{}: idempotentHint", name);
+            assert_eq!(
+                ann["destructiveHint"],
+                json!(dest),
+                "{}: destructiveHint",
+                name
+            );
+            assert_eq!(
+                ann["idempotentHint"],
+                json!(idem),
+                "{}: idempotentHint",
+                name
+            );
         }
         // _meta.spall.tags carries the tag list.
-        assert_eq!(tool["_meta"]["spall.tags"], json!(["items"]), "tags for {}", name);
+        assert_eq!(
+            tool["_meta"]["spall.tags"],
+            json!(["items"]),
+            "tags for {}",
+            name
+        );
     }
 
     // The /health GET sets x-mcp-annotations: { readOnlyHint: false,
@@ -973,11 +1003,7 @@ token = "admin-secret"
     );
     std::fs::write(apis_dir.join("authed.toml"), api_toml).unwrap();
 
-    let mut server = spawn(
-        &temp,
-        "authed",
-        &["--spall-auth-tool", "admin-op=admin"],
-    );
+    let mut server = spawn(&temp, "authed", &["--spall-auth-tool", "admin-op=admin"]);
 
     server.send(&json!({
         "jsonrpc": "2.0",

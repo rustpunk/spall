@@ -477,9 +477,7 @@ fn apply_op(
 
 fn values_equal(l: &serde_json::Value, r: &serde_json::Value) -> bool {
     match (l, r) {
-        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
-            a.as_f64() == b.as_f64()
-        }
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => a.as_f64() == b.as_f64(),
         _ => l == r,
     }
 }

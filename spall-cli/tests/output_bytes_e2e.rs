@@ -103,8 +103,7 @@ async fn http_500_prints_body_and_exits_5() {
     wiremock::Mock::given(method("GET"))
         .and(path("/thing"))
         .respond_with(
-            ResponseTemplate::new(500)
-                .set_body_json(serde_json::json!({"error": "boom internal"})),
+            ResponseTemplate::new(500).set_body_json(serde_json::json!({"error": "boom internal"})),
         )
         .mount(&mock)
         .await;

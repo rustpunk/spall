@@ -280,8 +280,7 @@ async fn with_criteria_fixture_runs_all_three_conditions() {
         .join("arazzo")
         .join("with-criteria.arazzo.yaml");
     let arazzo_path = temp.path().join("with-criteria.arazzo.yaml");
-    std::fs::copy(&fixture_src, &arazzo_path)
-        .expect("copy with-criteria fixture into temp dir");
+    std::fs::copy(&fixture_src, &arazzo_path).expect("copy with-criteria fixture into temp dir");
 
     let cfg_dir = temp.path().join("cfg");
     let cache_dir = temp.path().join("cache");
@@ -412,7 +411,8 @@ workflows:
     assert!(
         output.status.success(),
         "expected workflow to succeed after retries.\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        stdout, stderr,
+        stdout,
+        stderr,
     );
     server.verify().await;
 }
@@ -454,7 +454,10 @@ workflows:
         .output()
         .expect("spawn spall");
 
-    assert!(!output.status.success(), "retry exhaustion must exit non-zero");
+    assert!(
+        !output.status.success(),
+        "retry exhaustion must exit non-zero"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.contains("retry limit"),
@@ -515,7 +518,8 @@ workflows:
     assert!(
         output.status.success(),
         "goto-recovery workflow should succeed.\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        stdout, stderr,
+        stdout,
+        stderr,
     );
     // The failed step's record in the per-step JSON output must
     // carry `failedVia: "on-failure-goto"` — that's the public
@@ -777,12 +781,7 @@ async fn dry_run_preview_renders_action_chain_shape_for_both_chains() {
         let output = Command::new(bin_path())
             .env("XDG_CONFIG_HOME", &cfg_dir)
             .env("XDG_CACHE_HOME", &cache_dir)
-            .args([
-                "arazzo",
-                "run",
-                "--dry-run",
-                arazzo_path.to_str().unwrap(),
-            ])
+            .args(["arazzo", "run", "--dry-run", arazzo_path.to_str().unwrap()])
             .output()
             .expect("spawn spall");
         String::from_utf8_lossy(&output.stderr).into_owned()

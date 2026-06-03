@@ -102,14 +102,12 @@ async fn follow_link_via_hal() {
 
     wiremock::Mock::given(method("GET"))
         .and(path("/start"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "_links": {
-                    "next": {"href": next_url}
-                },
-                "items": []
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_links": {
+                "next": {"href": next_url}
+            },
+            "items": []
+        })))
         .mount(&mock)
         .await;
 

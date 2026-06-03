@@ -366,12 +366,7 @@ async fn repl_pipe_cross_api_target_is_actionable_error() {
 
     // A second API whose op `other-op` is NOT part of testapi's spec.
     let other_spec = other_api_spec(mock.address().port());
-    let other_path = temp
-        .path()
-        .join("other.json")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let other_path = temp.path().join("other.json").to_str().unwrap().to_string();
     std::fs::write(&other_path, &other_spec).unwrap();
     register_api(&temp, "otherapi", &other_path);
 

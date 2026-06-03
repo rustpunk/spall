@@ -91,7 +91,11 @@ fn spawn(temp: &TempDir, api: &str, extra_args: &[&str]) -> Server {
     let mut child = cmd.spawn().expect("spawn spall mcp");
     let stdin = child.stdin.take().unwrap();
     let stdout = BufReader::new(child.stdout.take().unwrap());
-    Server { child, stdin, stdout }
+    Server {
+        child,
+        stdin,
+        stdout,
+    }
 }
 
 fn shutdown(s: Server) -> String {

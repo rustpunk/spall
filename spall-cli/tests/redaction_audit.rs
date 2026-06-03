@@ -32,17 +32,13 @@ use std::path::Path;
 /// at line 48, distance 8) sits well outside the window; a refactor
 /// that closes that gap by 5+ lines trips this test.
 const K: usize = 3;
-const LOG_MARKERS: &[&str] = &[
-    "eprintln!",
-    "println!",
-    "tracing::",
-    "log::",
-    "dbg!",
-];
+const LOG_MARKERS: &[&str] = &["eprintln!", "println!", "tracing::", "log::", "dbg!"];
 
 #[test]
 fn expose_secret_never_within_k_lines_of_log_macro() {
-    let auth_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("auth");
+    let auth_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("auth");
     let mut violations: Vec<String> = Vec::new();
     for entry in fs::read_dir(&auth_dir).expect("read auth dir") {
         let path = entry.expect("dir entry").path();

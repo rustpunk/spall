@@ -99,12 +99,7 @@ async fn chain_into_path_param_hits_resolved_path() {
 
     let output = Command::new(bin_path())
         .env("XDG_CONFIG_HOME", temp.path())
-        .args([
-            "testapi",
-            "get-thing",
-            "--spall-chain",
-            "get-by-id --id id",
-        ])
+        .args(["testapi", "get-thing", "--spall-chain", "get-by-id --id id"])
         .output()
         .expect("failed to run spall");
 
@@ -224,12 +219,7 @@ async fn chain_before_api_name_does_not_loop() {
 
     let output = Command::new(bin_path())
         .env("XDG_CONFIG_HOME", temp.path())
-        .args([
-            "--spall-chain",
-            "get-by-id --id id",
-            "testapi",
-            "get-thing",
-        ])
+        .args(["--spall-chain", "get-by-id --id id", "testapi", "get-thing"])
         .output()
         .expect("failed to run spall");
 
@@ -280,12 +270,7 @@ async fn chain_after_op_performs_exactly_one_hop() {
 
     let output = Command::new(bin_path())
         .env("XDG_CONFIG_HOME", temp.path())
-        .args([
-            "testapi",
-            "get-thing",
-            "--spall-chain",
-            "get-by-id --id id",
-        ])
+        .args(["testapi", "get-thing", "--spall-chain", "get-by-id --id id"])
         .output()
         .expect("failed to run spall");
 

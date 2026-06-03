@@ -25,10 +25,7 @@ where
 /// secrets do not survive a serialize hop, which is the safe failure
 /// mode for inline credentials. Use the `oauth2.rs` round-trip
 /// helpers for credentials that must survive on-disk persistence.
-fn serialize_always_none<S>(
-    _: &Option<SecretString>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn serialize_always_none<S>(_: &Option<SecretString>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
