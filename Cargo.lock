@@ -3967,7 +3967,9 @@ dependencies = [
 name = "spall-openapi"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "indexmap",
+ "secrecy",
  "serde",
  "serde_json",
  "spall-core",

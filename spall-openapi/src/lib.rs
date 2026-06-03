@@ -35,7 +35,18 @@
 //! them later. [`Status`] is the neutral status newtype that preserves spall's
 //! `4xx`/`5xx` exit-code classification without depending on a transport's
 //! status type.
+//!
+//! ## Auth contributors
+//!
+//! The [`auth`] module supplies transport-neutral *request contributors* that
+//! take an already-resolved secret ([`secrecy::SecretString`]) and mutate an
+//! [`HttpRequestSpec`]: [`bearer()`], [`basic()`], [`api_key()`], and
+//! [`oauth2_access_token()`] inject headers / query pairs, while
+//! [`oauth2_client_credentials_request()`] builds the client-credentials token
+//! request as a spec the caller executes. The credential-resolution chain
+//! (keyring / env / prompt) and the OAuth2 login flow stay in the CLI.
 
+pub mod auth;
 pub mod builder;
 pub mod datapath;
 pub mod request;
@@ -43,6 +54,9 @@ pub mod response;
 pub mod status;
 pub mod stream;
 
+pub use auth::{
+    ApiKeyLocation, api_key, basic, bearer, oauth2_access_token, oauth2_client_credentials_request,
+};
 pub use builder::{BuildError, build_request};
 pub use datapath::{DataPath, DataPathError};
 pub use request::{Headers, HttpRequestSpec, MultipartField, MultipartValue, RequestBody};
