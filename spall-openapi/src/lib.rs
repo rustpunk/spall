@@ -19,6 +19,17 @@
 //!   `serde_json::Value` items drawn from the array located by a [`DataPath`].
 //!   Items are parsed one at a time; the page is never fully buffered.
 //!
+//! ## Automatic pagination
+//!
+//! [`ItemStream::paginated`] follows the response `Link` `rel=next` header
+//! ([`Paginator`], [`parse_rfc5988`]) across pages and de-paginates them into a
+//! single lazy item stream: each page's envelope is stripped via its
+//! [`DataPath`], items flow in order, and the next page is fetched only when the
+//! current one drains — no page is buffered whole. This replaces the CLI's old
+//! eager concat-all-pages step. [`Paginator::next_url`] is also the standalone
+//! building block for an opt-in raw-per-page loop (fetch a [`ResponseStream`],
+//! consume its raw body, ask for the next URL, repeat) with no item-flattening.
+//!
 //! ## Hand-rolled bounded-memory parser
 //!
 //! Layer 2 is driven by [`JsonSkimmer`], an in-house forward-only streaming
@@ -49,6 +60,8 @@
 pub mod auth;
 pub mod builder;
 pub mod datapath;
+pub mod links;
+pub mod paginate;
 pub mod request;
 pub mod response;
 pub mod status;
@@ -59,7 +72,9 @@ pub use auth::{
 };
 pub use builder::{BuildError, build_request};
 pub use datapath::{DataPath, DataPathError};
+pub use links::parse_rfc5988;
+pub use paginate::Paginator;
 pub use request::{Headers, HttpRequestSpec, MultipartField, MultipartValue, RequestBody};
 pub use response::ResponseStream;
 pub use status::Status;
-pub use stream::{ItemStream, JsonSkimmer, StreamError};
+pub use stream::{ItemStream, JsonSkimmer, PageFetch, StreamError, TopLevelShape};

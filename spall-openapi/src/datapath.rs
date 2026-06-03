@@ -84,6 +84,37 @@ impl DataPath {
         }
         Ok(DataPath::Pointer(segments))
     }
+
+    /// Reads the `x-spall-data-path` vendor extension off an operation, if it
+    /// names a valid JSON pointer.
+    ///
+    /// Why: an operation can declare where its item array lives directly in the
+    /// spec via the `x-spall-data-path` extension (a JSON-pointer string). This
+    /// reads that extension — mirroring spall-core's `x-cli-*` extension
+    /// pattern — and parses it with [`DataPath::from_pointer`].
+    ///
+    /// Returns `None` when the extension is absent, is not a string, or is a
+    /// malformed pointer. It never panics on bad spec input: a malformed pointer
+    /// is treated the same as "no override", so a lower-precedence source can
+    /// supply the data path instead.
+    ///
+    /// This is **one tier** of data-path sourcing. The full precedence — an
+    /// explicit caller override, then `x-spall-data-path`, then the
+    /// `ApiEntry.data_path` config field, then [`DataPath::TopLevel`] — plus the
+    /// new config field, is assembled in spall-cli (#28); this crate stays free
+    /// of spall-config and only knows how to read the vendor extension.
+    ///
+    /// Memory model: fully buffered and tiny; reads only the operation's small
+    /// extension map and does no I/O.
+    #[must_use]
+    pub fn from_operation(op: &spall_core::ir::ResolvedOperation) -> Option<DataPath> {
+        if let Some(spall_core::value::SpallValue::Str(s)) = op.extensions.get("x-spall-data-path")
+        {
+            DataPath::from_pointer(s).ok()
+        } else {
+            None
+        }
+    }
 }
 
 /// Decodes a single RFC-6901 reference token, expanding `~1` -> `/` and
@@ -178,5 +209,82 @@ mod tests {
             DataPath::from_pointer("/trailing~"),
             Err(DataPathError::InvalidEscape("trailing~".to_string()))
         );
+    }
+
+    fn op_with_extensions(
+        extensions: indexmap::IndexMap<String, spall_core::value::SpallValue>,
+    ) -> spall_core::ir::ResolvedOperation {
+        spall_core::ir::ResolvedOperation {
+            operation_id: "op".into(),
+            method: spall_core::ir::HttpMethod::Get,
+            path_template: "/x".into(),
+            summary: None,
+            description: None,
+            deprecated: false,
+            parameters: Vec::new(),
+            request_body: None,
+            responses: indexmap::IndexMap::new(),
+            security: Vec::new(),
+            tags: Vec::new(),
+            extensions,
+            servers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn from_operation_reads_x_spall_data_path() {
+        let mut ext = indexmap::IndexMap::new();
+        ext.insert(
+            "x-spall-data-path".to_string(),
+            spall_core::value::SpallValue::Str("/result/items".to_string()),
+        );
+        let op = op_with_extensions(ext);
+        assert_eq!(
+            DataPath::from_operation(&op),
+            Some(DataPath::Pointer(vec![
+                "result".to_string(),
+                "items".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn from_operation_top_level_pointer() {
+        let mut ext = indexmap::IndexMap::new();
+        ext.insert(
+            "x-spall-data-path".to_string(),
+            spall_core::value::SpallValue::Str("/".to_string()),
+        );
+        let op = op_with_extensions(ext);
+        assert_eq!(DataPath::from_operation(&op), Some(DataPath::TopLevel));
+    }
+
+    #[test]
+    fn from_operation_absent_is_none() {
+        let op = op_with_extensions(indexmap::IndexMap::new());
+        assert_eq!(DataPath::from_operation(&op), None);
+    }
+
+    #[test]
+    fn from_operation_non_string_is_none() {
+        let mut ext = indexmap::IndexMap::new();
+        ext.insert(
+            "x-spall-data-path".to_string(),
+            spall_core::value::SpallValue::Bool(true),
+        );
+        let op = op_with_extensions(ext);
+        assert_eq!(DataPath::from_operation(&op), None);
+    }
+
+    #[test]
+    fn from_operation_malformed_pointer_is_none() {
+        // Missing leading slash => from_pointer errors => None, no panic.
+        let mut ext = indexmap::IndexMap::new();
+        ext.insert(
+            "x-spall-data-path".to_string(),
+            spall_core::value::SpallValue::Str("result/items".to_string()),
+        );
+        let op = op_with_extensions(ext);
+        assert_eq!(DataPath::from_operation(&op), None);
     }
 }

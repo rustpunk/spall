@@ -26,6 +26,8 @@
 //! resident buffer. This is verified by `tests/stream_bound.rs`.
 
 use crate::datapath::DataPath;
+use crate::paginate::Paginator;
+use crate::request::Headers;
 use crate::response::ResponseStream;
 use serde_json::Value;
 use std::io::{BufReader, Read};
@@ -68,6 +70,25 @@ pub enum StreamError {
     /// formatted serde_json message (no internal types leak out).
     #[error("failed to parse JSON element: {0}")]
     Json(String),
+}
+
+/// The shape of a [`DataPath::TopLevel`] document, as resolved by
+/// [`JsonSkimmer::seek_top_level_lenient`].
+///
+/// Why: the default top-level data path reproduces the old `concat_results`
+/// leniency — an array root streams element-by-element, while a non-array root
+/// is yielded as one whole item. This enum carries that decision back to the
+/// [`ItemStream`] state machine so each case drives the right path.
+///
+/// Memory model: [`TopLevelShape::Array`] is a zero-size marker (the array
+/// streams). [`TopLevelShape::Single`] **buffers** exactly one value — the same
+/// buffering the old eager concatenation did for a non-array page.
+pub enum TopLevelShape {
+    /// The root is an array; the reader is positioned just after its `[` and
+    /// elements stream via [`JsonSkimmer::next_element`].
+    Array,
+    /// The root is a non-array value, captured whole as a single item.
+    Single(Value),
 }
 
 /// A forward-only streaming JSON pull reader.
@@ -172,6 +193,48 @@ impl<R: Read> JsonSkimmer<R> {
                 }
             }
             DataPath::Pointer(segments) => self.seek_pointer(segments),
+        }
+    }
+
+    /// Navigates a [`DataPath::TopLevel`] document with `concat_results`
+    /// leniency: if the root value is an array, positions the reader just after
+    /// the opening `[` and returns [`TopLevelShape::Array`]; if the root is any
+    /// non-array JSON value, captures that **whole** value and returns
+    /// [`TopLevelShape::Single`] holding it.
+    ///
+    /// Why: the old eager `concat_results` flattened array pages but wrapped a
+    /// non-array page (e.g. a bare object envelope) as a single element. The
+    /// de-paginated [`ItemStream`] must reproduce that exactly for the default
+    /// top-level data path. Pointer paths stay strict (a non-array there is a
+    /// configuration error), so this leniency lives only here.
+    ///
+    /// # Errors
+    /// * [`StreamError::NotJson`] if the body is empty / not JSON.
+    /// * [`StreamError::DepthExceeded`], [`StreamError::Io`],
+    ///   [`StreamError::Json`] from capturing a non-array root.
+    ///
+    /// Memory model: the array case **streams** (nothing captured yet). The
+    /// single-value case is **inherently buffered** for that one value — the
+    /// same buffering `concat_results` performed when it wrapped a non-array
+    /// page. #44 adds the `max_buffered_bytes` guard around this capture.
+    #[must_use = "navigation can fail and the Result must be handled"]
+    pub fn seek_top_level_lenient(&mut self) -> Result<TopLevelShape, StreamError> {
+        self.skip_ws()?;
+        match self.peek_byte()? {
+            Some(b'[') => {
+                // Consume the opening bracket; elements stream from here.
+                let _ = self.read_byte()?;
+                Ok(TopLevelShape::Array)
+            }
+            None => Err(StreamError::NotJson),
+            Some(_) => {
+                // A non-array root: capture the whole value as a single item.
+                self.scratch.clear();
+                self.capture_value()?;
+                let value = serde_json::from_slice::<Value>(&self.scratch)
+                    .map_err(|e| StreamError::Json(e.to_string()))?;
+                Ok(TopLevelShape::Single(value))
+            }
         }
     }
 
@@ -520,16 +583,65 @@ impl<R: Read> JsonSkimmer<R> {
     }
 }
 
-/// Internal seam: where a [`ItemStream`] gets its bytes from.
+/// The boxed, synchronous fetch closure an automatic [`ItemStream`] calls to
+/// retrieve the next page.
 ///
-/// Why: #24 ships single-page streaming only, but #27 must add multi-page
-/// pagination *without* rewriting `ItemStream`. Modeling the byte source as an
-/// enum lets #27 add a `Paginated { .. }` variant later while `next` stays the
-/// same shape. We add no multi-page variant now (no dead code); the enum simply
-/// names the single seam #27 will extend.
+/// Why a neutral closure: this crate depends on no HTTP client. The caller
+/// (the CLI transport, a mock, a test) supplies a `FnMut(&str)` that turns a
+/// next-page URL into a [`ResponseStream`]; pagination drives that closure
+/// without ever knowing how the bytes are fetched. It is `FnMut` (not `Fn`) so
+/// a transport may hold mutable state (a client, a connection) across pages.
+pub type PageFetch = Box<dyn FnMut(&str) -> Result<ResponseStream, StreamError>>;
+
+/// Internal seam: where an [`ItemStream`] gets its bytes from.
+///
+/// Why: #24 shipped single-page streaming only and documented this enum as the
+/// seam #27 would extend. #27 adds the [`PageSource::Paginated`] variant
+/// *without* rewriting [`ItemStream::single`]; only the `next` match grows a
+/// second arm.
 enum PageSource {
     /// A single response page: one skimmer over one body, no further pages.
+    /// Uses the outer [`ItemStream`] `sought`/`data_path` fields and stays
+    /// **strict** on a non-array top level (its #24 contract).
     Single(JsonSkimmer<Box<dyn Read + Send>>),
+    /// An automatically-paginated source: a chain of pages followed via
+    /// `rel=next`, de-paginated into one lazy item stream. Carries everything
+    /// the multi-page state machine needs.
+    Paginated(Box<PaginatedSource>),
+}
+
+/// State for a [`PageSource::Paginated`] source: the current page's skimmer and
+/// headers, the [`Paginator`] that computes the next URL, the fetch closure,
+/// the page budget already spent, and per-page seek/leniency state.
+///
+/// Boxed inside [`PageSource`] because it is much larger than the `Single`
+/// variant (a skimmer + headers + paginator + closure), keeping the enum small.
+///
+/// Memory model: **streams** across pages. Only the current page's skimmer (one
+/// reused element buffer) and its small header map are resident; pages are
+/// fetched one at a time and never accumulated. The lone exception is a
+/// non-array top-level page captured whole into `pending_single` — the same
+/// buffering the old `concat_results` did, and where #44 adds the byte guard.
+struct PaginatedSource {
+    /// Skimmer over the *current* page's body.
+    skimmer: JsonSkimmer<Box<dyn Read + Send>>,
+    /// The current page's response headers, used to compute the next URL.
+    headers: Headers,
+    /// The next-URL policy (RFC 5988 `rel=next`) plus the `max_pages` cap.
+    paginator: Paginator,
+    /// The caller-supplied synchronous page fetcher.
+    fetch: PageFetch,
+    /// How many pages have been fetched so far (the first page counts as 1).
+    page_count: usize,
+    /// True once the current page's data path has been navigated. Reset to
+    /// `false` each time a fresh page is installed.
+    page_sought: bool,
+    /// For a lenient top-level non-array page: the captured whole value waiting
+    /// to be emitted as the page's single item. Drained on the next `next`.
+    pending_single: Option<Value>,
+    /// True once the current page is known to be a streaming array (so further
+    /// `next` calls pull elements rather than re-running the lenient seek).
+    page_is_array: bool,
 }
 
 /// Layer 2: a lazy, bounded-memory iterator of response items.
@@ -539,18 +651,32 @@ enum PageSource {
 /// each only when the caller asks for it. The final per-element parse delegates
 /// to `serde_json`.
 ///
+/// Two sources feed it:
+///
+/// * [`ItemStream::single`] — one response page (#24).
+/// * [`ItemStream::paginated`] — a chain of pages followed automatically via
+///   the response `Link` `rel=next` header and de-paginated into one stream
+///   (#27). The next page is fetched only when the current page drains, so all
+///   pages are never resident at once — this replaces the old eager
+///   `concat_results`.
+///
 /// Memory model: **streams**. At most one element is resident at a time (plus
 /// the skimmer's reused capture buffer); peak memory is bounded by the largest
-/// element, independent of how large the page is. `tests/stream_bound.rs`
-/// proves this against a multi-hundred-megabyte body.
+/// element, independent of how large the page is, *and* independent of how many
+/// pages are followed. `tests/stream_bound.rs` proves the per-page bound. The
+/// one buffered case is a non-array top-level page on the paginated path, which
+/// is captured whole exactly as `concat_results` did (#44 caps its size).
 ///
 /// Errors are yielded inline as `Err(StreamError)` items; after an error the
-/// iterator is fused to `None` so callers cannot loop forever on a broken body.
+/// iterator is fused to `None` so callers cannot loop forever on a broken body
+/// or a failing fetch.
 pub struct ItemStream {
     source: PageSource,
-    /// True once navigation to the data path has been attempted.
+    /// True once navigation to the data path has been attempted. Used by the
+    /// `Single` source only; the `Paginated` source tracks per-page seek state
+    /// in [`PaginatedSource::page_sought`].
     sought: bool,
-    /// The data path to navigate to on first `next`.
+    /// The data path to navigate to on each page.
     data_path: DataPath,
     /// True once the stream has terminated (clean end or error); fuses `next`.
     done: bool,
@@ -578,6 +704,133 @@ impl ItemStream {
             done: false,
         }
     }
+
+    /// Builds an automatically-paginated item stream that de-paginates a chain
+    /// of pages into one lazy stream (#27).
+    ///
+    /// `first` is the already-fetched first page; `data_path` locates the item
+    /// array on **every** page; `paginator` computes the next-page URL from each
+    /// page's headers (RFC 5988 `rel=next`) and supplies the `max_pages` cap;
+    /// `fetch` turns a next-page URL into the next [`ResponseStream`].
+    ///
+    /// Behavior — the de-paginated contract:
+    ///
+    /// * Each page is navigated to `data_path` and its elements are streamed in
+    ///   order; page envelopes are stripped, so the caller sees a flat item
+    ///   stream as if the pages were one array (this is exactly the old
+    ///   `concat_results` flatten, but lazy).
+    /// * **Laziness:** the next page is fetched only when the current page's
+    ///   items are fully drained — `fetch` is never called ahead of need, and
+    ///   never at all if the caller stops early. No page is buffered whole
+    ///   (except a non-array top-level page; see below).
+    /// * The next URL is read from the current page's **headers**, never from
+    ///   the already-consumed body, so the forward-only skimmer needs no rewind.
+    /// * Following stops when `rel=next` is absent **or** `max_pages` pages have
+    ///   been fetched, whichever comes first.
+    /// * `concat_results` parity for [`DataPath::TopLevel`]: an array page
+    ///   streams its elements; a non-array page yields that whole value as one
+    ///   item then ends that page. For [`DataPath::Pointer`] paths a non-array
+    ///   at the pointer is a [`StreamError::PathNotArray`] error (strict).
+    /// * A fetch error or a navigation error fuses the stream with that `Err`.
+    ///
+    /// Memory model: **streams** across pages — one page's skimmer at a time;
+    /// pages are fetched lazily and never accumulated. A non-array top-level
+    /// page is the one buffered case (same as `concat_results`; #44 guards it).
+    #[must_use]
+    pub fn paginated(
+        first: ResponseStream,
+        data_path: DataPath,
+        paginator: Paginator,
+        fetch: PageFetch,
+    ) -> ItemStream {
+        let source = PaginatedSource {
+            skimmer: JsonSkimmer::new(first.body),
+            headers: first.headers,
+            paginator,
+            fetch,
+            page_count: 1,
+            page_sought: false,
+            pending_single: None,
+            page_is_array: false,
+        };
+        ItemStream {
+            source: PageSource::Paginated(Box::new(source)),
+            // `sought`/`data_path` here: the Paginated source uses `data_path`
+            // for every page but tracks seek state per page internally, so the
+            // outer `sought` flag is unused on this path.
+            sought: false,
+            data_path,
+            done: false,
+        }
+    }
+}
+
+impl PaginatedSource {
+    /// Pulls the next item from the paginated source, following `rel=next`
+    /// across page boundaries as needed.
+    ///
+    /// Returns `Ok(Some(v))` for an item, `Ok(None)` when all reachable pages
+    /// are exhausted, and `Err(e)` on a navigation or fetch fault (after which
+    /// the caller fuses the stream).
+    ///
+    /// Uses a `loop` (not recursion) so a run of empty pages cannot grow the
+    /// stack: a drained page that links to another simply re-enters the loop.
+    fn next_item(&mut self, data_path: &DataPath) -> Result<Option<Value>, StreamError> {
+        loop {
+            // First touch of a freshly-installed page: navigate the data path.
+            if !self.page_sought {
+                self.page_sought = true;
+                match data_path {
+                    DataPath::TopLevel => match self.skimmer.seek_top_level_lenient()? {
+                        TopLevelShape::Array => self.page_is_array = true,
+                        TopLevelShape::Single(v) => {
+                            // Whole-value page: emit it as this page's one item.
+                            self.page_is_array = false;
+                            self.pending_single = Some(v);
+                        }
+                    },
+                    DataPath::Pointer(_) => {
+                        // Pointer paths are strict; a non-array errors here.
+                        self.skimmer.seek_to_data_path(data_path)?;
+                        self.page_is_array = true;
+                    }
+                }
+            }
+
+            // A buffered non-array top-level page yields exactly one item.
+            if let Some(v) = self.pending_single.take() {
+                return Ok(Some(v));
+            }
+
+            // Stream the current array page's elements until it drains.
+            if self.page_is_array {
+                match self.skimmer.next_element()? {
+                    Some(v) => return Ok(Some(v)),
+                    None => { /* page drained; fall through to follow rel=next */ }
+                }
+            }
+
+            // The current page is exhausted. Compute the next URL from THIS
+            // page's headers (never the consumed body) and follow it if the
+            // page budget allows; otherwise the stream ends.
+            let Some(next_url) = self.paginator.next_url(&self.headers) else {
+                return Ok(None);
+            };
+            if self.page_count >= self.paginator.max_pages {
+                return Ok(None);
+            }
+
+            let next_page = (self.fetch)(&next_url)?;
+            // Install the fresh page: new skimmer + headers, reset per-page
+            // state, and loop to navigate and stream it.
+            self.skimmer = JsonSkimmer::new(next_page.body);
+            self.headers = next_page.headers;
+            self.page_count += 1;
+            self.page_sought = false;
+            self.page_is_array = false;
+            self.pending_single = None;
+        }
+    }
 }
 
 impl Iterator for ItemStream {
@@ -587,27 +840,43 @@ impl Iterator for ItemStream {
         if self.done {
             return None;
         }
-        let PageSource::Single(skimmer) = &mut self.source;
+        match &mut self.source {
+            PageSource::Single(skimmer) => {
+                // Navigate to the array exactly once, before the first element.
+                // Single stays strict: a non-array top level errors (its #24
+                // contract); only the Paginated path applies concat_results
+                // leniency.
+                if !self.sought {
+                    self.sought = true;
+                    if let Err(e) = skimmer.seek_to_data_path(&self.data_path) {
+                        self.done = true;
+                        return Some(Err(e));
+                    }
+                }
 
-        // Navigate to the array exactly once, before the first element.
-        if !self.sought {
-            self.sought = true;
-            if let Err(e) = skimmer.seek_to_data_path(&self.data_path) {
-                self.done = true;
-                return Some(Err(e));
+                match skimmer.next_element() {
+                    Ok(Some(v)) => Some(Ok(v)),
+                    Ok(None) => {
+                        self.done = true;
+                        None
+                    }
+                    Err(e) => {
+                        self.done = true;
+                        Some(Err(e))
+                    }
+                }
             }
-        }
-
-        match skimmer.next_element() {
-            Ok(Some(v)) => Some(Ok(v)),
-            Ok(None) => {
-                self.done = true;
-                None
-            }
-            Err(e) => {
-                self.done = true;
-                Some(Err(e))
-            }
+            PageSource::Paginated(source) => match source.next_item(&self.data_path) {
+                Ok(Some(v)) => Some(Ok(v)),
+                Ok(None) => {
+                    self.done = true;
+                    None
+                }
+                Err(e) => {
+                    self.done = true;
+                    Some(Err(e))
+                }
+            },
         }
     }
 }
@@ -791,5 +1060,277 @@ mod tests {
         assert!(matches!(first, Some(Err(StreamError::PathNotArray(_)))));
         // After an error the iterator is fused.
         assert!(stream.next().is_none());
+    }
+
+    // ----- #27: automatic pagination -----
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Builds a `ResponseStream` carrying an owned body and an owned `Link`
+    /// header (so the paginator can compute the next URL from it).
+    fn page(body: Vec<u8>, link: Option<&str>) -> ResponseStream {
+        let mut headers = Headers::new();
+        if let Some(l) = link {
+            headers.insert("link".to_string(), l.to_string());
+        }
+        ResponseStream {
+            status: Status(200),
+            headers,
+            body: Box::new(std::io::Cursor::new(body)),
+        }
+    }
+
+    #[test]
+    fn three_pages_concatenate_in_order() {
+        // Pages 2 and 3 are served by the fetch closure keyed on next URL.
+        let p2 = br#"[3, 4]"#.to_vec();
+        let p3 = br#"[5, 6]"#.to_vec();
+        let fetch: PageFetch = Box::new(move |url: &str| match url {
+            "https://api/x?page=2" => Ok(page(
+                p2.clone(),
+                Some(r#"<https://api/x?page=3>; rel="next""#),
+            )),
+            "https://api/x?page=3" => Ok(page(p3.clone(), None)),
+            other => panic!("unexpected fetch url: {other}"),
+        });
+        let first = page(
+            br#"[1, 2]"#.to_vec(),
+            Some(r#"<https://api/x?page=2>; rel="next""#),
+        );
+        let items: Vec<Value> =
+            ItemStream::paginated(first, DataPath::TopLevel, Paginator::default(), fetch)
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(
+            items,
+            vec![
+                Value::from(1),
+                Value::from(2),
+                Value::from(3),
+                Value::from(4),
+                Value::from(5),
+                Value::from(6),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_is_lazy_not_called_until_prior_page_drains() {
+        // The closure records, in order, the items already pulled when it is
+        // invoked, proving page 1 fully drains before page 2 is fetched.
+        let pulled: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        let fetch_log = Rc::clone(&pulled);
+        let p2 = br#"[3, 4]"#.to_vec();
+        let fetch: PageFetch = Box::new(move |url: &str| {
+            assert_eq!(url, "https://api/x?page=2");
+            // At the moment of fetch, page 1's two items must already be pulled.
+            assert_eq!(*fetch_log.borrow(), vec![1, 2]);
+            Ok(page(p2.clone(), None))
+        });
+        let first = page(
+            br#"[1, 2]"#.to_vec(),
+            Some(r#"<https://api/x?page=2>; rel="next""#),
+        );
+        let mut stream =
+            ItemStream::paginated(first, DataPath::TopLevel, Paginator::default(), fetch);
+
+        // Pull page 1's items one at a time; fetch must NOT have fired yet.
+        for expected in [1i64, 2] {
+            let v = stream.next().unwrap().unwrap();
+            pulled.borrow_mut().push(v.as_i64().unwrap());
+            assert_eq!(v, Value::from(expected));
+        }
+        // Pulling again drains the boundary and triggers exactly one fetch.
+        let v = stream.next().unwrap().unwrap();
+        assert_eq!(v, Value::from(3));
+    }
+
+    #[test]
+    fn fetch_not_called_when_caller_stops_early() {
+        // If the caller never drains page 1, the next page is never fetched.
+        let fetch: PageFetch = Box::new(|_url: &str| panic!("fetch must not be called"));
+        let first = page(
+            br#"[1, 2, 3]"#.to_vec(),
+            Some(r#"<https://api/x?page=2>; rel="next""#),
+        );
+        let mut stream =
+            ItemStream::paginated(first, DataPath::TopLevel, Paginator::default(), fetch);
+        // Pull just one item, then drop the stream — no fetch should occur.
+        assert_eq!(stream.next().unwrap().unwrap(), Value::from(1));
+        drop(stream);
+    }
+
+    #[test]
+    fn max_pages_cap_stops_following() {
+        // Every page links to a next page, but max_pages=2 stops after page 2.
+        let fetch_count = Rc::new(RefCell::new(0usize));
+        let fc = Rc::clone(&fetch_count);
+        let fetch: PageFetch = Box::new(move |_url: &str| {
+            *fc.borrow_mut() += 1;
+            // Always offers a further next link.
+            Ok(page(
+                br#"[9]"#.to_vec(),
+                Some(r#"<https://api/x?next>; rel="next""#),
+            ))
+        });
+        let first = page(
+            br#"[1]"#.to_vec(),
+            Some(r#"<https://api/x?next>; rel="next""#),
+        );
+        let paginator = Paginator { max_pages: 2 };
+        let items: Vec<Value> = ItemStream::paginated(first, DataPath::TopLevel, paginator, fetch)
+            .map(Result::unwrap)
+            .collect();
+        // Page 1 (item 1) + page 2 (item 9); page 3 is never fetched.
+        assert_eq!(items, vec![Value::from(1), Value::from(9)]);
+        assert_eq!(
+            *fetch_count.borrow(),
+            1,
+            "exactly one fetch under max_pages=2"
+        );
+    }
+
+    #[test]
+    fn top_level_non_array_page_yields_single_item() {
+        // concat_results parity: a non-array top-level page becomes ONE item.
+        let p2 = br#"{"meta": true}"#.to_vec();
+        let fetch: PageFetch = Box::new(move |_url: &str| Ok(page(p2.clone(), None)));
+        let first = page(
+            br#"[1, 2]"#.to_vec(),
+            Some(r#"<https://api/x?page=2>; rel="next""#),
+        );
+        let items: Vec<Value> =
+            ItemStream::paginated(first, DataPath::TopLevel, Paginator::default(), fetch)
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(
+            items,
+            vec![
+                Value::from(1),
+                Value::from(2),
+                serde_json::json!({"meta": true}),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_non_array_top_level_page_is_one_item() {
+        // A lone non-array page (no following) is itself a single item.
+        let fetch: PageFetch = Box::new(|_url: &str| panic!("no further pages"));
+        let first = page(br#"{"only": 1}"#.to_vec(), None);
+        let items: Vec<Value> =
+            ItemStream::paginated(first, DataPath::TopLevel, Paginator::default(), fetch)
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(items, vec![serde_json::json!({"only": 1})]);
+    }
+
+    #[test]
+    fn pointer_non_array_page_errors_path_not_array() {
+        // Pointer paths stay strict: a non-array at the pointer is an error,
+        // NOT a single item (unlike TopLevel leniency).
+        let first = page(br#"{"items": {"not": "array"}}"#.to_vec(), None);
+        let fetch: PageFetch = Box::new(|_url: &str| panic!("no further pages"));
+        let mut stream = ItemStream::paginated(
+            first,
+            DataPath::Pointer(vec!["items".to_string()]),
+            Paginator::default(),
+            fetch,
+        );
+        assert!(matches!(
+            stream.next(),
+            Some(Err(StreamError::PathNotArray(_)))
+        ));
+        // Error fuses the stream.
+        assert!(stream.next().is_none());
+    }
+
+    #[test]
+    fn pointer_paths_concatenate_across_pages() {
+        // De-paginate a pointer-located array across two pages.
+        let p2 = br#"{"items": [3, 4], "page": 2}"#.to_vec();
+        let fetch: PageFetch = Box::new(move |_url: &str| Ok(page(p2.clone(), None)));
+        let first = page(
+            br#"{"items": [1, 2], "page": 1}"#.to_vec(),
+            Some(r#"<https://api/x?page=2>; rel="next""#),
+        );
+        let items: Vec<Value> = ItemStream::paginated(
+            first,
+            DataPath::Pointer(vec!["items".to_string()]),
+            Paginator::default(),
+            fetch,
+        )
+        .map(Result::unwrap)
+        .collect();
+        assert_eq!(
+            items,
+            vec![
+                Value::from(1),
+                Value::from(2),
+                Value::from(3),
+                Value::from(4)
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_error_fuses_stream() {
+        let fetch: PageFetch =
+            Box::new(|_url: &str| Err(StreamError::Io(std::io::Error::other("boom"))));
+        let first = page(
+            br#"[1]"#.to_vec(),
+            Some(r#"<https://api/x?page=2>; rel="next""#),
+        );
+        let mut stream =
+            ItemStream::paginated(first, DataPath::TopLevel, Paginator::default(), fetch);
+        assert_eq!(stream.next().unwrap().unwrap(), Value::from(1));
+        // Draining page 1 triggers the fetch, which fails and surfaces inline.
+        assert!(matches!(stream.next(), Some(Err(StreamError::Io(_)))));
+        // Then the stream is fused.
+        assert!(stream.next().is_none());
+    }
+
+    #[test]
+    fn empty_pages_do_not_recurse_and_are_skipped() {
+        // A chain of empty array pages must not blow the stack and must reach
+        // the final page's items (loop, not recursion).
+        let p2 = br#"[]"#.to_vec();
+        let p3 = br#"[]"#.to_vec();
+        let p4 = br#"[42]"#.to_vec();
+        let fetch: PageFetch = Box::new(move |url: &str| match url {
+            "https://api/x?p=2" => Ok(page(p2.clone(), Some(r#"<https://api/x?p=3>; rel="next""#))),
+            "https://api/x?p=3" => Ok(page(p3.clone(), Some(r#"<https://api/x?p=4>; rel="next""#))),
+            "https://api/x?p=4" => Ok(page(p4.clone(), None)),
+            other => panic!("unexpected url: {other}"),
+        });
+        let first = page(
+            br#"[]"#.to_vec(),
+            Some(r#"<https://api/x?p=2>; rel="next""#),
+        );
+        let items: Vec<Value> =
+            ItemStream::paginated(first, DataPath::TopLevel, Paginator::default(), fetch)
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(items, vec![Value::from(42)]);
+    }
+
+    #[test]
+    fn seek_top_level_lenient_distinguishes_array_and_value() {
+        let mut arr = JsonSkimmer::new(
+            Box::new(std::io::Cursor::new(b"[1, 2]".to_vec())) as Box<dyn Read + Send>
+        );
+        assert!(matches!(
+            arr.seek_top_level_lenient().unwrap(),
+            TopLevelShape::Array
+        ));
+
+        let mut obj = JsonSkimmer::new(
+            Box::new(std::io::Cursor::new(b"{\"a\":1}".to_vec())) as Box<dyn Read + Send>
+        );
+        match obj.seek_top_level_lenient().unwrap() {
+            TopLevelShape::Single(v) => assert_eq!(v, serde_json::json!({"a": 1})),
+            TopLevelShape::Array => panic!("object should be a single value"),
+        }
     }
 }
