@@ -53,6 +53,18 @@ impl Status {
     }
 }
 
+impl std::fmt::Display for Status {
+    /// Writes the bare numeric code (e.g. `200`).
+    ///
+    /// Why: callers format a status into log lines and JSON without wanting a
+    /// reason phrase. Unlike `reqwest::StatusCode`'s `Display` (which renders
+    /// `200 OK`), this prints only the number — the canonical form the CLI's
+    /// verbose `HTTP <status> <url>` line and history records use.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl From<u16> for Status {
     /// Wraps a raw status number with no validation.
     ///
@@ -84,6 +96,14 @@ mod tests {
         assert!(Status(503).is_server_error());
         assert!(Status(599).is_server_error());
         assert!(!Status(499).is_server_error());
+    }
+
+    #[test]
+    fn display_writes_bare_number() {
+        // Unlike reqwest's "200 OK", Display prints only the code.
+        assert_eq!(Status(200).to_string(), "200");
+        assert_eq!(Status(404).to_string(), "404");
+        assert_eq!(format!("HTTP {}", Status(503)), "HTTP 503");
     }
 
     #[test]

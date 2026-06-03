@@ -17,10 +17,10 @@ mod links;
 mod matches;
 mod mcp;
 mod output;
-mod paginate;
 mod preview;
 mod repeat;
 mod repl;
+mod transport;
 mod validate;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};

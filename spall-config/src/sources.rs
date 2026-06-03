@@ -54,6 +54,8 @@ struct ApiToml {
     #[serde(default)]
     proxy: Option<String>,
     #[serde(default)]
+    data_path: Option<String>,
+    #[serde(default)]
     profile: HashMap<String, ProfileToml>,
 }
 
@@ -118,6 +120,7 @@ pub fn load_global_config() -> Result<GlobalConfig, SpallConfigError> {
             auth: None,
             proxy: None,
             profiles: std::collections::HashMap::new(),
+            data_path: None,
         })
         .collect();
 
@@ -210,6 +213,7 @@ pub fn scan_api_configs() -> Result<Vec<ApiEntry>, SpallConfigError> {
                     auth,
                     proxy: cfg.proxy,
                     profiles,
+                    data_path: cfg.data_path,
                 });
             }
         }
@@ -245,6 +249,7 @@ pub fn scan_spec_dirs(dirs: &[PathBuf]) -> Result<Vec<ApiEntry>, SpallConfigErro
                                 auth: None,
                                 proxy: None,
                                 profiles: std::collections::HashMap::new(),
+                                data_path: None,
                             });
                         }
                     }
@@ -306,6 +311,27 @@ unknown_key = "value"
     fn test_empty_config() {
         let cfg: SpallConfig = toml::from_str("").expect("empty string should parse");
         assert!(cfg.api.is_empty());
+    }
+
+    #[test]
+    fn api_toml_data_path_round_trips() {
+        // The new `data_path` field deserializes from TOML and serializes back
+        // unchanged, and is absent (None) when the key is omitted.
+        let with = r#"
+source = "petstore.json"
+data_path = "/result/items"
+"#;
+        let parsed = toml::from_str::<ApiToml>(with).expect("data_path should parse");
+        assert_eq!(parsed.data_path.as_deref(), Some("/result/items"));
+        let reser = toml::to_string(&parsed).expect("serialize back");
+        assert!(
+            reser.contains("data_path = \"/result/items\""),
+            "data_path should round-trip: {reser}"
+        );
+
+        let without = r#"source = "petstore.json""#;
+        let parsed = toml::from_str::<ApiToml>(without).expect("omitted data_path should parse");
+        assert_eq!(parsed.data_path, None);
     }
 
     #[test]

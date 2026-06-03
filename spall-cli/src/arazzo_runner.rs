@@ -262,7 +262,11 @@ pub async fn prepare_sources(
             "spall: loading workflow doc '{}' ({} source{}, {} workflow{})",
             doc_path.display(),
             doc.source_descriptions.len(),
-            if doc.source_descriptions.len() == 1 { "" } else { "s" },
+            if doc.source_descriptions.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
             doc.workflows.len(),
             if doc.workflows.len() == 1 { "" } else { "s" },
         );
@@ -278,13 +282,14 @@ pub async fn prepare_sources(
             }
         }
         let url = resolve_source_url(&source.url, doc_path);
-        let raw = load_raw(&url, cache_dir, proxy).await.map_err(|e| {
-            ArazzoRunError::LoadSource {
-                name: source.name.clone(),
-                url: url.clone(),
-                reason: e.to_string(),
-            }
-        })?;
+        let raw =
+            load_raw(&url, cache_dir, proxy)
+                .await
+                .map_err(|e| ArazzoRunError::LoadSource {
+                    name: source.name.clone(),
+                    url: url.clone(),
+                    reason: e.to_string(),
+                })?;
         let spec = spall_core::cache::load_or_resolve(&url, &raw, cache_dir).map_err(|e| {
             ArazzoRunError::LoadSource {
                 name: source.name.clone(),
@@ -358,6 +363,7 @@ fn resolve_api_entry(
         auth: None,
         proxy: None,
         profiles: std::collections::HashMap::new(),
+        data_path: None,
     };
     (synthetic, true)
 }
@@ -484,13 +490,14 @@ pub async fn run_workflow(
         match flow {
             StepFlow::Continue => idx += 1,
             StepFlow::Goto { step_id } => {
-                idx = *step_index.get(&step_id).ok_or_else(|| {
-                    ArazzoRunError::GotoTargetMissing {
-                        step: step.step_id.clone(),
-                        target: step_id.clone(),
-                        workflow: wf.workflow_id.clone(),
-                    }
-                })?;
+                idx =
+                    *step_index
+                        .get(&step_id)
+                        .ok_or_else(|| ArazzoRunError::GotoTargetMissing {
+                            step: step.step_id.clone(),
+                            target: step_id.clone(),
+                            workflow: wf.workflow_id.clone(),
+                        })?;
             }
             StepFlow::End { success } => {
                 if opts.verbose {
@@ -565,10 +572,7 @@ fn pick_workflow<'a>(
                     .map(|w| w.workflow_id.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                ArazzoRunError::WorkflowNotFound(format!(
-                    "'{}' (available: {})",
-                    id, available
-                ))
+                ArazzoRunError::WorkflowNotFound(format!("'{}' (available: {})", id, available))
             });
     }
     if doc.workflows.len() == 1 {
@@ -606,12 +610,12 @@ fn resolve_step_operation<'a>(
             feature: "workflowId (nested workflows are v2)".to_string(),
         });
     }
-    let op_ref = step
-        .operation_id
-        .as_deref()
-        .ok_or_else(|| ArazzoRunError::StepMissingOperation {
-            step: step.step_id.clone(),
-        })?;
+    let op_ref =
+        step.operation_id
+            .as_deref()
+            .ok_or_else(|| ArazzoRunError::StepMissingOperation {
+                step: step.step_id.clone(),
+            })?;
 
     // Qualified form: `<sourceName>.operationId`.
     if let Some((src_name, op_id)) = op_ref.split_once('.') {
@@ -703,16 +707,18 @@ async fn run_step_with_actions(
 ) -> Result<StepFlow, ArazzoRunError> {
     let success_chain = effective_success_chain(step, workflow);
     let failure_chain = effective_failure_chain(step, workflow);
-    let success_actions = resolve_success_chain(success_chain, components)
-        .map_err(|e| ArazzoRunError::ActionDispatch {
+    let success_actions = resolve_success_chain(success_chain, components).map_err(|e| {
+        ArazzoRunError::ActionDispatch {
             step: step.step_id.clone(),
             source: e,
-        })?;
-    let failure_actions = resolve_failure_chain(failure_chain, components)
-        .map_err(|e| ArazzoRunError::ActionDispatch {
+        }
+    })?;
+    let failure_actions = resolve_failure_chain(failure_chain, components).map_err(|e| {
+        ArazzoRunError::ActionDispatch {
             step: step.step_id.clone(),
             source: e,
-        })?;
+        }
+    })?;
 
     if opts.dry_run {
         print_action_chain_preview(step, &success_actions, &failure_actions);
@@ -828,10 +834,7 @@ fn effective_success_chain<'a>(step: &'a Step, workflow: &'a Workflow) -> &'a [A
 
 /// Pick the action chain that applies to a step's failure path. Same
 /// absent-vs-empty distinction as [`effective_success_chain`].
-fn effective_failure_chain<'a>(
-    step: &'a Step,
-    workflow: &'a Workflow,
-) -> &'a [FailureActionOrRef] {
+fn effective_failure_chain<'a>(step: &'a Step, workflow: &'a Workflow) -> &'a [FailureActionOrRef] {
     match &step.on_failure {
         Some(chain) => chain.as_slice(),
         None => workflow.failure_actions.as_slice(),
@@ -912,11 +915,7 @@ fn print_action_chain_preview(
 /// field carries whatever the wire actually returned (or 0 when the
 /// failure was criteria-only).
 fn synthetic_failure_outcome(step: &Step, ctx: &Context, via: FailedVia) -> StepOutcome {
-    let status = ctx
-        .current_response
-        .as_ref()
-        .map(|s| s.status)
-        .unwrap_or(0);
+    let status = ctx.current_response.as_ref().map(|s| s.status).unwrap_or(0);
     StepOutcome {
         step_id: step.step_id.clone(),
         status,
@@ -944,7 +943,11 @@ async fn run_step(
 
     // Step parameters.
     for p in &step.parameters {
-        let value = evaluate_value(&p.value, ctx, &format!("step '{}' parameter '{}'", step.step_id, p.name))?;
+        let value = evaluate_value(
+            &p.value,
+            ctx,
+            &format!("step '{}' parameter '{}'", step.step_id, p.name),
+        )?;
         let str_val = json_to_string(&value);
         let location = parameter_location(p, op, &step.step_id)?;
         match location.as_str() {
@@ -986,13 +989,8 @@ async fn run_step(
         // Reuse the shared URL builder so the dry-run render exactly
         // matches what would go on the wire — no double-slash bugs from
         // hand-formatted strings.
-        let url = build_url_with_path_args(
-            op,
-            spec,
-            entry,
-            args.server_override.as_deref(),
-            &args.path,
-        );
+        let url =
+            build_url_with_path_args(op, spec, entry, args.server_override.as_deref(), &args.path);
         eprintln!("[dry-run] step '{}': {} {}", step.step_id, op.method, url);
         if !args.query.is_empty() {
             eprintln!("            query: {:?}", args.query);
@@ -1065,11 +1063,10 @@ async fn run_step(
             }
             continue;
         }
-        let cond =
-            parse_condition(&c.condition).map_err(|e| ArazzoRunError::Expression {
-                context: format!("step '{}' criterion #{}", step.step_id, idx),
-                source: e,
-            })?;
+        let cond = parse_condition(&c.condition).map_err(|e| ArazzoRunError::Expression {
+            context: format!("step '{}' criterion #{}", step.step_id, idx),
+            source: e,
+        })?;
         let ok = eval_condition(&cond, ctx).map_err(|e| ArazzoRunError::Expression {
             context: format!("step '{}' criterion #{}", step.step_id, idx),
             source: e,
@@ -1155,7 +1152,10 @@ fn evaluate_value(
         serde_json::Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                out.insert(k.clone(), evaluate_value(v, ctx, &format!("{}.{}", context_label, k))?);
+                out.insert(
+                    k.clone(),
+                    evaluate_value(v, ctx, &format!("{}.{}", context_label, k))?,
+                );
             }
             Ok(serde_json::Value::Object(out))
         }
@@ -1309,5 +1309,3 @@ pub fn parse_inputs(raw: &[String]) -> Result<BTreeMap<String, serde_json::Value
     }
     Ok(out)
 }
-
-

@@ -7,7 +7,6 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::{distributions::Alphanumeric, Rng};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -60,16 +59,6 @@ where
 /// 30-second skew applied when checking access-token expiry so we never
 /// inject a token that's about to expire mid-request.
 const EXPIRY_SKEW_SECS: u64 = 30;
-
-/// Inject an OAuth2 access token as `Authorization: Bearer <token>`.
-pub fn apply(token: &SecretString, headers: &mut HeaderMap) {
-    // SECURITY: header-construction boundary.
-    let value = format!("Bearer {}", token.expose_secret());
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-    );
-}
 
 /// Tokens persisted to disk after a successful authorization-code
 /// exchange or refresh. `access_token` and `refresh_token` are
@@ -127,19 +116,16 @@ fn token_path(api_name: &str) -> PathBuf {
 /// On Unix the file is chmod-ed to `0600` so other local users cannot read it.
 pub fn save_tokens(api_name: &str, tokens: &OAuthTokens) -> Result<(), crate::SpallCliError> {
     let dir = token_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        crate::SpallCliError::AuthResolution {
-            api: api_name.to_string(),
-            message: format!("create token dir: {}", e),
-        }
+    std::fs::create_dir_all(&dir).map_err(|e| crate::SpallCliError::AuthResolution {
+        api: api_name.to_string(),
+        message: format!("create token dir: {}", e),
     })?;
     let path = token_path(api_name);
-    let json = serde_json::to_vec_pretty(tokens).map_err(|e| {
-        crate::SpallCliError::AuthResolution {
+    let json =
+        serde_json::to_vec_pretty(tokens).map_err(|e| crate::SpallCliError::AuthResolution {
             api: api_name.to_string(),
             message: format!("serialize tokens: {}", e),
-        }
-    })?;
+        })?;
     std::fs::write(&path, json).map_err(|e| crate::SpallCliError::AuthResolution {
         api: api_name.to_string(),
         message: format!("write token file: {}", e),
@@ -220,9 +206,9 @@ pub async fn run_login(api_name: &str, cfg: &AuthConfig) -> Result<(), crate::Sp
         .as_deref()
         .ok_or_else(|| usage_err(api_name, "`auth.token_url` is required for OAuth2 login"))?;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        crate::SpallCliError::Network(format!("bind redirect listener: {}", e))
-    })?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| crate::SpallCliError::Network(format!("bind redirect listener: {}", e)))?;
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
 
@@ -233,11 +219,7 @@ pub async fn run_login(api_name: &str, cfg: &AuthConfig) -> Result<(), crate::Sp
         .map(char::from)
         .collect();
 
-    let scopes_str = cfg
-        .scopes
-        .as_ref()
-        .map(|s| s.join(" "))
-        .unwrap_or_default();
+    let scopes_str = cfg.scopes.as_ref().map(|s| s.join(" ")).unwrap_or_default();
     let auth_url_full = build_authorize_url(
         auth_url,
         client_id,
@@ -251,7 +233,10 @@ pub async fn run_login(api_name: &str, cfg: &AuthConfig) -> Result<(), crate::Sp
     eprintln!();
     eprintln!("    {}", auth_url_full);
     eprintln!();
-    eprintln!("Waiting for the authorization callback on 127.0.0.1:{} ...", port);
+    eprintln!(
+        "Waiting for the authorization callback on 127.0.0.1:{} ...",
+        port
+    );
 
     let (code, callback_state) = wait_for_callback(&listener).await?;
 
@@ -273,7 +258,10 @@ pub async fn run_login(api_name: &str, cfg: &AuthConfig) -> Result<(), crate::Sp
     .await?;
 
     save_tokens(api_name, &tokens)?;
-    eprintln!("Successfully signed in to '{}'. Tokens stored locally.", api_name);
+    eprintln!(
+        "Successfully signed in to '{}'. Tokens stored locally.",
+        api_name
+    );
     Ok(())
 }
 
@@ -310,15 +298,17 @@ async fn wait_for_callback(
 ) -> Result<(String, String), crate::SpallCliError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (mut stream, _addr) = listener.accept().await.map_err(|e| {
-        crate::SpallCliError::Network(format!("accept callback: {}", e))
-    })?;
+    let (mut stream, _addr) = listener
+        .accept()
+        .await
+        .map_err(|e| crate::SpallCliError::Network(format!("accept callback: {}", e)))?;
 
     // Read until the end of the request line / headers (small buffer is fine).
     let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await.map_err(|e| {
-        crate::SpallCliError::Network(format!("read callback: {}", e))
-    })?;
+    let n = stream
+        .read(&mut buf)
+        .await
+        .map_err(|e| crate::SpallCliError::Network(format!("read callback: {}", e)))?;
     let req = String::from_utf8_lossy(&buf[..n]);
 
     let body = b"<!doctype html><meta charset=\"utf-8\"><title>spall</title>\
@@ -387,12 +377,14 @@ pub async fn refresh(
     api_name: &str,
     tokens: &OAuthTokens,
 ) -> Result<OAuthTokens, crate::SpallCliError> {
-    let refresh_token = tokens.refresh_token.as_ref().ok_or_else(|| {
-        crate::SpallCliError::AuthResolution {
-            api: api_name.to_string(),
-            message: "no refresh_token stored; run `spall auth login` again".to_string(),
-        }
-    })?;
+    let refresh_token =
+        tokens
+            .refresh_token
+            .as_ref()
+            .ok_or_else(|| crate::SpallCliError::AuthResolution {
+                api: api_name.to_string(),
+                message: "no refresh_token stored; run `spall auth login` again".to_string(),
+            })?;
     // SECURITY: token-endpoint POST boundary (over TLS).
     let params = [
         ("grant_type", "refresh_token"),
@@ -423,7 +415,10 @@ async fn post_token(
         .map_err(|e| crate::SpallCliError::Network(e.to_string()))?;
     let resp = client
         .post(token_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
         .header(reqwest::header::ACCEPT, "application/json")
         .body(body)
         .send()
@@ -446,12 +441,11 @@ async fn post_token(
         });
     }
 
-    let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-        crate::SpallCliError::AuthResolution {
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| crate::SpallCliError::AuthResolution {
             api: api_name.to_string(),
             message: format!("parse token response: {}", e),
-        }
-    })?;
+        })?;
 
     let access_token = json
         .get("access_token")
@@ -497,7 +491,9 @@ fn usage_err(api: &str, msg: &str) -> crate::SpallCliError {
 ///
 /// Returns `None` when no tokens are on disk yet (the user hasn't run
 /// `spall auth login`).
-pub async fn ensure_fresh_token(api_name: &str) -> Result<Option<SecretString>, crate::SpallCliError> {
+pub async fn ensure_fresh_token(
+    api_name: &str,
+) -> Result<Option<SecretString>, crate::SpallCliError> {
     let Some(tokens) = load_tokens(api_name) else {
         return Ok(None);
     };

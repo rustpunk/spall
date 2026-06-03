@@ -11,6 +11,7 @@ fn registry_find_existing() {
         auth: None,
         proxy: None,
         profiles: std::collections::HashMap::new(),
+        data_path: None,
     };
     let registry = ApiRegistry::from_entries(vec![entry], Default::default());
     assert!(registry.find("petstore").is_some());
@@ -41,6 +42,7 @@ fn resolve_profile_applies_overlay() {
         auth: None,
         proxy: None,
         profiles,
+        data_path: None,
     };
     let registry = ApiRegistry::from_entries(vec![entry], Default::default());
     let resolved = registry.resolve_profile("api", Some("staging")).unwrap();
@@ -61,6 +63,7 @@ fn resolve_profile_no_profile() {
         auth: None,
         proxy: None,
         profiles: std::collections::HashMap::new(),
+        data_path: None,
     };
     let registry = ApiRegistry::from_entries(vec![entry], Default::default());
     let resolved = registry.resolve_profile("api", None).unwrap();

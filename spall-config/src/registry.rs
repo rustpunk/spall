@@ -31,6 +31,12 @@ pub struct ApiEntry {
     pub proxy: Option<String>,
     /// Per-API profiles overlay.
     pub profiles: std::collections::HashMap<String, ProfileConfig>,
+    /// Optional default data-path (RFC-6901 JSON pointer) locating the item
+    /// array in paginated responses. Tier 3 in the data-path precedence chain
+    /// (below an explicit caller override and the `x-spall-data-path` operation
+    /// extension, above the `TopLevel` default); consumed by spall-cli's
+    /// pagination flow.
+    pub data_path: Option<String>,
 }
 
 /// Profile configuration overlay (Wave 2).

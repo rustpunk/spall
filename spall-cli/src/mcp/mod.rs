@@ -17,7 +17,9 @@ pub(crate) mod verbose;
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 use spall_config::registry::{ApiEntry, ApiRegistry};
-use spall_core::ir::{HttpMethod, ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSpec};
+use spall_core::ir::{
+    HttpMethod, ParameterLocation, ResolvedOperation, ResolvedParameter, ResolvedSpec,
+};
 use spall_core::value::SpallValue;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -214,8 +216,7 @@ fn build_registry(
     };
 
     let mut out: IndexMap<String, ToolEntry> = IndexMap::new();
-    let mut matched_keys: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
+    let mut matched_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (idx, op) in ordered {
         let raw = sanitize_tool_name(&op.operation_id);
         let name = unique_name(&raw, &out);
@@ -346,7 +347,11 @@ fn truncate_deterministically(
     cap: usize,
 ) -> Vec<(usize, &ResolvedOperation)> {
     let mut entries = filtered;
-    entries.sort_by(|a, b| first_tag(a.1).cmp(first_tag(b.1)).then_with(|| a.0.cmp(&b.0)));
+    entries.sort_by(|a, b| {
+        first_tag(a.1)
+            .cmp(first_tag(b.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     entries.truncate(cap);
     entries.sort_by_key(|a| a.0);
     entries
@@ -1088,11 +1093,7 @@ mod tests {
 
     #[test]
     fn truncate_below_cap_keeps_all_ops_in_spec_order() {
-        let spec = spec_of(vec![
-            op("a", &["t1"]),
-            op("b", &["t2"]),
-            op("c", &["t1"]),
-        ]);
+        let spec = spec_of(vec![op("a", &["t1"]), op("b", &["t2"]), op("c", &["t1"])]);
         let reg = build_registry(&spec, &[], &[], Some(10), &HashMap::new()).0;
         let names: Vec<&str> = reg.keys().map(String::as_str).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
@@ -1214,10 +1215,7 @@ mod tests {
         let mut o = op_with_method("listPets", HttpMethod::Get);
         o.summary = Some("List pets owned by the caller".to_string());
         let mut override_map: IndexMap<String, SpallValue> = IndexMap::new();
-        override_map.insert(
-            "title".into(),
-            SpallValue::Str("Show My Pets".to_string()),
-        );
+        override_map.insert("title".into(), SpallValue::Str("Show My Pets".to_string()));
         o.extensions
             .insert("x-mcp-annotations".into(), SpallValue::Object(override_map));
         let ann = derive_annotations(&o);
@@ -1350,7 +1348,12 @@ mod tests {
         assert!(err.contains("unknown argument 'zzz'"));
     }
 
-    fn make_param(name: &str, loc: ParameterLocation, style: &str, explode: bool) -> ResolvedParameter {
+    fn make_param(
+        name: &str,
+        loc: ParameterLocation,
+        style: &str,
+        explode: bool,
+    ) -> ResolvedParameter {
         ResolvedParameter {
             name: name.to_string(),
             location: loc,
@@ -1392,7 +1395,10 @@ mod tests {
             true,
         )]);
         let prog = build_programmatic_args(&op, &json!({"ids": [1, 2, 3]})).unwrap();
-        assert!(prog.query.is_empty(), "explode=true bypasses the single-value map");
+        assert!(
+            prog.query.is_empty(),
+            "explode=true bypasses the single-value map"
+        );
         assert_eq!(
             prog.query_extras,
             vec![
@@ -1511,6 +1517,7 @@ mod tests {
             auth: None,
             proxy: None,
             profiles: map,
+            data_path: None,
         }
     }
 
@@ -1546,12 +1553,8 @@ mod tests {
 
         let p1 = Arc::clone(&profiles);
         let p2 = Arc::clone(&profiles);
-        let h1 = tokio::spawn(async move {
-            p1.resolve(Some("admin")).await.map(Cow::into_owned)
-        });
-        let h2 = tokio::spawn(async move {
-            p2.resolve(Some("admin")).await.map(Cow::into_owned)
-        });
+        let h1 = tokio::spawn(async move { p1.resolve(Some("admin")).await.map(Cow::into_owned) });
+        let h2 = tokio::spawn(async move { p2.resolve(Some("admin")).await.map(Cow::into_owned) });
         let r1 = h1.await.expect("task 1").expect("resolve 1");
         let r2 = h2.await.expect("task 2").expect("resolve 2");
         assert_eq!(r1.base_url, r2.base_url);
@@ -1585,8 +1588,7 @@ mod tests {
         ));
         let mut validated = HashSet::new();
         validated.insert("admin".to_string());
-        let profiles =
-            AuthProfiles::new(entry, validated, empty_registry, "svc".to_string());
+        let profiles = AuthProfiles::new(entry, validated, empty_registry, "svc".to_string());
         let err = profiles
             .resolve(Some("admin"))
             .await
