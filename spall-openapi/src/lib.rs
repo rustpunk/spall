@@ -36,12 +36,14 @@
 //! `4xx`/`5xx` exit-code classification without depending on a transport's
 //! status type.
 
+pub mod builder;
 pub mod datapath;
 pub mod request;
 pub mod response;
 pub mod status;
 pub mod stream;
 
+pub use builder::{BuildError, build_request};
 pub use datapath::{DataPath, DataPathError};
 pub use request::{Headers, HttpRequestSpec, MultipartField, MultipartValue, RequestBody};
 pub use response::ResponseStream;
