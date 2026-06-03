@@ -158,12 +158,11 @@ pub fn build_request(
     // Set the content-type for the body kind only when one is not already
     // present (e.g. supplied via a header parameter), matching prepare_and_send
     // step 6 / the legacy form/multipart content-type step.
-    if let Some(b) = &body {
-        if !headers.contains_key("content-type") {
-            if let Some(ct) = default_content_type(b) {
-                headers.insert("content-type".to_string(), ct.to_string());
-            }
-        }
+    if let Some(b) = &body
+        && !headers.contains_key("content-type")
+        && let Some(ct) = default_content_type(b)
+    {
+        headers.insert("content-type".to_string(), ct.to_string());
     }
 
     Ok(HttpRequestSpec {

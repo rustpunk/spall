@@ -5,6 +5,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# Workspace MSRV. spall-openapi's edition-2024 floor is 1.85, but the transitive
+# dependency tree (time, cookie_store, plist, home, dbus-secret-service, icu_*)
+# raises the real floor to 1.88. Enforced by the `msrv` CI job.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["spall contributors"]

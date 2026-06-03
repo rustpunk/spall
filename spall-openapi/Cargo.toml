@@ -3,11 +3,12 @@ name = "spall-openapi"
 version.workspace = true
 license.workspace = true
 authors.workspace = true
-# edition + rust-version are set EXPLICITLY (not workspace-inherited): this crate
-# is edition 2024 per #29, which requires rustc >= 1.85. The rest of the
-# workspace stays on edition 2021.
+# edition is set EXPLICITLY (not workspace-inherited): this crate is edition 2024
+# per #29, while the rest of the workspace stays on edition 2021. Edition 2024
+# needs rustc >= 1.85, but the workspace's transitive deps raise the effective
+# MSRV to 1.88, which this inherits from [workspace.package] below.
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 
 [dependencies]
 spall-core = { path = "../spall-core" }

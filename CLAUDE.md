@@ -4,10 +4,11 @@
 
 ## Architecture
 
-Three-crate workspace:
-- `spall-core`: Spec loading, `$ref` resolution, IR, dynamic clap `Command` builder.
+Four-crate workspace:
+- `spall-core`: Spec loading, `$ref` resolution, IR. (clap-free since #23.)
 - `spall-config`: Config parsing, credential stack, `ApiRegistry`.
-- `spall-cli`: Binary. Two-phase parse (Phase 1: registry scan; Phase 2: spec load + re-parse).
+- `spall-openapi`: Transport-neutral request/response contract — request builder, auth contributors, neutral `Status`/`Headers`, and a hand-rolled bounded-memory streaming JSON parser feeding a de-paginating `ItemStream`. No HTTP client, async runtime, or clap. Edition 2024 (workspace MSRV 1.88).
+- `spall-cli`: Binary. Two-phase parse (Phase 1: registry scan; Phase 2: spec load + re-parse). Owns the dynamic clap `Command` builder and the concrete `reqwest` transport.
 
 **Phase 1 API stubs must `.disable_help_flag(true)` so `--help` falls through to Phase 2.**
 
@@ -16,8 +17,9 @@ Three-crate workspace:
 - `openapiv3` for spec deserialization (behavioral logic is ours).
 - `clap` builder API (never derive).
 - `serde_saphyr = "0.0.24"` (NOT `serde_yaml`). All YAML goes through `spall_core::yaml` chokepoint.
-- `reqwest` with `default-features = false` + `rustls-tls` + `multipart`.
+- `reqwest` with `default-features = false` + `rustls-tls` + `multipart` — lives in `spall-cli` (the transport); `spall-openapi` stays client-free.
 - `tokio` current_thread (`rt`, `macros`, `net`, `time`, `io-util`).
+- Response streaming + pagination: in-house hand-rolled streaming JSON parser in `spall-openapi` (deliberately no third-party streaming-parser dep).
 - `miette` + `thiserror`.
 - `secrecy` for credentials.
 - `postcard` + `sha2` for IR cache.
@@ -33,7 +35,7 @@ Three-crate workspace:
 - Arg ID namespacing: `path-{n}`, `query-{n}`, `header-{n}`, `cookie-{n}`.
 - Error boundary: `thiserror` in libraries, `miette` in CLI, `#[diagnostic(transparent)]` for passthrough.
 - Never panic on user input.
-- Rust 2021 edition. `#[must_use]` on Result-returning functions.
+- Rust 2021 edition (except `spall-openapi`, which is edition 2024); workspace MSRV 1.88. `#[must_use]` on Result-returning functions.
 
 ## Build/Test
 

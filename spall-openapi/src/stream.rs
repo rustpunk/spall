@@ -227,20 +227,6 @@ pub struct JsonSkimmer<R: Read> {
 }
 
 impl<R: Read> JsonSkimmer<R> {
-    /// Wraps a reader in a new skimmer positioned at the start of the document,
-    /// using the default [`StreamLimits`] (64 MiB item / 256 MiB buffer).
-    ///
-    /// Why: callers hand us the raw streaming body; we add buffering and the
-    /// one-byte peek the grammar walk needs. Allocates only the `BufReader`'s
-    /// internal buffer; reads nothing yet.
-    ///
-    /// Memory model: identical to [`JsonSkimmer::with_limits`] — capture is
-    /// bounded by [`StreamLimits::default`].
-    #[must_use]
-    pub fn new(reader: R) -> Self {
-        Self::with_limits(reader, StreamLimits::default())
-    }
-
     /// Wraps a reader in a new skimmer positioned at the start of the document
     /// with explicit [`StreamLimits`] (#44).
     ///
@@ -1579,16 +1565,18 @@ mod tests {
 
     #[test]
     fn seek_top_level_lenient_distinguishes_array_and_value() {
-        let mut arr = JsonSkimmer::new(
-            Box::new(std::io::Cursor::new(b"[1, 2]".to_vec())) as Box<dyn Read + Send>
+        let mut arr = JsonSkimmer::with_limits(
+            Box::new(std::io::Cursor::new(b"[1, 2]".to_vec())) as Box<dyn Read + Send>,
+            StreamLimits::default(),
         );
         assert!(matches!(
             arr.seek_top_level_lenient().unwrap(),
             TopLevelShape::Array
         ));
 
-        let mut obj = JsonSkimmer::new(
-            Box::new(std::io::Cursor::new(b"{\"a\":1}".to_vec())) as Box<dyn Read + Send>
+        let mut obj = JsonSkimmer::with_limits(
+            Box::new(std::io::Cursor::new(b"{\"a\":1}".to_vec())) as Box<dyn Read + Send>,
+            StreamLimits::default(),
         );
         match obj.seek_top_level_lenient().unwrap() {
             TopLevelShape::Single(v) => assert_eq!(v, serde_json::json!({"a": 1})),
