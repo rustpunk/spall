@@ -39,7 +39,10 @@ const RESERVED_API_NAMES: &[&str] = &[
 fn handle_add(matches: &ArgMatches) -> Result<()> {
     let name = matches.get_one::<String>("name").unwrap();
     let source = matches.get_one::<String>("source").unwrap();
-    if RESERVED_API_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+    if RESERVED_API_NAMES
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(name))
+    {
         return Err(crate::SpallCliError::Usage(format!(
             "'{}' is a reserved subcommand name; choose a different API name (reserved: {})",
             name,

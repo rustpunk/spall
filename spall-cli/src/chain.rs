@@ -19,14 +19,14 @@ struct TargetParam {
     name: String,
     location: ParameterLocation,
     /// The clap long flag (without value) for non-path params, mirroring
-    /// `spall_core::command::build_op_cmd`. `None` for path params.
+    /// `crate::command::build_op_cmd`. `None` for path params.
     flag: Option<String>,
     /// Declaration index in the target operation.
     order: usize,
 }
 
 /// Build the chainable parameter metadata for a target operation, deriving each
-/// non-path flag exactly as `spall_core::command::build_op_cmd` does so the
+/// non-path flag exactly as `crate::command::build_op_cmd` does so the
 /// recursive parse accepts the emitted tokens.
 fn target_params(op: &ResolvedOperation) -> Vec<TargetParam> {
     op.parameters
@@ -42,7 +42,7 @@ fn target_params(op: &ResolvedOperation) -> Vec<TargetParam> {
 }
 
 /// Derive the clap long flag for a non-path parameter, matching the builder in
-/// `spall_core::command`. Path parameters are positional and return `None`.
+/// `crate::command`. Path parameters are positional and return `None`.
 fn flag_for(param: &ResolvedParameter) -> Option<String> {
     let ext = CliExtensions::from_parameter(param);
     let long_name = ext.cli_name.as_deref().unwrap_or(&param.name);
@@ -308,7 +308,9 @@ mod tests {
                 param("limit", ParameterLocation::Query),
             ],
         );
-        let args = c.resolve(&json!({"id": "7", "limit": "5"}), &target).unwrap();
+        let args = c
+            .resolve(&json!({"id": "7", "limit": "5"}), &target)
+            .unwrap();
         assert_eq!(args, vec!["op2", "7", "--limit", "5"]);
     }
 
@@ -334,9 +336,7 @@ mod tests {
     fn resolve_nested_jmespath() {
         let c = ChainExpr::parse("op2 --name data.name").unwrap();
         let target = op("op2", vec![param("name", ParameterLocation::Query)]);
-        let args = c
-            .resolve(&json!({"data": {"name": "x"}}), &target)
-            .unwrap();
+        let args = c.resolve(&json!({"data": {"name": "x"}}), &target).unwrap();
         assert_eq!(args, vec!["op2", "--name", "x"]);
     }
 

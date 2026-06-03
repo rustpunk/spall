@@ -1,8 +1,7 @@
-//! spall-core: OpenAPI spec loading, resolution, IR, and dynamic clap command building.
+//! spall-core: OpenAPI spec loading, resolution, and IR.
 
 pub mod arazzo;
 pub mod cache;
-pub mod command;
 pub mod error;
 pub mod extensions;
 pub mod ir;

@@ -169,9 +169,7 @@ fn pick_body_schema(rb: &spall_core::ir::ResolvedRequestBody) -> Option<&Resolve
             return Some(schema);
         }
     }
-    rb.content
-        .values()
-        .find_map(|media| media.schema.as_ref())
+    rb.content.values().find_map(|media| media.schema.as_ref())
 }
 
 fn annotate_location(prop: &mut Value, location: ParameterLocation, param_desc: Option<&str>) {
@@ -435,7 +433,10 @@ mod tests {
         assert_eq!(v["properties"]["petId"]["type"], "integer");
         assert_eq!(v["properties"]["name"]["type"], "string");
         assert_eq!(v["properties"]["body"]["type"], "object");
-        assert_eq!(v["properties"]["body"]["properties"]["note"]["type"], "string");
+        assert_eq!(
+            v["properties"]["body"]["properties"]["note"]["type"],
+            "string"
+        );
         let required = v["required"].as_array().unwrap();
         assert!(required.iter().any(|x| x == "petId"));
         assert!(required.iter().any(|x| x == "body"));

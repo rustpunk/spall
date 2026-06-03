@@ -1,14 +1,11 @@
 //! Auth resolution and request injection.
 
-pub mod apikey;
-pub mod basic;
-pub mod bearer;
 pub mod oauth2;
 
-use reqwest::header::HeaderMap;
 use secrecy::{ExposeSecret, SecretString};
 use spall_config::auth::{ApiKeyLocation, AuthConfig, AuthKind, ResolvedAuth};
 use spall_config::credentials::CredentialKind;
+use spall_openapi::HttpRequestSpec;
 
 /// Resolve authentication material following the priority chain:
 ///
@@ -141,30 +138,38 @@ pub async fn resolve(
     Ok(None)
 }
 
-/// Apply a resolved auth value to the request.
-pub fn apply(
-    auth: &ResolvedAuth,
-    headers: &mut HeaderMap,
-    query_pairs: &mut Vec<(String, String)>,
-) {
+/// Apply a resolved auth value to a transport-neutral request spec by
+/// dispatching to the matching `spall_openapi::auth` contributor.
+///
+/// The reqwest-specific header/query injection that used to live in
+/// `auth/{bearer,basic,apikey,oauth2}.rs` now lives once, in `spall-openapi`;
+/// this function only translates `ResolvedAuth` into a contributor call and
+/// maps `spall_config`'s `ApiKeyLocation` into spall-openapi's neutral one.
+pub fn apply(auth: &ResolvedAuth, spec: &mut HttpRequestSpec) {
     match auth {
-        ResolvedAuth::Bearer(token) => bearer::apply(token, headers),
+        ResolvedAuth::Bearer(token) => spall_openapi::bearer(token, spec),
         ResolvedAuth::ApiKey { key, location } => {
-            apikey::apply(
-                &apikey::ApiKeyConfig {
-                    key: key.clone(),
-                    location: location.clone(),
-                },
-                headers,
-                query_pairs,
-            );
+            spall_openapi::api_key(key, &map_api_key_location(location), spec);
         }
         ResolvedAuth::Basic { username, password } => {
-            // SECURITY: header-construction boundary.
+            // SECURITY: credential-join boundary — spall_openapi::basic
+            // base64-encodes the joined `user:pass`.
             let creds = format!("{}:{}", username, password.expose_secret());
-            basic::apply(&SecretString::new(creds.into()), headers);
+            spall_openapi::basic(&SecretString::new(creds.into()), spec);
         }
-        ResolvedAuth::OAuth2(token) => oauth2::apply(token, headers),
+        ResolvedAuth::OAuth2(token) => spall_openapi::oauth2_access_token(token, spec),
+    }
+}
+
+/// Map `spall_config`'s `ApiKeyLocation` into spall-openapi's neutral one.
+fn map_api_key_location(location: &ApiKeyLocation) -> spall_openapi::ApiKeyLocation {
+    match location {
+        ApiKeyLocation::Header { name } => {
+            spall_openapi::ApiKeyLocation::Header { name: name.clone() }
+        }
+        ApiKeyLocation::Query { name } => {
+            spall_openapi::ApiKeyLocation::Query { name: name.clone() }
+        }
     }
 }
 
@@ -297,7 +302,9 @@ mod tests {
             kind: Some(AuthKind::Bearer),
             ..Default::default()
         };
-        let result = resolve("test", Some(&cfg), Some("Bearer abc123")).await.unwrap();
+        let result = resolve("test", Some(&cfg), Some("Bearer abc123"))
+            .await
+            .unwrap();
         assert!(matches!(
             result,
             Some(ResolvedAuth::Bearer(ref s)) if s.expose_secret() == "abc123"
@@ -310,7 +317,9 @@ mod tests {
             kind: Some(AuthKind::Basic),
             ..Default::default()
         };
-        let result = resolve("test", Some(&cfg), Some("alice:secret")).await.unwrap();
+        let result = resolve("test", Some(&cfg), Some("alice:secret"))
+            .await
+            .unwrap();
         assert!(matches!(
             result,
             Some(ResolvedAuth::Basic { ref username, ref password })

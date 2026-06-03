@@ -42,3 +42,46 @@ jobs:
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Runs `cargo deny check` (advisories, bans, licenses, sources) against the
+      # workspace deny.toml. Pre-existing unmaintained advisories and the
+      # first-party rustpunk/hasp git source are allow-listed there with rationale.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  openapi-purity:
+    name: spall-openapi dep purity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # spall-openapi is the transport-neutral contract crate: it must never pull
+      # an HTTP client, async runtime, CLI framework, or C/`*-sys` dependency.
+      # `-e normal` excludes dev/build deps, so test-only crates do not trip this.
+      - name: spall-openapi must stay transport-neutral
+        run: |
+          tree="$(cargo tree -p spall-openapi -e normal)"
+          echo "$tree"
+          if echo "$tree" | grep -Eiq '[[:space:]](reqwest|hyper|ureq|isahc|tokio|async-std|futures[a-z-]*|clap|[a-z0-9_-]*-sys)[[:space:]]+v'; then
+            echo "::error::spall-openapi pulled a forbidden dependency (HTTP client / async runtime / clap / *-sys). It must remain transport-neutral."
+            exit 1
+          fi
+          echo "spall-openapi dependency tree is transport-neutral."
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      # Workspace MSRV is 1.88 (spall-openapi's edition-2024 floor is 1.85, but
+      # transitive deps — time, cookie_store, plist, icu_* — raise it). This job
+      # fails if anything regresses that floor.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: swatinem/rust-cache@v2
+      - run: cargo check --workspace --locked

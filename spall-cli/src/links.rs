@@ -68,10 +68,7 @@ impl Links {
     }
 
     fn push(&mut self, link: Link) {
-        self.by_rel
-            .entry(link.rel.clone())
-            .or_default()
-            .push(link);
+        self.by_rel.entry(link.rel.clone()).or_default().push(link);
     }
 
     fn absorb_link_header(&mut self, headers: &HeaderMap) {
@@ -156,26 +153,15 @@ impl Links {
 
 /// Parse an RFC 5988 `Link` header value into `(rel, href)` pairs.
 ///
+/// Delegates to [`spall_openapi::parse_rfc5988`], the transport-neutral home of
+/// the header grammar. The CLI keeps the body-based link discovery (HAL,
+/// JSON:API, Siren in [`Links`]) that the header parser feeds, but the header
+/// grammar itself lives in spall-openapi so the CLI and library never drift.
+///
 /// Example: `<https://api.example.com?page=2>; rel="next", <…>; rel="prev"`.
 #[must_use]
 pub fn parse_rfc5988(link: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for part in link.split(',') {
-        let mut url = None;
-        let mut rel = None;
-        for segment in part.split(';') {
-            let seg = segment.trim();
-            if seg.starts_with('<') && seg.ends_with('>') {
-                url = Some(seg[1..seg.len() - 1].to_string());
-            } else if let Some(rest) = seg.strip_prefix("rel=") {
-                rel = Some(rest.trim().trim_matches('"').to_string());
-            }
-        }
-        if let (Some(u), Some(r)) = (url, rel) {
-            out.push((r, u));
-        }
-    }
-    out
+    spall_openapi::parse_rfc5988(link)
 }
 
 #[cfg(test)]
@@ -195,7 +181,13 @@ mod tests {
             r#"<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=5>; rel="last""#,
         );
         assert_eq!(l.len(), 2);
-        assert_eq!(l[0], ("next".to_string(), "https://api.github.com/x?page=2".to_string()));
+        assert_eq!(
+            l[0],
+            (
+                "next".to_string(),
+                "https://api.github.com/x?page=2".to_string()
+            )
+        );
         assert_eq!(l[1].0, "last");
     }
 

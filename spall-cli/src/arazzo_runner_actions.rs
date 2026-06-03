@@ -266,13 +266,12 @@ fn criteria_pass(
                 source: e,
             }
         })?;
-        let ok = eval_condition(&cond, ctx).map_err(|e| {
-            ActionDispatchError::CriterionExpression {
+        let ok =
+            eval_condition(&cond, ctx).map_err(|e| ActionDispatchError::CriterionExpression {
                 name: action_name.to_string(),
                 index: idx,
                 source: e,
-            }
-        })?;
+            })?;
         if !ok {
             return Ok(false);
         }
@@ -356,7 +355,10 @@ mod tests {
             criteria: Vec::new(),
         };
         let err = dispatch_success_chain(&[action], &empty_ctx()).unwrap_err();
-        assert!(matches!(err, ActionDispatchError::NestedWorkflowGoto { .. }));
+        assert!(matches!(
+            err,
+            ActionDispatchError::NestedWorkflowGoto { .. }
+        ));
     }
 
     #[test]
@@ -439,7 +441,10 @@ mod tests {
             }],
         };
         let err = dispatch_failure_chain(&[action], &empty_ctx()).unwrap_err();
-        assert!(matches!(err, ActionDispatchError::UnsupportedCriterionType { .. }));
+        assert!(matches!(
+            err,
+            ActionDispatchError::UnsupportedCriterionType { .. }
+        ));
     }
 
     #[test]
@@ -499,10 +504,9 @@ mod tests {
     #[test]
     fn refs_resolve_against_components() {
         let mut comps = Components::default();
-        comps.success_actions.insert(
-            "named-end".to_string(),
-            unconditional_end_action(),
-        );
+        comps
+            .success_actions
+            .insert("named-end".to_string(), unconditional_end_action());
         let chain = vec![ActionOrRef::Reference(ActionRef {
             reference: "$components.successActions.named-end".to_string(),
         })];
@@ -526,7 +530,10 @@ mod tests {
             reference: "components.bogus.path".to_string(), // no $ prefix
         })];
         let err = resolve_success_chain(&chain, None).unwrap_err();
-        assert!(matches!(err, ActionDispatchError::MalformedReference { .. }));
+        assert!(matches!(
+            err,
+            ActionDispatchError::MalformedReference { .. }
+        ));
     }
 
     #[test]
@@ -537,12 +544,14 @@ mod tests {
             reference: "$components.successActions.foo".to_string(),
         })];
         let mut comps = Components::default();
-        comps.success_actions.insert(
-            "foo".to_string(),
-            unconditional_end_action(),
-        );
+        comps
+            .success_actions
+            .insert("foo".to_string(), unconditional_end_action());
         let err = resolve_failure_chain(&chain, Some(&comps)).unwrap_err();
-        assert!(matches!(err, ActionDispatchError::MalformedReference { .. }));
+        assert!(matches!(
+            err,
+            ActionDispatchError::MalformedReference { .. }
+        ));
     }
 
     #[test]
@@ -562,5 +571,4 @@ mod tests {
         let flow = dispatch_success_chain(&[action], &empty_ctx()).unwrap();
         assert!(matches!(flow, StepFlow::Continue));
     }
-
 }

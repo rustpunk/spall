@@ -46,11 +46,8 @@ pub(crate) const VALUE_REDACTED: &str = "[REDACTED]";
 /// Lowercased; comparison is case-insensitive via `eq_ignore_ascii_case`.
 /// Source of truth for the [`redact_header_value`] match arms — a unit
 /// test asserts every entry here triggers a redaction (drift guard).
-pub(crate) const REDACTED_HEADER_NAMES: &[&str] = &[
-    "authorization",
-    "cookie",
-    "proxy-authorization",
-];
+pub(crate) const REDACTED_HEADER_NAMES: &[&str] =
+    &["authorization", "cookie", "proxy-authorization"];
 
 /// URL query parameter names whose values would be redacted IF v1 wired
 /// rendered-URL logging. Defined now so the constant + the
@@ -100,10 +97,7 @@ use std::borrow::Cow;
 /// Returns `(rendered_value, Some(reason))` when redacted, `(value, None)`
 /// when passed through. The `reason` is exposed for callers that want
 /// to enrich a structured event later.
-pub(crate) fn redact_header_value(
-    name: &str,
-    value: &str,
-) -> (String, Option<RedactionReason>) {
+pub(crate) fn redact_header_value(name: &str, value: &str) -> (String, Option<RedactionReason>) {
     if !REDACTED_HEADER_NAMES
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -221,10 +215,7 @@ mod tests {
         // JSON quoting.
         assert_eq!(quote_if_needed("has space").as_ref(), "\"has space\"");
         assert_eq!(quote_if_needed("has=equals").as_ref(), "\"has=equals\"");
-        assert_eq!(
-            quote_if_needed("has\"quote").as_ref(),
-            "\"has\\\"quote\""
-        );
+        assert_eq!(quote_if_needed("has\"quote").as_ref(), "\"has\\\"quote\"");
     }
 
     #[test]
@@ -245,7 +236,11 @@ mod tests {
             "got: {}",
             out,
         );
-        assert!(out.contains("content-type: application/json"), "got: {}", out);
+        assert!(
+            out.contains("content-type: application/json"),
+            "got: {}",
+            out
+        );
         assert!(!out.contains("supersecret"), "leak: {}", out);
     }
 

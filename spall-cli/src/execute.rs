@@ -1,10 +1,14 @@
 use crate::matches::MergedMatches;
 use clap::ArgMatches;
+use indexmap::IndexMap;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE};
 use spall_config::registry::ApiEntry;
 use spall_core::ir::{
     HttpMethod, ParameterLocation, ResolvedOperation, ResolvedRequestBody, ResolvedSpec,
 };
+use spall_core::value::SpallValue;
+use spall_openapi::request::Headers as NeutralHeaders;
+use spall_openapi::{HttpRequestSpec, RequestBody, Status};
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -71,7 +75,7 @@ pub fn collect_remaining_args(matches: &ArgMatches) -> Vec<String> {
 /// surfaced as an error invoke [`raise_for_status`].
 #[derive(Debug)]
 pub struct OperationResult {
-    pub status: reqwest::StatusCode,
+    pub status: Status,
     pub raw: Option<Vec<u8>>,
     pub value: serde_json::Value,
     pub headers: BTreeMap<String, String>,
@@ -209,109 +213,119 @@ pub async fn execute_operation_programmatic(
         status,
         raw: Some(body_bytes),
         value,
-        headers: lowercase_headers(&resp_hdrs),
+        headers: resp_hdrs,
     })
 }
 
 /// Shared request-assembly + send pipeline.
 ///
 /// Both the programmatic entry point above and the clap-driven
-/// `execute_operation`'s single-shot branch call this. Centralizing the
-/// "build URL → headers → cookies → query → auth → caller headers →
-/// body → send" sequence here is what prevents drift between the two
-/// callers (the parity guard test in
-/// `spall-cli/tests/execute_parity_test.rs` exercises this).
+/// `execute_operation`'s single-shot branch call this. The neutral request is
+/// built by `spall_openapi::build_request` (URL/path templating, query,
+/// cookies, body, content-type); auth is contributed onto it; caller headers
+/// are overlaid last so they win over auth; `transport::send_spec` performs the
+/// single reqwest call. Centralizing this here is what prevents drift between
+/// the two callers — the parity guard
+/// `programmatic_tests::parity_clap_and_programmatic_emit_identical_request` in
+/// this file exercises it against a wiremock server.
 pub(crate) async fn prepare_and_send(
     op: &ResolvedOperation,
     spec: &ResolvedSpec,
     entry: &ApiEntry,
     args: &ProgrammaticArgs,
-) -> Result<(reqwest::StatusCode, HeaderMap, Vec<u8>), crate::SpallCliError> {
-    let url = build_url_with_path_args(op, spec, entry, args.server_override.as_deref(), &args.path);
+) -> Result<(Status, NeutralHeaders, Vec<u8>), crate::SpallCliError> {
+    // Build the neutral request through the shared spall-openapi builder, then
+    // overlay the extras `ProgrammaticArgs` carries that the spec builder does
+    // not model (query_extras, auth, caller-header overrides).
+    let mut req = build_neutral_spec(op, spec, entry, args)?;
 
-    let mut headers = HeaderMap::new();
+    // Overlay `query_extras` after the spec-routed query pairs. These are the
+    // repeated array-explosion pairs the MCP dispatcher emits (OpenAPI
+    // `style: form, explode: true`); reqwest preserves the repetition.
+    req.query.extend(args.query_extras.iter().cloned());
 
-    // Step 1: default headers from the ApiEntry config.
-    for (k, v) in &entry.default_headers {
-        if let (Ok(name), Ok(value)) =
-            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
-        {
-            headers.insert(name, value);
-        }
-    }
-
-    // Step 2: cookies → COOKIE header.
-    if !args.cookie.is_empty() {
-        let joined = args
-            .cookie
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("; ");
-        if let Ok(v) = HeaderValue::from_str(&joined) {
-            headers.insert(COOKIE, v);
-        }
-    }
-
-    // Step 3: query pairs. The dedup'd map yields one pair per key;
-    // `query_extras` adds any further pairs (repeated keys allowed) for
-    // OpenAPI `style: form, explode: true` array serialization.
-    let mut query_pairs: Vec<(String, String)> = args
-        .query
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    query_pairs.extend(args.query_extras.iter().cloned());
-
-    // Step 4: auth resolution + injection.
-    let resolved_auth =
-        crate::auth::resolve(&entry.name, entry.auth.as_ref(), args.auth_override.as_deref())
-            .await?;
+    // Auth resolution + injection happens BEFORE the caller-header overlay so a
+    // caller-supplied `Authorization` wins (the historical precedence).
+    let resolved_auth = crate::auth::resolve(
+        &entry.name,
+        entry.auth.as_ref(),
+        args.auth_override.as_deref(),
+    )
+    .await?;
     if let Some(a) = resolved_auth {
-        crate::auth::apply(&a, &mut headers, &mut query_pairs);
+        crate::auth::apply(&a, &mut req);
     }
 
-    // Step 5: caller-supplied headers win over the auth chain.
+    // Caller-supplied headers (spec header params + `--spall-header` overrides +
+    // an explicit `Content-Type`) win over both auth and the body's default
+    // content type. Lowercased to honor the neutral Headers contract.
     for (k, v) in &args.header {
-        if let (Ok(name), Ok(value)) =
-            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
-        {
-            headers.insert(name, value);
-        }
+        req.headers.insert(k.to_ascii_lowercase(), v.clone());
     }
 
-    // Step 6: body serialization.
-    let body_bytes: Option<Vec<u8>> = if let Some(value) = &args.body {
-        let bytes = serde_json::to_vec(value)
-            .map_err(|e| crate::SpallCliError::Usage(format!("invalid JSON body: {}", e)))?;
-        if !headers.contains_key(reqwest::header::CONTENT_TYPE) {
-            headers.insert(
-                reqwest::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-        }
-        Some(bytes)
-    } else {
-        None
-    };
-
-    // Step 7: build client + send.
     let client =
         crate::http::build_http_client(&args.http).map_err(crate::SpallCliError::HttpClient)?;
-    send_one(
-        &client,
-        op.method,
-        &url,
-        headers,
-        body_bytes,
-        None,
-        &query_pairs,
-        args.retry_count,
-        args.retry_max_wait_secs,
-    )
-    .await
+    crate::transport::send_spec(&client, &req, args.retry_count, args.retry_max_wait_secs).await
 }
 
+/// Assemble the transport-neutral [`HttpRequestSpec`] for the single-shot path.
+///
+/// Path parameters drive URL substitution and the JSON body (plus its default
+/// content type) come from `spall_openapi::build_request`; query pairs and
+/// cookies are routed per their parameter location from the disambiguated
+/// `ProgrammaticArgs` buckets (so a name declared in two locations cannot
+/// collide in a single name-keyed map). Header routing is deferred to the
+/// caller-header overlay in [`prepare_and_send`] because spec header params and
+/// `--spall-header` overrides must both land after auth.
+fn build_neutral_spec(
+    op: &ResolvedOperation,
+    spec: &ResolvedSpec,
+    entry: &ApiEntry,
+    args: &ProgrammaticArgs,
+) -> Result<HttpRequestSpec, crate::SpallCliError> {
+    let base_url = args
+        .server_override
+        .clone()
+        .or_else(|| entry.base_url.clone());
+
+    // The builder routes args by the operation's declared parameter location.
+    // Only path params go in here (they drive URL substitution); query and
+    // cookie values are overlaid below from their own buckets, preserving the
+    // per-location disambiguation `build_request` cannot get from one map.
+    let mut arg_map: IndexMap<String, SpallValue> = IndexMap::new();
+    for (k, v) in &args.path {
+        arg_map.insert(k.clone(), SpallValue::Str(v.clone()));
+    }
+
+    let body = args.body.clone().map(RequestBody::Json);
+
+    let mut req = spall_openapi::build_request(
+        op,
+        spec,
+        base_url.as_deref(),
+        &arg_map,
+        body,
+        &entry.default_headers,
+    )
+    .map_err(|e| crate::SpallCliError::Usage(e.to_string()))?;
+
+    // Query pairs from the dedup'd `args.query` bucket (one pair per name),
+    // routed here rather than through the builder so a name shared with a path
+    // or cookie param keeps its own bucket.
+    for (k, v) in &args.query {
+        req.query.push((k.clone(), v.clone()));
+    }
+    // Cookie pairs likewise come from their own bucket.
+    for (k, v) in &args.cookie {
+        req.cookies.push((k.clone(), v.clone()));
+    }
+
+    Ok(req)
+}
+
+/// Lowercase a reqwest [`HeaderMap`] into a neutral lowercased map (RFC 9110
+/// case-insensitive names). Still used by the hypermedia-follow and
+/// multipart/form single-shot paths, which build reqwest `HeaderMap`s directly.
 fn lowercase_headers(h: &HeaderMap) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (name, value) in h.iter() {
@@ -407,8 +421,9 @@ pub async fn execute_operation(
     let body_data = resolve_body(op.request_body.as_ref(), phase2_matches)?;
 
     // Build ProgrammaticArgs from clap matches. This is the *only* place
-    // the clap → programmatic translation happens; the parity test in
-    // tests/execute_parity_test.rs locks down the wire-level behavior.
+    // the clap → programmatic translation happens; the parity test
+    // `programmatic_tests::parity_clap_and_programmatic_emit_identical_request`
+    // in this file locks down the wire-level behavior.
     let mut http_config = crate::http::config_from_matches(phase1_matches, phase2_matches);
     http_config.proxy = crate::http::resolve_proxy(entry, defaults, phase1_matches, phase2_matches);
 
@@ -424,7 +439,8 @@ pub async fn execute_operation(
             // the programmatic path doesn't override it with
             // application/json.
             if let Some(ct) = body_data.content_type.as_deref() {
-                args.header.insert("Content-Type".to_string(), ct.to_string());
+                args.header
+                    .insert("Content-Type".to_string(), ct.to_string());
             }
             // Try to parse the bytes as JSON; if successful, use the
             // structured body. Otherwise (e.g. a raw text payload), fall
@@ -449,9 +465,10 @@ pub async fn execute_operation(
         // Build a HeaderMap snapshot for preview purposes only.
         let mut preview_headers = HeaderMap::new();
         for (k, v) in &args.header {
-            if let (Ok(name), Ok(value)) =
-                (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
-            {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            ) {
                 preview_headers.insert(name, value);
             }
         }
@@ -492,9 +509,10 @@ pub async fn execute_operation(
     // (Cheap; the lowercased BTreeMap was the cross-process boundary.)
     let mut resp_hdrs = HeaderMap::new();
     for (k, v) in &result.headers {
-        if let (Ok(name), Ok(value)) =
-            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
-        {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
             resp_hdrs.insert(name, value);
         }
     }
@@ -502,9 +520,10 @@ pub async fn execute_operation(
     // Reconstruct a request-side HeaderMap for the history record.
     let mut req_hdrs_for_history = HeaderMap::new();
     for (k, v) in &args.header {
-        if let (Ok(name), Ok(value)) =
-            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
-        {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
             req_hdrs_for_history.insert(name, value);
         }
     }
@@ -516,7 +535,7 @@ pub async fn execute_operation(
         &op.operation_id,
         &op.method.to_string(),
         &url,
-        Some(result.status),
+        Some(result.status.as_u16()),
         &req_hdrs_for_history,
         &resp_hdrs,
         duration_ms,
@@ -575,18 +594,19 @@ pub async fn execute_operation(
             }
             let client = crate::http::build_http_client(&args.http)
                 .map_err(crate::SpallCliError::HttpClient)?;
-            // Re-resolve auth so the follow inherits Authorization /
-            // ApiKey headers from the same chain that built the primary
-            // request — keeps behavior identical to the pre-refactor path.
-            let mut follow_headers = HeaderMap::new();
-            for (k, v) in &args.header {
-                if let (Ok(name), Ok(value)) =
-                    (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
-                {
-                    follow_headers.insert(name, value);
-                }
-            }
-            let mut empty_query: Vec<(String, String)> = Vec::new();
+            // Build a neutral GET spec for the absolute followed URL. Auth is
+            // re-resolved and contributed BEFORE the caller-header overlay so
+            // the follow inherits the same Authorization / ApiKey chain as the
+            // primary request, with caller headers still winning — identical to
+            // the pre-extraction precedence.
+            let mut follow_spec = HttpRequestSpec {
+                method: HttpMethod::Get,
+                url: followed_url,
+                query: Vec::new(),
+                headers: NeutralHeaders::new(),
+                cookies: Vec::new(),
+                body: None,
+            };
             if let Some(a) = crate::auth::resolve(
                 &entry.name,
                 entry.auth.as_ref(),
@@ -594,31 +614,31 @@ pub async fn execute_operation(
             )
             .await?
             {
-                crate::auth::apply(&a, &mut follow_headers, &mut empty_query);
+                crate::auth::apply(&a, &mut follow_spec);
             }
-            let (fstatus, fhdrs, fbytes) = send_one(
+            for (k, v) in &args.header {
+                follow_spec
+                    .headers
+                    .insert(k.to_ascii_lowercase(), v.clone());
+            }
+            let (fstatus, fhdrs, fbytes) = crate::transport::send_spec(
                 &client,
-                HttpMethod::Get,
-                &followed_url,
-                follow_headers,
-                None,
-                None,
-                &empty_query,
+                &follow_spec,
                 args.retry_count,
                 args.retry_max_wait_secs,
             )
             .await?;
             // A failed follow is a hard error: the followed body is not the
             // primary output, so 4xx/5xx is surfaced rather than emitted.
-            let followed_value =
-                serde_json::from_slice::<serde_json::Value>(&fbytes).unwrap_or_else(|_| {
+            let followed_value = serde_json::from_slice::<serde_json::Value>(&fbytes)
+                .unwrap_or_else(|_| {
                     serde_json::Value::String(String::from_utf8_lossy(&fbytes).to_string())
                 });
             let followed = raise_for_status(OperationResult {
                 status: fstatus,
                 raw: Some(fbytes),
                 value: followed_value,
-                headers: lowercase_headers(&fhdrs),
+                headers: fhdrs,
             })?;
             // The followed body replaces the primary one for output, so its
             // original bytes become the `raw` the unfiltered emitter prints.
@@ -663,7 +683,9 @@ pub(crate) fn args_from_matches(
     let mut args = ProgrammaticArgs {
         http: http_config,
         retry_count: combined.get_one::<u8>("spall-retry").unwrap_or(1),
-        retry_max_wait_secs: combined.get_one::<u64>("spall-retry-max-wait").unwrap_or(60),
+        retry_max_wait_secs: combined
+            .get_one::<u64>("spall-retry-max-wait")
+            .unwrap_or(60),
         ..ProgrammaticArgs::default()
     };
 
@@ -698,7 +720,8 @@ pub(crate) fn args_from_matches(
     if let Some(values) = combined.get_many::<String>("spall-header") {
         for h in values {
             if let Some((k, v)) = h.split_once(':') {
-                args.header.insert(k.trim().to_string(), v.trim().to_string());
+                args.header
+                    .insert(k.trim().to_string(), v.trim().to_string());
             }
         }
     }
@@ -781,11 +804,32 @@ async fn execute_legacy_path(
         }
     }
 
-    // Authentication
+    // Authentication. Auth contributors mutate a neutral request spec, so
+    // resolve onto a throwaway spec and merge its headers / query pairs into
+    // this path's reqwest assembly. This keeps the multipart / form single-shot
+    // tail on its reqwest builder while still routing auth through the one
+    // shared `spall_openapi::auth` contributor set.
     let cli_auth = combined.get_one::<String>("spall-auth");
     let auth = crate::auth::resolve(&entry.name, entry.auth.as_ref(), cli_auth.as_deref()).await?;
     if let Some(a) = auth {
-        crate::auth::apply(&a, &mut headers, &mut query_pairs);
+        let mut auth_spec = HttpRequestSpec {
+            method: op.method,
+            url: url.clone(),
+            query: Vec::new(),
+            headers: NeutralHeaders::new(),
+            cookies: Vec::new(),
+            body: None,
+        };
+        crate::auth::apply(&a, &mut auth_spec);
+        for (k, v) in auth_spec.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(&v),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+        query_pairs.extend(auth_spec.query);
     }
 
     // Content-Type
@@ -801,11 +845,13 @@ async fn execute_legacy_path(
     let mut http_config = crate::http::config_from_matches(phase1_matches, phase2_matches);
     http_config.proxy = crate::http::resolve_proxy(entry, defaults, phase1_matches, phase2_matches);
 
-    let client = crate::http::build_http_client(&http_config)
-        .map_err(crate::SpallCliError::HttpClient)?;
+    let client =
+        crate::http::build_http_client(&http_config).map_err(crate::SpallCliError::HttpClient)?;
 
     let retry_count = combined.get_one::<u8>("spall-retry").unwrap_or(1);
-    let retry_max_wait = combined.get_one::<u64>("spall-retry-max-wait").unwrap_or(60);
+    let retry_max_wait = combined
+        .get_one::<u64>("spall-retry-max-wait")
+        .unwrap_or(60);
 
     if combined.get_flag("spall-paginate") {
         if body_data.multipart.is_some() {
@@ -813,39 +859,68 @@ async fn execute_legacy_path(
                 "Cannot use --spall-paginate with multipart uploads".to_string(),
             ));
         }
-        let paginator = crate::paginate::Paginator::default();
-        let mut pages: Vec<serde_json::Value> = Vec::new();
+
+        // Neutral headers for the paginate pages, derived once from the reqwest
+        // assembly above (default headers + --spall-header + cookies + auth).
+        let neutral_headers = lowercase_headers(&headers);
+
+        let paginator = spall_openapi::Paginator::default();
+        let verbose = combined.get_flag("spall-verbose");
+
+        // Eagerly follow `rel=next` across pages, buffering each page body. This
+        // preserves the old loop's semantics exactly: the first non-2xx page is
+        // returned verbatim (prior pages are NOT concatenated with an error
+        // body), and following stops at the page budget or an absent `rel=next`.
+        // The buffered pages are then handed to the library's de-paginating
+        // `ItemStream`, which flattens them via the resolved `DataPath` — the
+        // streaming replacement for the old `concat_results`. All HTTP I/O stays
+        // here in the async function, so no async-to-sync bridge is needed.
+        let mut queued: Vec<spall_openapi::ResponseStream> = Vec::new();
         let mut current_url = url.clone();
-        let mut first_status: Option<reqwest::StatusCode> = None;
+        let mut page_query = query_pairs.clone();
+        let mut first_status: Option<Status> = None;
+        let mut last_url = current_url.clone();
 
         for page_num in 0..paginator.max_pages {
-            let (status, resp_headers, body_bytes) = send_one(
-                &client,
-                op.method,
-                &current_url,
-                headers.clone(),
-                if page_num == 0 {
-                    body_data.body.clone()
-                } else {
-                    None
-                },
-                None,
-                &query_pairs,
-                retry_count,
-                retry_max_wait,
-            )
-            .await?;
+            // Only the first page carries the request body. The content type (if
+            // any) is already a header in `neutral_headers`, so `Bytes` only
+            // needs to carry the raw payload; the builder does not re-set the
+            // content type because the header already wins.
+            let page_body = if page_num == 0 {
+                body_data.body.clone().map(|data| RequestBody::Bytes {
+                    content_type: body_data
+                        .content_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    data,
+                })
+            } else {
+                None
+            };
+            let page_spec = HttpRequestSpec {
+                method: op.method,
+                url: current_url.clone(),
+                query: page_query.clone(),
+                headers: neutral_headers.clone(),
+                cookies: Vec::new(),
+                body: page_body,
+            };
+
+            let (status, page_headers, body_bytes) =
+                crate::transport::send_spec(&client, &page_spec, retry_count, retry_max_wait)
+                    .await?;
             if first_status.is_none() {
                 first_status = Some(status);
             }
-            if combined.get_flag("spall-verbose") {
+            last_url = current_url.clone();
+            if verbose {
                 eprintln!("HTTP {} {}", status, current_url);
             }
             if !status.is_success() {
-                // Return the error page's body verbatim for emission; the
-                // caller maps the status to the exit code. Pages collected
-                // before the error are intentionally not concatenated with an
-                // error body — the error payload is the actionable diagnostic.
+                // Return the error page's body verbatim for emission; the caller
+                // maps the status to the exit code. Pages collected before the
+                // error are intentionally not concatenated with an error body —
+                // the error payload is the actionable diagnostic.
                 let error_value = serde_json::from_slice::<serde_json::Value>(&body_bytes)
                     .unwrap_or_else(|_| {
                         serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string())
@@ -854,29 +929,48 @@ async fn execute_legacy_path(
                     status,
                     raw: Some(body_bytes),
                     value: error_value,
-                    headers: lowercase_headers(&resp_headers),
+                    headers: page_headers,
                 }));
             }
-            let body_json =
-                serde_json::from_slice::<serde_json::Value>(&body_bytes).map_err(|e| {
-                    crate::SpallCliError::Usage(format!(
-                        "Pagination requires JSON responses: {}",
-                        e
-                    ))
-                })?;
-            pages.push(body_json);
-            if let Some(next) = paginator.next_url(&resp_headers) {
-                current_url = resolve_next_url(&current_url, &next)?;
-                query_pairs.clear();
-            } else {
-                break;
+
+            let next = paginator.next_url(&page_headers);
+            queued.push(spall_openapi::ResponseStream {
+                status,
+                headers: page_headers,
+                body: Box::new(std::io::Cursor::new(body_bytes)),
+            });
+            match next {
+                Some(n) => {
+                    current_url = resolve_next_url(&current_url, &n)?;
+                    // Subsequent pages carry their query in the next URL.
+                    page_query.clear();
+                }
+                None => break,
             }
         }
 
-        let final_value = paginator.concat_results(pages);
+        // Resolve the data path: explicit override (none from the CLI yet) >
+        // `x-spall-data-path` on the operation > `ApiEntry.data_path` config >
+        // `TopLevel`. The library's lenient TopLevel handling reproduces the old
+        // `concat_results` shape (arrays flatten; a non-array page is one item).
+        let data_path = resolve_data_path(op, entry)?;
+
+        // Drain the de-paginating ItemStream into a single array, the streaming
+        // replacement for `concat_results`. #44's byte caps (default 64 MiB
+        // item / 256 MiB buffer, or the `--spall-max-item-bytes` /
+        // `--spall-max-buffer-bytes` overrides) guard this collect: an oversized
+        // record / indivisible page aborts the capture mid-flight and surfaces
+        // as a NotRecordStreamable diagnostic rather than an OOM.
+        let stream_limits = resolve_stream_limits(&combined);
+        let final_value = collect_paginated(queued, data_path, stream_limits)?;
+
         if let Some(first) = first_status {
-            let warnings =
-                crate::validate::response_validate(op, first.as_u16(), "application/json", &final_value);
+            let warnings = crate::validate::response_validate(
+                op,
+                first.as_u16(),
+                "application/json",
+                &final_value,
+            );
             if !warnings.is_empty() {
                 eprintln!("Warning: response body did not match schema:");
                 eprintln!("{}", crate::validate::format_errors(&warnings));
@@ -888,19 +982,19 @@ async fn execute_legacy_path(
             &entry.name,
             &op.operation_id,
             &op.method.to_string(),
-            &current_url,
-            first_status,
+            &last_url,
+            first_status.map(Status::as_u16),
             &headers,
             &HeaderMap::new(),
             duration_ms,
         );
 
-        // Paginate succeeded (2xx): record for the next pipe/chain stage.
-        // No single original body survives the merge, so `raw` is None and the
+        // Paginate succeeded (2xx): record for the next pipe/chain stage. No
+        // single original body survives the merge, so `raw` is None and the
         // caller emits the parsed value.
         sink.set(final_value.clone());
         return Ok(Some(OperationResult {
-            status: reqwest::StatusCode::OK,
+            status: Status::from(200),
             raw: None,
             value: final_value,
             headers: BTreeMap::new(),
@@ -928,7 +1022,7 @@ async fn execute_legacy_path(
         &op.operation_id,
         &op.method.to_string(),
         &url,
-        Some(status),
+        Some(status.as_u16()),
         &headers,
         &resp_headers,
         duration_ms,
@@ -955,10 +1049,9 @@ async fn execute_legacy_path(
     // Parse for filter/chain; the utf8-lossy String is only a fallback so those
     // paths have *something*. The original bytes (`raw`) are what the unfiltered
     // output path emits, preserving binary/non-JSON content.
-    let body_json =
-        serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_else(|_| {
-            serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string())
-        });
+    let body_json = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string())
+    });
 
     let duration = start.elapsed();
     if combined.get_flag("spall-time") || combined.get_flag("spall-verbose") {
@@ -973,11 +1066,113 @@ async fn execute_legacy_path(
         sink.set(body_json.clone());
     }
     Ok(Some(OperationResult {
-        status,
+        status: Status::from(status.as_u16()),
         raw: Some(body_bytes),
         value: body_json,
         headers: lowercase_headers(&resp_headers),
     }))
+}
+
+/// Resolve the [`spall_openapi::DataPath`] for a paginated operation, applying
+/// the precedence `x-spall-data-path` operation extension > `ApiEntry.data_path`
+/// config > `DataPath::TopLevel`. (An explicit caller override is a future tier
+/// and is not surfaced by the CLI yet.)
+fn resolve_data_path(
+    op: &ResolvedOperation,
+    entry: &ApiEntry,
+) -> Result<spall_openapi::DataPath, crate::SpallCliError> {
+    if let Some(dp) = spall_openapi::DataPath::from_operation(op) {
+        return Ok(dp);
+    }
+    if let Some(pointer) = &entry.data_path {
+        return spall_openapi::DataPath::from_pointer(pointer).map_err(|e| {
+            crate::SpallCliError::Usage(format!(
+                "invalid data_path '{pointer}' for API '{}': {e}",
+                entry.name
+            ))
+        });
+    }
+    Ok(spall_openapi::DataPath::TopLevel)
+}
+
+/// Drain an eagerly-fetched chain of pages through the library's de-paginating
+/// [`spall_openapi::ItemStream`] into a single JSON array — the streaming
+/// replacement for the old `concat_results`. The first queued page seeds the
+/// stream; the rest are
+/// returned in order by a fetch closure that pops the pre-fetched queue (all
+/// HTTP I/O already happened in the caller, so this closure does no I/O and
+/// needs no async-to-sync bridge).
+///
+/// `limits` carries the #44 byte caps (default 64 MiB item / 256 MiB buffer, or
+/// the `--spall-max-item-bytes` / `--spall-max-buffer-bytes` overrides). A
+/// record or indivisible page that would exceed a cap aborts the capture
+/// mid-flight (the library never buffers the oversized value) and surfaces as
+/// [`crate::SpallCliError::NotRecordStreamable`] — an actionable message that
+/// points the user at raising the cap or capturing the raw body to a file with
+/// `--spall-download`. A genuinely non-JSON / malformed body still maps to a
+/// usage error.
+fn collect_paginated(
+    queued: Vec<spall_openapi::ResponseStream>,
+    data_path: spall_openapi::DataPath,
+    limits: spall_openapi::StreamLimits,
+) -> Result<serde_json::Value, crate::SpallCliError> {
+    let mut pages = queued.into_iter();
+    let Some(first) = pages.next() else {
+        // No pages fetched (max_pages == 0 is impossible by default); empty array.
+        return Ok(serde_json::Value::Array(Vec::new()));
+    };
+
+    let mut rest = pages;
+    let fetch: spall_openapi::PageFetch = Box::new(move |_next_url: &str| {
+        // The queue is already in `rel=next` order, so ignore the URL and hand
+        // back the next pre-fetched page.
+        rest.next().ok_or_else(|| {
+            spall_openapi::StreamError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "no further pre-fetched page",
+            ))
+        })
+    });
+
+    let stream = spall_openapi::ItemStream::paginated_with_limits(
+        first,
+        data_path,
+        spall_openapi::Paginator::default(),
+        fetch,
+        limits,
+    );
+
+    let mut items = Vec::new();
+    for item in stream {
+        let value = item.map_err(|e| match e {
+            // The #44 guards: the message names the cap and the raw-body escape;
+            // route them to the dedicated diagnostic rather than a bare usage
+            // error so the miette help (raise the cap / --spall-download) shows.
+            spall_openapi::StreamError::ItemTooLarge { .. }
+            | spall_openapi::StreamError::ResponseNotStreamable { .. } => {
+                crate::SpallCliError::NotRecordStreamable(e.to_string())
+            }
+            other => {
+                crate::SpallCliError::Usage(format!("Pagination requires JSON responses: {other}"))
+            }
+        })?;
+        items.push(value);
+    }
+    Ok(serde_json::Value::Array(items))
+}
+
+/// Resolve the #44 [`spall_openapi::StreamLimits`] from the merged CLI flags,
+/// falling back to [`spall_openapi::StreamLimits::default`] (64 MiB item /
+/// 256 MiB buffer) for any flag the caller did not set.
+fn resolve_stream_limits(combined: &MergedMatches) -> spall_openapi::StreamLimits {
+    let mut limits = spall_openapi::StreamLimits::default();
+    if let Some(n) = combined.get_one::<usize>("spall-max-item-bytes") {
+        limits.max_item_bytes = n;
+    }
+    if let Some(n) = combined.get_one::<usize>("spall-max-buffer-bytes") {
+        limits.max_buffered_bytes = n;
+    }
+    limits
 }
 
 /// Send a single HTTP request, with transient-error retry.
@@ -1314,7 +1509,7 @@ fn record_history(
     operation: &str,
     method: &str,
     url: &str,
-    status: Option<reqwest::StatusCode>,
+    status: Option<u16>,
     req_headers: &HeaderMap,
     resp_headers: &HeaderMap,
     duration_ms: u64,
@@ -1359,7 +1554,7 @@ fn record_history(
         operation: operation.to_string(),
         method: method.to_string(),
         url: url.to_string(),
-        status_code: status.map(|s| s.as_u16()).unwrap_or(0),
+        status_code: status.unwrap_or(0),
         duration_ms,
         request_headers,
         response_headers,
@@ -1430,7 +1625,11 @@ mod programmatic_tests {
         }
     }
 
-    fn make_get_op(op_id: &str, path_template: &str, with_path_param: Option<&str>) -> ResolvedOperation {
+    fn make_get_op(
+        op_id: &str,
+        path_template: &str,
+        with_path_param: Option<&str>,
+    ) -> ResolvedOperation {
         let parameters = match with_path_param {
             Some(name) => vec![path_param(name)],
             None => Vec::new(),
@@ -1481,6 +1680,7 @@ mod programmatic_tests {
             auth: None,
             proxy: None,
             profiles: HashMap::new(),
+            data_path: None,
         }
     }
 
@@ -1515,7 +1715,10 @@ mod programmatic_tests {
             .await
             .expect("request");
         assert_eq!(result.status.as_u16(), 200);
-        assert_eq!(result.value, serde_json::json!({"id": "abc-123", "count": 7}));
+        assert_eq!(
+            result.value,
+            serde_json::json!({"id": "abc-123", "count": 7})
+        );
     }
 
     #[tokio::test]
@@ -1565,8 +1768,10 @@ mod programmatic_tests {
         let op = make_get_op("getMe", "/me", None);
 
         let mut args = ProgrammaticArgs::new();
-        args.header
-            .insert("Authorization".to_string(), "Bearer caller-token".to_string());
+        args.header.insert(
+            "Authorization".to_string(),
+            "Bearer caller-token".to_string(),
+        );
 
         let res = execute_operation_programmatic(&op, &spec, &entry, &args)
             .await
@@ -1600,7 +1805,10 @@ mod programmatic_tests {
         assert_eq!(res.status.as_u16(), 403);
         // Headers + body are observable on failure so callers can record
         // history, build MCP error payloads, or hint at remediation.
-        assert_eq!(res.headers.get("x-error-id").map(String::as_str), Some("trace-9"));
+        assert_eq!(
+            res.headers.get("x-error-id").map(String::as_str),
+            Some("trace-9")
+        );
         assert_eq!(res.value, serde_json::json!({"detail": "nope"}));
         // raise_for_status lifts the result into Err for callers that
         // want the historical 4xx-as-error contract.
@@ -1721,7 +1929,7 @@ mod programmatic_tests {
         }
     }
 
-    /// Mirror of the arg shape `spall_core::command::build_operations_cmd`
+    /// Mirror of the arg shape `crate::command::build_operations_cmd`
     /// would emit: `path-{name}`, `query-{name}`, `header-{name}`, plus
     /// the body knobs `--data` / `--no-data` / `--spall-content-type`.
     /// We also register the **typed** global args (spall-timeout u64,
@@ -1930,7 +2138,8 @@ mod programmatic_tests {
         // Path A: programmatic
         let mut args = ProgrammaticArgs::default();
         args.path.insert("id".to_string(), "abc-123".to_string());
-        args.query.insert("filter".to_string(), "active".to_string());
+        args.query
+            .insert("filter".to_string(), "active".to_string());
         args.header
             .insert("X-Trace-Id".to_string(), "trace-xyz".to_string());
         args.body = Some(body.clone());
@@ -1980,11 +2189,7 @@ mod programmatic_tests {
         for (i, r) in received.iter().enumerate() {
             assert_eq!(r.method.as_str(), "POST", "request #{i} method");
             assert_eq!(r.url.path(), "/items/abc-123", "request #{i} path");
-            assert_eq!(
-                r.url.query(),
-                Some("filter=active"),
-                "request #{i} query"
-            );
+            assert_eq!(r.url.query(), Some("filter=active"), "request #{i} query");
             assert_eq!(
                 r.headers.get("x-trace-id").and_then(|v| v.to_str().ok()),
                 Some("trace-xyz"),

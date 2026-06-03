@@ -215,10 +215,7 @@ async fn run_piped(
     let mut sink = crate::execute::ResponseContext::new();
 
     match Box::pin(crate::run_with_args(
-        &full_args,
-        registry,
-        cache_dir,
-        &mut sink,
+        &full_args, registry, cache_dir, &mut sink,
     ))
     .await
     {
@@ -254,13 +251,15 @@ async fn run_piped(
         // Load (and cache) the stage-0 API spec the first time a real response
         // reaches a chain stage.
         if spec.is_none() {
-            spec = Some(load_api_spec(api_name, registry, cache_dir).await.map_err(
-                |reason| PipeError::SpecLoad {
-                    stage: stage_num,
-                    api: api_name.to_string(),
-                    reason,
-                },
-            )?);
+            spec = Some(
+                load_api_spec(api_name, registry, cache_dir)
+                    .await
+                    .map_err(|reason| PipeError::SpecLoad {
+                        stage: stage_num,
+                        api: api_name.to_string(),
+                        reason,
+                    })?,
+            );
         }
         let spec_ref = spec
             .as_ref()
@@ -280,23 +279,19 @@ async fn run_piped(
             })?;
 
         // #34: resolve bindings against the target op's parameter metadata.
-        let next_args =
-            chain
-                .resolve(&response, target_op)
-                .map_err(|e| PipeError::JmesPath {
-                    stage: stage_num,
-                    expr: stage.to_string(),
-                    reason: e.to_string(),
-                })?;
+        let next_args = chain
+            .resolve(&response, target_op)
+            .map_err(|e| PipeError::JmesPath {
+                stage: stage_num,
+                expr: stage.to_string(),
+                reason: e.to_string(),
+            })?;
 
         let mut full_args = vec!["spall".to_string(), api_name.to_string()];
         full_args.extend(next_args);
 
         match Box::pin(crate::run_with_args(
-            &full_args,
-            registry,
-            cache_dir,
-            &mut sink,
+            &full_args, registry, cache_dir, &mut sink,
         ))
         .await
         {

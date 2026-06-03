@@ -4,6 +4,7 @@ mod arazzo_runner;
 mod arazzo_runner_actions;
 mod auth;
 mod chain;
+mod command;
 mod commands;
 mod completions;
 mod discover;
@@ -16,10 +17,10 @@ mod links;
 mod matches;
 mod mcp;
 mod output;
-mod paginate;
 mod preview;
 mod repeat;
 mod repl;
+mod transport;
 mod validate;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -77,6 +78,20 @@ If this API requires a VPN, ensure you're connected."
 
     #[error("Auth resolution failed for '{api}': {message}")]
     AuthResolution { api: String, message: String },
+
+    /// A paginated response could not be streamed within the configured byte
+    /// caps (#44): a single record, or one indivisible non-array page, was too
+    /// large. The guard aborts the capture mid-flight so spall never buffers the
+    /// oversized value into an OOM. The message itself is the actionable
+    /// diagnostic produced by [`spall_openapi::StreamError`].
+    #[error("Response is not record-streamable: {0}")]
+    #[diagnostic(help(
+        "A single record (or one indivisible non-array page) exceeded the streaming byte cap. \
+Raise the cap with `--spall-max-item-bytes <N>` / `--spall-max-buffer-bytes <N>` if you truly \
+need it, or capture the raw body to a file with `--spall-download <path>` (or `-o <path>`) \
+and process it from disk."
+    ))]
+    NotRecordStreamable(String),
 }
 
 impl SpallCliError {
@@ -92,6 +107,7 @@ impl SpallCliError {
             SpallCliError::Http5xx(_) => EXIT_HTTP_5XX,
             SpallCliError::ValidationFailed => EXIT_VALIDATION,
             SpallCliError::AuthResolution { .. } => EXIT_USAGE,
+            SpallCliError::NotRecordStreamable(_) => EXIT_USAGE,
         }
     }
 }
@@ -299,8 +315,7 @@ async fn show_api_help(
                     "⚠  Could not load spec for '{}'. Showing cached operation list from {}.",
                     api_name, index.cached_at
                 );
-                let mut phase2 =
-                    spall_core::command::build_operations_cmd_from_index(api_name, &index);
+                let mut phase2 = crate::command::build_operations_cmd_from_index(api_name, &index);
                 for arg in spall_global_args() {
                     phase2 = phase2.arg(arg);
                 }
@@ -328,8 +343,7 @@ async fn show_api_help(
                     "⚠  Could not load spec for '{}'. Showing cached operation list from {}.",
                     api_name, index.cached_at
                 );
-                let mut phase2 =
-                    spall_core::command::build_operations_cmd_from_index(api_name, &index);
+                let mut phase2 = crate::command::build_operations_cmd_from_index(api_name, &index);
                 for arg in spall_global_args() {
                     phase2 = phase2.arg(arg);
                 }
@@ -349,7 +363,7 @@ async fn show_api_help(
         }
     };
 
-    let mut phase2 = spall_core::command::build_operations_cmd(api_name, &spec);
+    let mut phase2 = crate::command::build_operations_cmd(api_name, &spec);
     for arg in spall_global_args() {
         phase2 = phase2.arg(arg);
     }
@@ -421,7 +435,7 @@ async fn handle_api_operation(
         }
     })?;
 
-    let mut phase2 = spall_core::command::build_operations_cmd(api_name, &spec);
+    let mut phase2 = crate::command::build_operations_cmd(api_name, &spec);
     for arg in spall_global_args() {
         phase2 = phase2.arg(arg);
     }
@@ -859,6 +873,22 @@ fn spall_global_args() -> Vec<Arg> {
             .action(ArgAction::SetTrue)
             .global(true)
             .help("Auto-follow Link header pagination"),
+        Arg::new("spall-max-item-bytes")
+            .long("spall-max-item-bytes")
+            .value_parser(clap::value_parser!(usize))
+            .global(true)
+            .help(
+                "Max bytes for a single streamed record on the paginate path before it is \
+rejected as not record-streamable (default: 64 MiB)",
+            ),
+        Arg::new("spall-max-buffer-bytes")
+            .long("spall-max-buffer-bytes")
+            .value_parser(clap::value_parser!(usize))
+            .global(true)
+            .help(
+                "Max bytes for one indivisible non-array page captured whole on the paginate \
+path (default: 256 MiB)",
+            ),
         Arg::new("spall-follow")
             .long("spall-follow")
             .global(true)

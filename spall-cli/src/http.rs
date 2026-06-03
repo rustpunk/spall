@@ -183,8 +183,8 @@ pub fn build_http_client(config: &HttpConfig) -> Result<Client, String> {
     }
 
     if let Some(path) = &config.ca_cert {
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("read --spall-ca-cert '{}': {}", path, e))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("read --spall-ca-cert '{}': {}", path, e))?;
         let cert = reqwest::Certificate::from_pem(&bytes)
             .or_else(|_| reqwest::Certificate::from_der(&bytes))
             .map_err(|e| format!("parse --spall-ca-cert '{}': {}", path, e))?;
@@ -208,8 +208,12 @@ pub fn build_http_client(config: &HttpConfig) -> Result<Client, String> {
                 cert_bytes.push(b'\n');
             }
             cert_bytes.extend_from_slice(&key_bytes);
-            let identity = reqwest::Identity::from_pem(&cert_bytes)
-                .map_err(|e| format!("parse client identity from '{}' + '{}': {}", cert_path, key_path, e))?;
+            let identity = reqwest::Identity::from_pem(&cert_bytes).map_err(|e| {
+                format!(
+                    "parse client identity from '{}' + '{}': {}",
+                    cert_path, key_path, e
+                )
+            })?;
             builder = builder.identity(identity);
         }
     }

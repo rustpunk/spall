@@ -1,0 +1,26 @@
+[package]
+name = "spall-openapi"
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+# edition is set EXPLICITLY (not workspace-inherited): this crate is edition 2024
+# per #29, while the rest of the workspace stays on edition 2021. Edition 2024
+# needs rustc >= 1.85, but the workspace's transitive deps raise the effective
+# MSRV to 1.88, which this inherits from [workspace.package] below.
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+spall-core = { path = "../spall-core" }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+indexmap = { version = "2", features = ["serde"] }
+thiserror = "2"
+# Auth contributors (#26): secrets stay wrapped in `SecretString`; `base64`
+# STANDARD-encodes Basic credentials. Both are pure-Rust (no C / `*-sys`),
+# matching spall-cli's versions exactly so the CLI can delegate in #28.
+secrecy = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

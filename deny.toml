@@ -1,0 +1,77 @@
+# cargo-deny configuration for the spall workspace.
+#
+# Scope (milestone #1 / issue #24): a minimal, honest policy over the licenses
+# and advisories already present in the tree. The dedicated cargo-deny CI job is
+# deferred to #29; this file lets `cargo deny check` run locally and in that
+# future job without surprises.
+
+[advisories]
+# Fail the build on any security advisory affecting a dependency.
+version = 2
+yanked = "deny"
+# Pre-existing, out-of-milestone-#1-scope advisories. All five are
+# *unmaintained* notices (not vulnerabilities) on transitive dependencies spall
+# does not control, each with "no safe upgrade available". They predate the
+# spall-openapi extraction and are tracked as separate spall supply-chain debt;
+# M1 neither introduces nor regresses them. The last two are reachable only
+# under cargo-deny's --all-features pass (the cargo-deny-action default), via
+# hasp's optional Azure Key Vault backend. Re-evaluate when the upstreams pull
+# maintained replacements.
+ignore = [
+    # atomic-polyfill unmaintained — via postcard -> heapless (IR cache).
+    "RUSTSEC-2023-0089",
+    # bincode 1.3.3 unmaintained — via syntect (REPL syntax highlighting).
+    "RUSTSEC-2025-0141",
+    # yaml-rust 0.4.5 unmaintained — via syntect.
+    "RUSTSEC-2024-0320",
+    # instant unmaintained — feature-gated transitive via hasp's Azure KV
+    # backend (azure SDK); only seen under cargo-deny --all-features.
+    "RUSTSEC-2024-0384",
+    # paste unmaintained — feature-gated transitive via hasp's Azure KV backend
+    # (azure_core); only seen under cargo-deny --all-features.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# Allow the permissive licenses actually present across the workspace tree.
+# cargo-deny evaluates SPDX expressions, so an `A OR B` crate passes when either
+# operand is listed here. The set below covers every license observed via
+# `cargo metadata` on the current lockfile.
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    # Weak, file-scoped copyleft used by a single transitive build-time dep
+    # (option-ext, via dirs). No source modifications are distributed, so the
+    # MPL file-level obligation is satisfied by using it unmodified.
+    "MPL-2.0",
+]
+# Confidence threshold for license-text matching (0.0..=1.0).
+confidence-threshold = 0.8
+
+[bans]
+# Multiple versions of the same crate are a warning, not an error: the current
+# tree has some duplicate transitive versions we do not control yet.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Only crates.io is an allowed registry source.
+unknown-registry = "deny"
+unknown-git = "deny"
+# First-party rustpunk credential-backend workspace (hasp + its env / file /
+# keyring backends), consumed by spall-cli as a git dependency. Same org as
+# spall itself, so this is a trusted source, not an unvetted third party.
+allow-git = ["https://github.com/rustpunk/hasp"]
