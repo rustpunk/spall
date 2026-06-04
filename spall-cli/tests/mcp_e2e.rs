@@ -1336,3 +1336,207 @@ async fn http_transport_absent_protocol_version_ok() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// `DELETE /` with a valid `Mcp-Session-Id` terminates that session:
+/// the DELETE returns 200, and a subsequent request carrying the same
+/// id is rejected with 400 + the re-initialize hint (mirroring the
+/// missing-session test). Proves client-initiated termination (#18).
+#[tokio::test]
+async fn http_transport_delete_terminates_session() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // initialize to mint a session id.
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // DELETE with the issued session id → 200, no body.
+    let del = client
+        .delete(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .send()
+        .await
+        .expect("send delete");
+    assert_eq!(del.status(), reqwest::StatusCode::OK);
+    let del_body = del.bytes().await.expect("read delete body");
+    assert!(
+        del_body.is_empty(),
+        "DELETE 200 should carry no body, got {} bytes",
+        del_body.len(),
+    );
+
+    // The session is now gone: reusing the id → 400 + re-init hint.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("send tools/list");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Mcp-Session-Id"),
+        "terminated session should be rejected with the re-init hint: {:?}",
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Session termination is idempotent: a second `DELETE` for the same
+/// (now-absent) session id still returns 200 OK — the goal state
+/// ("session no longer exists") is already reached (#18 AC).
+#[tokio::test]
+async fn http_transport_delete_idempotent() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // First DELETE terminates the session → 200.
+    let first = client
+        .delete(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .send()
+        .await
+        .expect("send first delete");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+    // Second DELETE for the now-absent id is still 200 (idempotent).
+    let second = client
+        .delete(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .send()
+        .await
+        .expect("send second delete");
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::OK,
+        "DELETE for an absent session id must be idempotent (200 OK)",
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `DELETE /` with no `Mcp-Session-Id` header is a malformed request:
+/// 400 Bad Request. Absent vs. unknown session id are distinct — an
+/// absent id is idempotent 200, but a missing header is a client error.
+#[tokio::test]
+async fn http_transport_delete_missing_header_400() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // DELETE with no session-id header → 400 + error envelope.
+    let resp = client
+        .delete(format!("{}/", base_url))
+        .send()
+        .await
+        .expect("send delete");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Mcp-Session-Id"),
+        "missing-header DELETE should name the session id header: {:?}",
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The shared Origin gate applies to `DELETE` identically to `POST`:
+/// a disallowed Origin under an allowlist is rejected with 403 before
+/// the session-id is read. Proves `check_origin` reuse (#18 AC).
+#[tokio::test]
+async fn http_transport_delete_rejects_disallowed_origin() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(
+        &temp,
+        "petstore",
+        &["--spall-allowed-origin", "https://example.com"],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // DELETE with a non-allowlisted Origin → 403, never reaching the
+    // session-id check.
+    let resp = client
+        .delete(format!("{}/", base_url))
+        .header("origin", "https://evil.example.org")
+        .header("mcp-session-id", "deadbeefdeadbeefdeadbeefdeadbeef")
+        .send()
+        .await
+        .expect("send delete");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

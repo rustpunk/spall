@@ -11,6 +11,12 @@
 //!   one JSON-RPC reply frame as `application/json`. A
 //!   notification/response frame (no reply) gets `202 Accepted` with an
 //!   empty body, per the spec's "Sending Messages" rule.
+//! - **DELETE /** with `Mcp-Session-Id` terminates that session. The
+//!   Origin gate applies identically (rejecting before the session-id
+//!   is read). A valid header returns `200 OK`; termination is
+//!   idempotent — a DELETE for an absent session id still returns
+//!   `200 OK` (the goal state is reached either way). A missing or
+//!   empty `Mcp-Session-Id` header returns `400 Bad Request`.
 //! - **`Mcp-Session-Id`** is issued on `initialize` and required on
 //!   every subsequent request. Sessions expire after
 //!   [`SESSION_TTL_SECS`] of inactivity; a background task prunes
@@ -206,7 +212,7 @@ pub async fn run_http(
     };
 
     let app = Router::new()
-        .route("/", post(handle_post))
+        .route("/", post(handle_post).delete(handle_delete))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(cors)
         .with_state(state);
@@ -243,11 +249,15 @@ struct HttpState {
     verbose: bool,
 }
 
-async fn handle_post(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
+/// Shared Origin gate for every HTTP method on `/`. Returns
+/// `Some(403 response)` when the request's `Origin` is not allowed and
+/// `None` when it passes, applying the DNS-rebinding policy described on
+/// [`HttpState`]. POST, DELETE, and any future verb call this first so
+/// the rejection logic — and the `kind=http-request` verbose line — are
+/// identical across methods. (Returning `Option` rather than `Result`
+/// keeps the large `Response` off a `Result::Err` variant, which the
+/// `result_large_err` lint flags.)
+fn check_origin(headers: &HeaderMap, state: &HttpState) -> Option<Response> {
     // Origin policy:
     // - Empty allowlist + Origin absent → allow (curl, MCP test
     //   clients, same-process). Most browsers always send Origin on
@@ -292,19 +302,92 @@ async fn handle_post(
             super::verbose::SENTINEL,
             super::verbose::quote_if_needed(&origin_str),
             super::verbose::quote_if_needed(&outcome),
-            super::verbose::format_headers(&headers),
+            super::verbose::format_headers(headers),
         );
     }
 
-    if !allowed {
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "origin '{}' not allowed (configure with --spall-allowed-origin)",
-                origin
-            ),
+    if allowed {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "origin '{}' not allowed (configure with --spall-allowed-origin)",
+                    origin
+                ),
+            )
+                .into_response(),
         )
-            .into_response();
+    }
+}
+
+/// Shared session-id gate. Reads [`HEADER_SESSION_ID`], checks it
+/// against the live session map, and refreshes the last-seen marker on
+/// a hit. Returns `Some(400 response)` for a missing, empty, expired, or
+/// unknown session id (carrying the supplied JSON-RPC `id` in the error
+/// envelope) and `None` on a fresh session. POST uses this to gate
+/// post-`initialize` requests; future verbs that require an established
+/// session reuse the identical logic. (`Option` rather than `Result`
+/// mirrors [`check_origin`] and keeps the large `Response` off a
+/// `Result::Err` variant.)
+async fn check_session_id(
+    headers: &HeaderMap,
+    state: &HttpState,
+    rpc_id: &Value,
+) -> Option<Response> {
+    let sid = headers
+        .get(HEADER_SESSION_ID)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let ttl = Duration::from_secs(SESSION_TTL_SECS);
+    let now = Instant::now();
+    let valid = {
+        let mut sessions = state.sessions.write().await;
+        match sessions.get(&sid) {
+            Some(last_seen) if now.duration_since(*last_seen) < ttl => {
+                // Bump the last-seen marker so an active session
+                // doesn't expire mid-flight.
+                sessions.insert(sid.clone(), now);
+                true
+            }
+            Some(_) => {
+                // Expired — reclaim immediately so the next probe
+                // sees a clean miss.
+                sessions.remove(&sid);
+                false
+            }
+            None => false,
+        }
+    };
+    if valid {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id.clone(),
+                    "error": {
+                        "code": -32600,
+                        "message": "missing, expired, or invalid Mcp-Session-Id; call `initialize` first",
+                    },
+                })),
+            )
+                .into_response(),
+        )
+    }
+}
+
+async fn handle_post(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(resp) = check_origin(&headers, &state) {
+        return resp;
     }
 
     // Peek the JSON-RPC method to gate session-id requirements.
@@ -335,44 +418,9 @@ async fn handle_post(
     // SESSION_TTL_SECS) get the same 400 with a re-init hint so the
     // client can recover without restarting.
     if !is_initialize {
-        let sid = headers
-            .get(HEADER_SESSION_ID)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let ttl = Duration::from_secs(SESSION_TTL_SECS);
-        let now = Instant::now();
-        let valid = {
-            let mut sessions = state.sessions.write().await;
-            match sessions.get(&sid) {
-                Some(last_seen) if now.duration_since(*last_seen) < ttl => {
-                    // Bump the last-seen marker so an active session
-                    // doesn't expire mid-flight.
-                    sessions.insert(sid.clone(), now);
-                    true
-                }
-                Some(_) => {
-                    // Expired — reclaim immediately so the next probe
-                    // sees a clean miss.
-                    sessions.remove(&sid);
-                    false
-                }
-                None => false,
-            }
-        };
-        if !valid {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "jsonrpc": "2.0",
-                    "id": parsed.get("id").cloned().unwrap_or(Value::Null),
-                    "error": {
-                        "code": -32600,
-                        "message": "missing, expired, or invalid Mcp-Session-Id; call `initialize` first",
-                    },
-                })),
-            )
-                .into_response();
+        let rpc_id = parsed.get("id").cloned().unwrap_or(Value::Null);
+        if let Some(resp) = check_session_id(&headers, &state, &rpc_id).await {
+            return resp;
         }
 
         // MCP-Protocol-Version gate, applied after the session check so
@@ -449,6 +497,52 @@ async fn handle_post(
 
     let body = response.unwrap_or(Value::Null);
     (headers_out, Json(body)).into_response()
+}
+
+/// Client-initiated session termination, per MCP spec 2025-06-18 §HTTP
+/// "Session Management": `DELETE /` with `Mcp-Session-Id` ends that
+/// session.
+///
+/// - The [`check_origin`] gate runs first and rejects (403) before the
+///   session-id is read, identically to `handle_post`.
+/// - A missing or empty `Mcp-Session-Id` header is a malformed request:
+///   `400 Bad Request` with the standard JSON-RPC error envelope.
+/// - Otherwise the session is removed and `200 OK` returned with no
+///   body. Termination is IDEMPOTENT: removing an id that is absent
+///   (already terminated, expired, or never issued) still returns
+///   `200 OK`, because the goal state — "this session no longer
+///   exists" — holds either way. Mid-flight requests on a terminated
+///   session are out of scope; the existing `RwLock` on the session map
+///   is the only synchronization needed.
+async fn handle_delete(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
+    if let Some(resp) = check_origin(&headers, &state) {
+        return resp;
+    }
+
+    let sid = headers
+        .get(HEADER_SESSION_ID)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if sid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": {
+                    "code": -32600,
+                    "message": "missing or empty Mcp-Session-Id; DELETE requires the session id to terminate",
+                },
+            })),
+        )
+            .into_response();
+    }
+
+    // `remove` returning `None` (absent id) is fine — termination is
+    // idempotent, so a second DELETE for the same id still reaches the
+    // 200 OK goal state.
+    state.sessions.write().await.remove(sid);
+    StatusCode::OK.into_response()
 }
 
 /// True for `Origin` headers pointing at the same machine the default

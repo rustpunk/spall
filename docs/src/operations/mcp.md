@@ -259,6 +259,14 @@ JSON-RPC over stdio to Streamable HTTP per [MCP spec 2025-06-18
 - `Mcp-Session-Id` header is issued on `initialize` and required on
   every subsequent request. Sessions live for the process lifetime;
   restarting the server invalidates all existing sessions.
+- **Session termination**: a client ends its session with `DELETE /`
+  carrying its `Mcp-Session-Id`. The Origin gate applies identically and
+  rejects (403) before the session-id is read. A valid header returns
+  `200 OK` with no body; the operation is **idempotent** — a second
+  `DELETE` for the same (now-absent) id still returns `200 OK`, since
+  the session no longer exists either way. A **missing or empty**
+  `Mcp-Session-Id` header is a malformed request and returns
+  `400 Bad Request`.
 - `MCP-Protocol-Version` header is validated on every
   post-`initialize` request. If the header is **absent**, the server
   assumes `2025-03-26` (the spec's backward-compatibility default) and
