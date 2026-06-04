@@ -30,7 +30,10 @@ fn classify_url_shaped_is_bearer() {
         classify_bare_token("keyring://service/key"),
         CredentialKind::Bearer
     );
-    assert_eq!(classify_bare_token("env://SOME_VAR"), CredentialKind::Bearer);
+    assert_eq!(
+        classify_bare_token("env://SOME_VAR"),
+        CredentialKind::Bearer
+    );
 }
 
 #[test]

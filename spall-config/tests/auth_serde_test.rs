@@ -69,8 +69,16 @@ fn serde_json_serialize_redacts_secret_values() {
         json,
     );
     // Confirm the redaction shape: each secret field's value is `null`.
-    assert!(json.contains("\"token\":null"), "expected null token: {}", json);
-    assert!(json.contains("\"password\":null"), "expected null password: {}", json);
+    assert!(
+        json.contains("\"token\":null"),
+        "expected null token: {}",
+        json
+    );
+    assert!(
+        json.contains("\"password\":null"),
+        "expected null password: {}",
+        json
+    );
     assert!(
         json.contains("\"client_secret\":null"),
         "expected null client_secret: {}",

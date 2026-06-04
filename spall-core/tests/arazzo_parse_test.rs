@@ -82,8 +82,8 @@ workflows:
       - stepId: only
         operationId: getPet
 "#;
-    let doc = spall_core::yaml::from_str::<ArazzoDocument>(yaml)
-        .expect("x-spall-api fixture parses");
+    let doc =
+        spall_core::yaml::from_str::<ArazzoDocument>(yaml).expect("x-spall-api fixture parses");
     let src = &doc.source_descriptions[0];
     assert_eq!(src.name, "petstore-prod");
     assert_eq!(
@@ -123,7 +123,10 @@ fn with_goto_fixture_parses() {
     assert_eq!(wf.workflow_id, "gotoFlow");
     // 3 steps, first has onFailure redirect, last is the goto target.
     let step_ids: Vec<&str> = wf.steps.iter().map(|s| s.step_id.as_str()).collect();
-    assert_eq!(step_ids, vec!["maybeFail", "shouldBeSkipped", "cleanupStep"]);
+    assert_eq!(
+        step_ids,
+        vec!["maybeFail", "shouldBeSkipped", "cleanupStep"]
+    );
     let chain = wf.steps[0]
         .on_failure
         .as_ref()
@@ -195,8 +198,8 @@ workflows:
       - stepId: useDefault
         operationId: getThing
 "#;
-    let doc = spall_core::yaml::from_str::<ArazzoDocument>(yaml)
-        .expect("explicit-empty fixture parses");
+    let doc =
+        spall_core::yaml::from_str::<ArazzoDocument>(yaml).expect("explicit-empty fixture parses");
     let wf = &doc.workflows[0];
     assert_eq!(
         wf.steps[0].on_success.as_ref().map(|v| v.len()),
@@ -235,8 +238,8 @@ workflows:
       - stepId: useDefault
         operationId: getThing
 "#;
-    let doc = spall_core::yaml::from_str::<ArazzoDocument>(yaml)
-        .expect("explicit-empty fixture parses");
+    let doc =
+        spall_core::yaml::from_str::<ArazzoDocument>(yaml).expect("explicit-empty fixture parses");
     let wf = &doc.workflows[0];
     let opt_out = &wf.steps[0];
     let use_default = &wf.steps[1];
@@ -258,8 +261,10 @@ fn with_outputs_fixture_parses() {
     assert_eq!(wf.workflow_id, "loginAndUseToken");
     assert_eq!(wf.steps.len(), 2);
     let step0 = &wf.steps[0];
-    assert_eq!(step0.outputs.get("token").map(|s| s.as_str()),
-        Some("$response.body#/token"));
+    assert_eq!(
+        step0.outputs.get("token").map(|s| s.as_str()),
+        Some("$response.body#/token")
+    );
     let step1 = &wf.steps[1];
     let auth_param = step1
         .parameters

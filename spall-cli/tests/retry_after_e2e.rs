@@ -50,9 +50,7 @@ async fn retry_after_429_delta_seconds_waits_then_succeeds() {
     // First call: 429 + Retry-After: 1. Second call: 200.
     Mock::given(method("GET"))
         .and(path("/items"))
-        .respond_with(
-            ResponseTemplate::new(429).insert_header("Retry-After", "1"),
-        )
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
         .up_to_n_times(1)
         .mount(&mock)
         .await;
@@ -65,12 +63,7 @@ async fn retry_after_429_delta_seconds_waits_then_succeeds() {
     let started = Instant::now();
     let output = Command::new(bin_path())
         .env("XDG_CONFIG_HOME", temp.path())
-        .args([
-            "testapi",
-            "get-items",
-            "--spall-retry",
-            "1",
-        ])
+        .args(["testapi", "get-items", "--spall-retry", "1"])
         .output()
         .expect("failed to run spall");
     let elapsed = started.elapsed();
@@ -99,9 +92,7 @@ async fn retry_after_exceeds_clamp_returns_429_without_waiting() {
     // 429 with Retry-After: 600 (10 minutes). Clamp is 2s → fall through.
     Mock::given(method("GET"))
         .and(path("/items"))
-        .respond_with(
-            ResponseTemplate::new(429).insert_header("Retry-After", "600"),
-        )
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "600"))
         .mount(&mock)
         .await;
 
