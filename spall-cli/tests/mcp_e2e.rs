@@ -1540,3 +1540,228 @@ async fn http_transport_delete_rejects_disallowed_origin() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// SSE content negotiation (#12): a `tools/call` POST carrying
+/// `Accept: text/event-stream` whose dispatch yields multiple reply
+/// frames is answered as `text/event-stream` with one `data:` line per
+/// frame. The `__spall_test_multi` placeholder tool (cfg(debug_assertions)-only on
+/// the dispatcher) emits a progress notification frame followed by the
+/// result frame, so a conformant SSE body carries ≥2 `data:` lines.
+#[tokio::test]
+async fn http_transport_sse_multi_event() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // initialize to mint a session id.
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // tools/call against the multi-frame placeholder, asking for SSE.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .header("accept", "text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "__spall_test_multi", "arguments": {} }
+        }))
+        .send()
+        .await
+        .expect("send tools/call");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "SSE-accepting POST must answer text/event-stream, got: {:?}",
+        content_type,
+    );
+    // The stream completes after the last frame (`stream::iter`), so
+    // reading to end is bounded.
+    let body = resp.text().await.expect("read SSE body");
+    let data_lines = body.lines().filter(|l| l.starts_with("data:")).count();
+    assert!(
+        data_lines >= 2,
+        "multi-frame SSE body must carry ≥2 data: lines, got {} in:\n{}",
+        data_lines,
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// JSON is the default reply shape (#12): a `tools/call` with no
+/// `Accept: text/event-stream` gets `application/json` carrying the
+/// single JSON-RPC result frame, not an SSE stream. Pins the
+/// content-negotiation default (server MAY always answer JSON).
+#[tokio::test]
+async fn http_transport_json_response_default() {
+    let mock = MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/pets/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 7, "name": "Rex"})))
+        .mount(&mock)
+        .await;
+
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // tools/call with no Accept header → application/json single result.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "getpetbyid", "arguments": { "petId": 7 } }
+        }))
+        .send()
+        .await
+        .expect("send tools/call");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.starts_with("application/json"),
+        "default tools/call must answer application/json, got: {:?}",
+        content_type,
+    );
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["id"], 2);
+    assert_eq!(body["result"]["isError"], false);
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    let echoed: Value = serde_json::from_str(text).expect("parse echoed body");
+    assert_eq!(echoed["id"], 7);
+    assert_eq!(echoed["name"], "Rex");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// GET `/` opens the server→client SSE channel (#12): with a valid
+/// session id and `Accept: text/event-stream`, the server responds
+/// `200 OK` + `Content-Type: text/event-stream`. The stream is
+/// keep-alive-only (no server-push source yet — see #47/#48), so it
+/// never completes; this asserts on the RESPONSE HEAD only and drops
+/// the connection without reading the (unbounded) body.
+#[tokio::test]
+async fn http_transport_get_opens_sse() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+
+    // Mint a session via a default client.
+    let init_client = reqwest::Client::new();
+    let init = init_client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // The GET stream stays open (keep-alive), so use a short read timeout
+    // and assert on the response head only. `send()` returns once headers
+    // arrive; we never call `.text()` / `.bytes()` (which would block on
+    // the never-ending body).
+    let get_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .expect("build client");
+    let resp = get_client
+        .get(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("send GET");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "GET / with SSE Accept must open a text/event-stream channel, got: {:?}",
+        content_type,
+    );
+    // Drop the response (and its in-flight body) without draining it.
+    drop(resp);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

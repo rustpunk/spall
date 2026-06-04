@@ -14,6 +14,7 @@ pub mod http;
 pub mod schema;
 pub(crate) mod verbose;
 
+use futures::StreamExt;
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 use spall_config::registry::{ApiEntry, ApiRegistry};
@@ -576,8 +577,13 @@ pub async fn run(
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_line(&line, &spec, &profiles, &registry, verbose).await;
-        if let Some(resp) = response {
+        // Drain the reply stream: a notification yields zero frames
+        // (nothing written, matching the old `None`-skip); a request
+        // yields one. Each frame is written as its own line, preserving
+        // the line-delimited JSON-RPC framing.
+        let mut frames = handle_line(&line, &spec, &profiles, &registry, verbose).await;
+        let mut write_failed = false;
+        while let Some(resp) = frames.next().await {
             let mut bytes = match serde_json::to_vec(&resp) {
                 Ok(b) => b,
                 Err(e) => {
@@ -588,12 +594,17 @@ pub async fn run(
             bytes.push(b'\n');
             if let Err(e) = stdout.write_all(&bytes).await {
                 eprintln!("spall mcp: stdout write failed: {}", e);
+                write_failed = true;
                 break;
             }
             if let Err(e) = stdout.flush().await {
                 eprintln!("spall mcp: stdout flush failed: {}", e);
+                write_failed = true;
                 break;
             }
+        }
+        if write_failed {
+            break;
         }
     }
     Ok(())
@@ -625,22 +636,57 @@ pub(crate) fn emit_verbose_startup(
     );
 }
 
-/// Parse one JSON-RPC frame and dispatch. Returns `None` for
-/// notifications (no `id`) and for parse errors that aren't recoverable
-/// into a JSON-RPC error envelope (notifications can't error per spec).
+/// Parse one JSON-RPC frame, dispatch, and yield zero or more reply
+/// frames as an owned, `'static` stream.
+///
+/// Returning a stream rather than `Option<Value>` is the enabling shape
+/// for SSE (issue #12): a `text/event-stream` POST can emit each yielded
+/// frame as one `data:` event, and the stdio / `application/json`
+/// consumers simply drain it. The stream is eagerly materialized — the
+/// single `tools/call` round-trip is awaited *inside* this function and
+/// its result collected into an owned `Vec<Value>` before
+/// [`futures::stream::iter`] hands back a `'static` stream. Eager
+/// collection sidesteps the borrow-vs-`'static` conflict that a lazily
+/// streaming body would hit against the borrowed `spec` / `profiles` /
+/// `registry`; it is sound because every tool today is a single buffered
+/// request/response (no long-running source exists — see issue #48 for
+/// the streaming-tool-source follow-up).
+///
+/// Yield counts:
+/// - **0 frames** for notifications (`notifications/initialized`,
+///   `notifications/cancelled`) and unknown-method notifications (no
+///   `id`). The HTTP transport maps an empty stream to `202 Accepted`.
+/// - **1 frame** for every request that carries an `id`
+///   (`initialize`, `ping`, `tools/list`, `tools/call`) and for parse
+///   errors (null-id error envelope).
 pub(crate) async fn handle_line(
     line: &str,
     spec: &ResolvedSpec,
     profiles: &AuthProfiles,
     registry: &IndexMap<String, ToolEntry>,
     verbose: bool,
-) -> Option<Value> {
+) -> impl futures::Stream<Item = Value> + Send + 'static {
+    let frames = collect_frames(line, spec, profiles, registry, verbose).await;
+    futures::stream::iter(frames)
+}
+
+/// Dispatch one JSON-RPC frame into the owned reply vector that
+/// [`handle_line`] streams. Split out so the `async fn` can `.await` the
+/// tool call with the inputs still borrowed, then return an owned
+/// `Vec<Value>` that outlives those borrows.
+async fn collect_frames(
+    line: &str,
+    spec: &ResolvedSpec,
+    profiles: &AuthProfiles,
+    registry: &IndexMap<String, ToolEntry>,
+    verbose: bool,
+) -> Vec<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("spall mcp: invalid JSON-RPC line: {}", e);
             // Parse errors don't have an id; spec §3 says reply with null id.
-            return Some(rpc_error(Value::Null, ERR_PARSE, "Parse error"));
+            return vec![rpc_error(Value::Null, ERR_PARSE, "Parse error")];
         }
     };
 
@@ -649,21 +695,40 @@ pub(crate) async fn handle_line(
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
     match method {
-        "initialize" => Some(rpc_result(id, handle_initialize())),
-        "notifications/initialized" | "notifications/cancelled" => None,
-        "ping" => Some(rpc_result(id, json!({}))),
-        "tools/list" => Some(rpc_result(id, handle_tools_list(spec, registry))),
+        "initialize" => vec![rpc_result(id, handle_initialize())],
+        "notifications/initialized" | "notifications/cancelled" => Vec::new(),
+        "ping" => vec![rpc_result(id, json!({}))],
+        "tools/list" => vec![rpc_result(id, handle_tools_list(spec, registry))],
         "tools/call" => {
+            #[cfg(debug_assertions)]
+            if let Some(frames) = test_multi_event_frames(&params, &id) {
+                // Test-only multi-frame placeholder, gated to #12's AC
+                // requirement that an SSE POST can carry ≥2 `data:`
+                // frames. No production tool emits more than one frame
+                // (every tool is one buffered round-trip); a real
+                // multi-frame source is issue #48.
+                //
+                // Gated on `debug_assertions`, NOT `cfg(test)`: the SSE
+                // e2e test spawns the real `spall` binary as a
+                // subprocess, and that binary is not compiled with
+                // `--cfg test`, so a `cfg(test)` gate would leave the
+                // placeholder absent from the dispatched binary. Release
+                // builds (`cargo build --release`, the shipped artifact)
+                // disable `debug_assertions`, so the placeholder stays
+                // out of every shipped binary's dispatch table —
+                // `tools/list` and live tool calls are unaffected there.
+                return frames;
+            }
             let result = handle_tools_call(&params, spec, profiles, registry, verbose).await;
-            Some(rpc_result(id, result))
+            vec![rpc_result(id, result)]
         }
         "" => {
             // No method field at all — malformed but recoverable.
-            Some(rpc_error(
+            vec![rpc_error(
                 id.unwrap_or(Value::Null),
                 ERR_INVALID_PARAMS,
                 "missing method",
-            ))
+            )]
         }
         other => {
             // Unknown method. If the original was a notification (no
@@ -675,8 +740,47 @@ pub(crate) async fn handle_line(
                     &format!("unknown method: {}", other),
                 )
             })
+            .into_iter()
+            .collect()
         }
     }
+}
+
+/// Reserved `tools/call` name that drives the test-only multi-frame
+/// path. Kept beside [`collect_frames`] so the gate and the test agree
+/// on the magic string. The leading `__` keeps it out of any plausible
+/// real `operationId` namespace.
+#[cfg(debug_assertions)]
+const TEST_MULTI_EVENT_TOOL: &str = "__spall_test_multi";
+
+/// When a `tools/call` names [`TEST_MULTI_EVENT_TOOL`], synthesize two
+/// reply frames (a progress-style notification frame followed by the
+/// result frame) so #12's SSE content-negotiation can be exercised with
+/// a ≥2-frame stream. Returns `None` for every other tool so the normal
+/// single-frame dispatch runs. Gated on `debug_assertions` so it is
+/// reachable from the subprocess-spawned binary the SSE e2e test drives,
+/// yet compiled out of release builds (see the call site in
+/// [`collect_frames`]).
+#[cfg(debug_assertions)]
+fn test_multi_event_frames(params: &Value, id: &Option<Value>) -> Option<Vec<Value>> {
+    let name = params.get("name").and_then(Value::as_str)?;
+    if name != TEST_MULTI_EVENT_TOOL {
+        return None;
+    }
+    Some(vec![
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": { "progress": 1, "total": 2 },
+        }),
+        rpc_result(
+            id.clone(),
+            json!({
+                "content": [{ "type": "text", "text": "multi-frame placeholder" }],
+                "isError": false,
+            }),
+        ),
+    ])
 }
 
 fn handle_initialize() -> Value {
