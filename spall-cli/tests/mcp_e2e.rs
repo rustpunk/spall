@@ -1159,3 +1159,180 @@ async fn unknown_tool_returns_is_error() {
 
     let _ = shutdown(server);
 }
+
+/// A POST whose body is a notification (no reply frame) must return
+/// `202 Accepted` with an empty body, per MCP spec 2025-06-18 §HTTP
+/// "Sending Messages". Regression guard that 202-no-body replaced the
+/// old 200-with-`null`-body behavior.
+#[tokio::test]
+async fn http_transport_notification_returns_202() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // initialize to mint a session id.
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    assert_eq!(init.status(), reqwest::StatusCode::OK);
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("Mcp-Session-Id header must be issued on initialize")
+        .to_string();
+
+    // notifications/initialized has no `id` → no reply frame → 202.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .send()
+        .await
+        .expect("send notification");
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    let body = resp.bytes().await.expect("read body");
+    assert!(
+        body.is_empty(),
+        "202 Accepted must carry no body, got {} bytes",
+        body.len(),
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A post-`initialize` request carrying an unsupported
+/// `MCP-Protocol-Version` is rejected with `400 Bad Request` and a
+/// JSON-RPC error envelope.
+#[tokio::test]
+async fn http_transport_unsupported_protocol_version_400() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // Valid session, but a bogus protocol version → 400 + error envelope.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", "1999-01-01")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("send tools/list");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("MCP-Protocol-Version"),
+        "error should name the version header: {:?}",
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A post-`initialize` request with NO `MCP-Protocol-Version` header
+/// proceeds normally: an absent header means a pre-header client, so
+/// the server assumes `2025-03-26` rather than rejecting. Pins the
+/// asymmetric rule (absent ⇒ ok, present-unsupported ⇒ 400).
+#[tokio::test]
+async fn http_transport_absent_protocol_version_ok() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // No protocol-version header at all → request proceeds → 200.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("send tools/list");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["result"]["tools"].is_array(),
+        "tools/list should succeed when the version header is absent: {:?}",
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

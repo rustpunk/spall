@@ -252,10 +252,20 @@ JSON-RPC over stdio to Streamable HTTP per [MCP spec 2025-06-18
 §HTTP][mcp-http]. The wire shape:
 
 - One POST endpoint at `/` (the bind root). Body is one JSON-RPC 2.0
-  request frame; response is the matching reply as `application/json`.
+  frame. A request (a frame with an `id`) gets the matching reply as
+  `application/json`. A notification or response frame carries no reply,
+  so the server answers `202 Accepted` with an empty body, per the
+  spec's "Sending Messages" rule.
 - `Mcp-Session-Id` header is issued on `initialize` and required on
   every subsequent request. Sessions live for the process lifetime;
   restarting the server invalidates all existing sessions.
+- `MCP-Protocol-Version` header is validated on every
+  post-`initialize` request. If the header is **absent**, the server
+  assumes `2025-03-26` (the spec's backward-compatibility default) and
+  proceeds. If it is **present but unsupported**, the request gets
+  `400 Bad Request`. The supported set is `2025-06-18` (advertised),
+  `2025-03-26` (assumed default), and `2025-11-25`. `initialize` is
+  exempt, since the client has not yet learned a version to send.
 - Streaming (`text/event-stream`) responses are documented in the
   spec for long-running tools. spall's v1 tools are all
   request/response; the server returns JSON regardless of which

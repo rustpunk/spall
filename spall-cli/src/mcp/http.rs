@@ -7,13 +7,20 @@
 //!
 //! Wire contract:
 //! - **POST /** with `Content-Type: application/json`. Body is one
-//!   JSON-RPC 2.0 request frame. Response is one JSON-RPC frame as
-//!   `application/json`.
+//!   JSON-RPC 2.0 request frame. A request (a frame with an `id`) gets
+//!   one JSON-RPC reply frame as `application/json`. A
+//!   notification/response frame (no reply) gets `202 Accepted` with an
+//!   empty body, per the spec's "Sending Messages" rule.
 //! - **`Mcp-Session-Id`** is issued on `initialize` and required on
 //!   every subsequent request. Sessions expire after
 //!   [`SESSION_TTL_SECS`] of inactivity; a background task prunes
 //!   expired entries. Expired session IDs receive 400 with a
 //!   re-initialize hint.
+//! - **`MCP-Protocol-Version`** is validated on every post-`initialize`
+//!   request. An absent header means a pre-header client, so the server
+//!   assumes `2025-03-26` and proceeds; a present-but-unsupported
+//!   version (outside [`SUPPORTED_PROTOCOL_VERSIONS`]) receives 400.
+//!   `initialize` is exempt — the client has not yet learned a version.
 //! - **Origin** validation: when `--spall-allowed-origin <origin>` is
 //!   provided (repeatable), only listed origins succeed. With an
 //!   empty allowlist (the default), localhost Origins and requests
@@ -91,6 +98,21 @@ const PRUNE_INTERVAL_SECS: u64 = SESSION_TTL_SECS / 12;
 
 /// Header name for the MCP session identifier, per spec.
 const HEADER_SESSION_ID: &str = "mcp-session-id";
+
+/// Header name carrying the negotiated protocol version on every
+/// post-`initialize` request, per MCP spec 2025-06-18 §HTTP
+/// "Protocol Version Header".
+const HEADER_PROTOCOL_VERSION: &str = "mcp-protocol-version";
+
+/// Protocol versions this server accepts on the
+/// [`HEADER_PROTOCOL_VERSION`] header. Includes the advertised
+/// version ([`super::PROTOCOL_VERSION`], `2025-06-18`), the version
+/// assumed when the header is absent (`2025-03-26`, per the spec's
+/// backward-compatibility rule), and the normatively-equivalent
+/// successor `2025-11-25` so newer clients are not rejected. When the
+/// header is present but not in this set, the request is rejected with
+/// `400 Bad Request`.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2025-11-25"];
 
 /// Default port when `--spall-port` is omitted. Picked from the
 /// dynamic / unassigned range to avoid colliding with anything common.
@@ -352,6 +374,37 @@ async fn handle_post(
             )
                 .into_response();
         }
+
+        // MCP-Protocol-Version gate, applied after the session check so
+        // an invalid session still wins (it is the more fundamental
+        // gate). Per the spec's backward-compatibility rule: an ABSENT
+        // header means the client predates the header convention, so we
+        // assume `2025-03-26` and proceed. A PRESENT but unsupported
+        // version is rejected with 400. `initialize` is exempt — the
+        // client has not yet learned the version to send.
+        if let Some(version) = headers
+            .get(HEADER_PROTOCOL_VERSION)
+            .and_then(|v| v.to_str().ok())
+        {
+            if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": parsed.get("id").cloned().unwrap_or(Value::Null),
+                        "error": {
+                            "code": -32600,
+                            "message": format!(
+                                "unsupported MCP-Protocol-Version '{}'; supported: {}",
+                                version,
+                                SUPPORTED_PROTOCOL_VERSIONS.join(", "),
+                            ),
+                        },
+                    })),
+                )
+                    .into_response();
+            }
+        }
     }
 
     // Dispatch via the same line handler the stdio transport uses.
@@ -375,6 +428,23 @@ async fn handle_post(
         if let Ok(v) = HeaderValue::from_str(&sid) {
             headers_out.insert(HeaderName::from_static(HEADER_SESSION_ID), v);
         }
+    }
+
+    // A POST whose body is only notifications/responses carries no
+    // reply frame: per MCP spec 2025-06-18 §HTTP "Sending Messages"
+    // clause 4 the server MUST answer `202 Accepted` with no body.
+    // `handle_line` returns `None` for exactly those inputs
+    // (`notifications/initialized`, `notifications/cancelled`, and
+    // unknown-method notifications), so `response.is_none()` is the
+    // precise "no reply frame" signal. INVARIANT: every method that
+    // carries an `id` returns `Some(structured value)` from
+    // `handle_line` — none returns `Some(Value::Null)` and none returns
+    // `None` — so this predicate never mis-classifies a real request as
+    // a notification. Reachable only for the non-`initialize` path:
+    // `initialize` always yields `Some`, so the session-mint above runs
+    // before this branch can fire.
+    if response.is_none() {
+        return StatusCode::ACCEPTED.into_response();
     }
 
     let body = response.unwrap_or(Value::Null);
