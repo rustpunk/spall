@@ -234,8 +234,13 @@ of the flag are independent and may be combined.
 ## Limitations
 
 - **Tools only.** No MCP `resources` or `prompts` surfaces in v1.
-- **Request/response only.** No progress streaming on long-running
-  calls.
+- **Single request/response per tool.** The HTTP transport's SSE
+  plumbing (content-negotiated POST + keep-alive GET channel) is in
+  place, but every tool is one buffered round-trip — there is no
+  long-running tool source emitting progress frames yet
+  ([#48](https://github.com/rustpunk/spall/issues/48)) and no
+  server-push source on the GET channel
+  ([#47](https://github.com/rustpunk/spall/issues/47)).
 - **`oneOf` / `anyOf` / `allOf` are flattened.** Spall's resolver
   collapses schema composition on load, so each tool's `inputSchema`
   reflects a single resolved branch. If your spec relies heavily on
@@ -252,14 +257,55 @@ JSON-RPC over stdio to Streamable HTTP per [MCP spec 2025-06-18
 §HTTP][mcp-http]. The wire shape:
 
 - One POST endpoint at `/` (the bind root). Body is one JSON-RPC 2.0
-  request frame; response is the matching reply as `application/json`.
+  frame. A request (a frame with an `id`) **content-negotiates** its
+  reply on the `Accept` header:
+  - Default (`Accept: application/json`, or no `Accept` header): one
+    JSON-RPC reply object as `application/json`. The server MAY always
+    answer JSON, per the spec's "Sending Messages" clause 5, so this is
+    the shape every client gets unless it opts into streaming.
+  - `Accept: text/event-stream`: the reply is a `text/event-stream`
+    body carrying one `data:` event per yielded frame, then the stream
+    closes. spall v1 tools are all single request/response (one reply
+    frame), so the SSE body normally carries a single `data:` event;
+    multi-frame streaming awaits a long-running tool source (see
+    [#48](https://github.com/rustpunk/spall/issues/48)).
+  - A notification or response frame carries no reply, so the server
+    answers `202 Accepted` with an empty body, per the spec's "Sending
+    Messages" rule.
+- One GET endpoint at `/` for the server→client SSE channel. With a
+  valid `Mcp-Session-Id` and `Accept: text/event-stream`, the server
+  opens a **keep-alive-only** `text/event-stream` — the conformant "I
+  offer a stream but have nothing to push yet" shape. spall v1 has no
+  server-push source, so the stream emits only keep-alive comment pings;
+  per-session push subscription state is tracked in
+  [#47](https://github.com/rustpunk/spall/issues/47). The Origin and
+  session-id gates apply identically to POST and DELETE.
 - `Mcp-Session-Id` header is issued on `initialize` and required on
   every subsequent request. Sessions live for the process lifetime;
   restarting the server invalidates all existing sessions.
-- Streaming (`text/event-stream`) responses are documented in the
-  spec for long-running tools. spall's v1 tools are all
-  request/response; the server returns JSON regardless of which
-  format the client `Accept`s.
+- **Session termination**: a client ends its session with `DELETE /`
+  carrying its `Mcp-Session-Id`. The Origin gate applies identically and
+  rejects (403) before the session-id is read. A valid header returns
+  `200 OK` with no body; the operation is **idempotent** — a second
+  `DELETE` for the same (now-absent) id still returns `200 OK`, since
+  the session no longer exists either way. A **missing or empty**
+  `Mcp-Session-Id` header is a malformed request and returns
+  `400 Bad Request`.
+- `MCP-Protocol-Version` header is validated on every
+  post-`initialize` request. If the header is **absent**, the server
+  assumes `2025-03-26` (the spec's backward-compatibility default) and
+  proceeds. If it is **present but unsupported**, the request gets
+  `400 Bad Request`. The supported set is `2025-06-18` (advertised),
+  `2025-03-26` (assumed default), and `2025-11-25`. `initialize` is
+  exempt, since the client has not yet learned a version to send.
+- Streaming (`text/event-stream`) is wired on both the POST reply (via
+  `Accept` content negotiation) and the GET channel, as described
+  above. spall's v1 tools are all single request/response, so an
+  SSE-accepting POST carries a single `data:` event and the GET channel
+  is keep-alive-only — the enabling shape is in place, but there is no
+  multi-frame / server-push source yet
+  ([#47](https://github.com/rustpunk/spall/issues/47),
+  [#48](https://github.com/rustpunk/spall/issues/48)).
 
 [mcp-http]: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
 

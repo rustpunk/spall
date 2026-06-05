@@ -1159,3 +1159,609 @@ async fn unknown_tool_returns_is_error() {
 
     let _ = shutdown(server);
 }
+
+/// A POST whose body is a notification (no reply frame) must return
+/// `202 Accepted` with an empty body, per MCP spec 2025-06-18 §HTTP
+/// "Sending Messages". Regression guard that 202-no-body replaced the
+/// old 200-with-`null`-body behavior.
+#[tokio::test]
+async fn http_transport_notification_returns_202() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // initialize to mint a session id.
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    assert_eq!(init.status(), reqwest::StatusCode::OK);
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("Mcp-Session-Id header must be issued on initialize")
+        .to_string();
+
+    // notifications/initialized has no `id` → no reply frame → 202.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .send()
+        .await
+        .expect("send notification");
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    let body = resp.bytes().await.expect("read body");
+    assert!(
+        body.is_empty(),
+        "202 Accepted must carry no body, got {} bytes",
+        body.len(),
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A post-`initialize` request carrying an unsupported
+/// `MCP-Protocol-Version` is rejected with `400 Bad Request` and a
+/// JSON-RPC error envelope.
+#[tokio::test]
+async fn http_transport_unsupported_protocol_version_400() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // Valid session, but a bogus protocol version → 400 + error envelope.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", "1999-01-01")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("send tools/list");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("MCP-Protocol-Version"),
+        "error should name the version header: {:?}",
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A post-`initialize` request with NO `MCP-Protocol-Version` header
+/// proceeds normally: an absent header means a pre-header client, so
+/// the server assumes `2025-03-26` rather than rejecting. Pins the
+/// asymmetric rule (absent ⇒ ok, present-unsupported ⇒ 400).
+#[tokio::test]
+async fn http_transport_absent_protocol_version_ok() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // No protocol-version header at all → request proceeds → 200.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("send tools/list");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["result"]["tools"].is_array(),
+        "tools/list should succeed when the version header is absent: {:?}",
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `DELETE /` with a valid `Mcp-Session-Id` terminates that session:
+/// the DELETE returns 200, and a subsequent request carrying the same
+/// id is rejected with 400 + the re-initialize hint (mirroring the
+/// missing-session test). Proves client-initiated termination (#18).
+#[tokio::test]
+async fn http_transport_delete_terminates_session() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // initialize to mint a session id.
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // DELETE with the issued session id → 200, no body.
+    let del = client
+        .delete(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .send()
+        .await
+        .expect("send delete");
+    assert_eq!(del.status(), reqwest::StatusCode::OK);
+    let del_body = del.bytes().await.expect("read delete body");
+    assert!(
+        del_body.is_empty(),
+        "DELETE 200 should carry no body, got {} bytes",
+        del_body.len(),
+    );
+
+    // The session is now gone: reusing the id → 400 + re-init hint.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("send tools/list");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Mcp-Session-Id"),
+        "terminated session should be rejected with the re-init hint: {:?}",
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Session termination is idempotent: a second `DELETE` for the same
+/// (now-absent) session id still returns 200 OK — the goal state
+/// ("session no longer exists") is already reached (#18 AC).
+#[tokio::test]
+async fn http_transport_delete_idempotent() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // First DELETE terminates the session → 200.
+    let first = client
+        .delete(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .send()
+        .await
+        .expect("send first delete");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+    // Second DELETE for the now-absent id is still 200 (idempotent).
+    let second = client
+        .delete(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .send()
+        .await
+        .expect("send second delete");
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::OK,
+        "DELETE for an absent session id must be idempotent (200 OK)",
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `DELETE /` with no `Mcp-Session-Id` header is a malformed request:
+/// 400 Bad Request. Absent vs. unknown session id are distinct — an
+/// absent id is idempotent 200, but a missing header is a client error.
+#[tokio::test]
+async fn http_transport_delete_missing_header_400() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // DELETE with no session-id header → 400 + error envelope.
+    let resp = client
+        .delete(format!("{}/", base_url))
+        .send()
+        .await
+        .expect("send delete");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Mcp-Session-Id"),
+        "missing-header DELETE should name the session id header: {:?}",
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The shared Origin gate applies to `DELETE` identically to `POST`:
+/// a disallowed Origin under an allowlist is rejected with 403 before
+/// the session-id is read. Proves `check_origin` reuse (#18 AC).
+#[tokio::test]
+async fn http_transport_delete_rejects_disallowed_origin() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(
+        &temp,
+        "petstore",
+        &["--spall-allowed-origin", "https://example.com"],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // DELETE with a non-allowlisted Origin → 403, never reaching the
+    // session-id check.
+    let resp = client
+        .delete(format!("{}/", base_url))
+        .header("origin", "https://evil.example.org")
+        .header("mcp-session-id", "deadbeefdeadbeefdeadbeefdeadbeef")
+        .send()
+        .await
+        .expect("send delete");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// SSE content negotiation (#12): a `tools/call` POST carrying
+/// `Accept: text/event-stream` whose dispatch yields multiple reply
+/// frames is answered as `text/event-stream` with one `data:` line per
+/// frame. The `__spall_test_multi` placeholder tool (cfg(debug_assertions)-only on
+/// the dispatcher) emits a progress notification frame followed by the
+/// result frame, so a conformant SSE body carries ≥2 `data:` lines.
+#[tokio::test]
+async fn http_transport_sse_multi_event() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    // initialize to mint a session id.
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // tools/call against the multi-frame placeholder, asking for SSE.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .header("accept", "text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "__spall_test_multi", "arguments": {} }
+        }))
+        .send()
+        .await
+        .expect("send tools/call");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "SSE-accepting POST must answer text/event-stream, got: {:?}",
+        content_type,
+    );
+    // The stream completes after the last frame (`stream::iter`), so
+    // reading to end is bounded.
+    let body = resp.text().await.expect("read SSE body");
+    let data_lines = body.lines().filter(|l| l.starts_with("data:")).count();
+    assert!(
+        data_lines >= 2,
+        "multi-frame SSE body must carry ≥2 data: lines, got {} in:\n{}",
+        data_lines,
+        body,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// JSON is the default reply shape (#12): a `tools/call` with no
+/// `Accept: text/event-stream` gets `application/json` carrying the
+/// single JSON-RPC result frame, not an SSE stream. Pins the
+/// content-negotiation default (server MAY always answer JSON).
+#[tokio::test]
+async fn http_transport_json_response_default() {
+    let mock = MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/pets/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 7, "name": "Rex"})))
+        .mount(&mock)
+        .await;
+
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+    let client = reqwest::Client::new();
+
+    let init = client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // tools/call with no Accept header → application/json single result.
+    let resp = client
+        .post(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "getpetbyid", "arguments": { "petId": 7 } }
+        }))
+        .send()
+        .await
+        .expect("send tools/call");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.starts_with("application/json"),
+        "default tools/call must answer application/json, got: {:?}",
+        content_type,
+    );
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["id"], 2);
+    assert_eq!(body["result"]["isError"], false);
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    let echoed: Value = serde_json::from_str(text).expect("parse echoed body");
+    assert_eq!(echoed["id"], 7);
+    assert_eq!(echoed["name"], "Rex");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// GET `/` opens the server→client SSE channel (#12): with a valid
+/// session id and `Accept: text/event-stream`, the server responds
+/// `200 OK` + `Content-Type: text/event-stream`. The stream is
+/// keep-alive-only (no server-push source yet — see #47/#48), so it
+/// never completes; this asserts on the RESPONSE HEAD only and drops
+/// the connection without reading the (unbounded) body.
+#[tokio::test]
+async fn http_transport_get_opens_sse() {
+    let mock = MockServer::start().await;
+    let temp = TempDir::new().unwrap();
+    let spec_path = temp.path().join("petstore.json");
+    std::fs::write(&spec_path, pet_spec(mock.address().port())).unwrap();
+    setup_api(&temp, "petstore", spec_path.to_str().unwrap());
+
+    let (mut child, base_url) = spawn_http(&temp, "petstore", &[]).await;
+
+    // Mint a session via a default client.
+    let init_client = reqwest::Client::new();
+    let init = init_client
+        .post(format!("{}/", base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name":"t","version":"0"} }
+        }))
+        .send()
+        .await
+        .expect("send initialize");
+    let session_id = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session id")
+        .to_string();
+
+    // The GET stream stays open (keep-alive), so use a short read timeout
+    // and assert on the response head only. `send()` returns once headers
+    // arrive; we never call `.text()` / `.bytes()` (which would block on
+    // the never-ending body).
+    let get_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .expect("build client");
+    let resp = get_client
+        .get(format!("{}/", base_url))
+        .header("mcp-session-id", &session_id)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("send GET");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "GET / with SSE Accept must open a text/event-stream channel, got: {:?}",
+        content_type,
+    );
+    // Drop the response (and its in-flight body) without draining it.
+    drop(resp);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

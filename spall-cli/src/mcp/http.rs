@@ -7,13 +7,32 @@
 //!
 //! Wire contract:
 //! - **POST /** with `Content-Type: application/json`. Body is one
-//!   JSON-RPC 2.0 request frame. Response is one JSON-RPC frame as
-//!   `application/json`.
+//!   JSON-RPC 2.0 request frame. A request (a frame with an `id`)
+//!   content-negotiates its reply on the `Accept` header: the default
+//!   (`application/json` or no `Accept`) is one JSON-RPC reply object;
+//!   `Accept: text/event-stream` switches the reply to a `text/event-stream`
+//!   body carrying one `data:` event per yielded frame (see *SSE
+//!   responses* below). A notification/response frame (no reply) gets
+//!   `202 Accepted` with an empty body, per the spec's "Sending
+//!   Messages" rule.
+//! - **GET /** with `Accept: text/event-stream` opens the server→client
+//!   SSE channel (progress, sampling, roots). See *SSE responses*.
+//! - **DELETE /** with `Mcp-Session-Id` terminates that session. The
+//!   Origin gate applies identically (rejecting before the session-id
+//!   is read). A valid header returns `200 OK`; termination is
+//!   idempotent — a DELETE for an absent session id still returns
+//!   `200 OK` (the goal state is reached either way). A missing or
+//!   empty `Mcp-Session-Id` header returns `400 Bad Request`.
 //! - **`Mcp-Session-Id`** is issued on `initialize` and required on
 //!   every subsequent request. Sessions expire after
 //!   [`SESSION_TTL_SECS`] of inactivity; a background task prunes
 //!   expired entries. Expired session IDs receive 400 with a
 //!   re-initialize hint.
+//! - **`MCP-Protocol-Version`** is validated on every post-`initialize`
+//!   request. An absent header means a pre-header client, so the server
+//!   assumes `2025-03-26` and proceeds; a present-but-unsupported
+//!   version (outside [`SUPPORTED_PROTOCOL_VERSIONS`]) receives 400.
+//!   `initialize` is exempt — the client has not yet learned a version.
 //! - **Origin** validation: when `--spall-allowed-origin <origin>` is
 //!   provided (repeatable), only listed origins succeed. With an
 //!   empty allowlist (the default), localhost Origins and requests
@@ -28,33 +47,45 @@
 //!
 //! ### SSE responses
 //!
-//! The MCP spec allows `text/event-stream` for long-running tool
-//! responses and for server→client notifications (progress, sampling,
-//! roots). spall v1 returns JSON for every reply: tools are all
-//! request/response and there is no GET event channel.
+//! The MCP spec allows `text/event-stream` both for a POST reply (when
+//! the client `Accept`s it) and for a server→client GET channel. spall
+//! supports both shapes:
 //!
-//! Adding SSE later is **not** a content-type flip in this handler —
-//! [`super::handle_line`] returns `Option<Value>` synchronously, so
-//! streaming requires changing the dispatcher's signature to be
-//! stream-shaped (`Stream<Item = Value>`), threading progress
-//! callbacks through `handle_tools_call`, and adding a GET route for
-//! the server-pump channel. That is a transport refactor, tracked
-//! separately.
+//! - **POST content negotiation.** [`super::handle_line`] is
+//!   stream-shaped (`Stream<Item = Value>`), so [`handle_post`] drains
+//!   it and chooses the reply framing on `Accept`. The default is
+//!   `application/json` carrying the single JSON-RPC reply (the server
+//!   MAY always answer JSON, per "Sending Messages" clause 5);
+//!   `Accept: text/event-stream` emits one `data:` event per yielded
+//!   frame, then the stream closes. Every production method yields 0 or
+//!   1 frame today, so the multi-frame SSE path is exercised only by the
+//!   `#[cfg(debug_assertions)]` placeholder tool — a real multi-frame
+//!   source (tool progress) is issue #48.
+//! - **GET channel.** [`handle_get`] serves `GET /` as a keep-alive-only
+//!   SSE stream — the conformant "I offer a stream but have nothing to
+//!   push yet" shape. There is no server-push source in spall v1, so the
+//!   stream emits only the keep-alive comment pings; per-session push
+//!   subscription state is issue #47.
 //!
 //! ### Out of scope (file a new issue if needed)
 //!
-//! - SSE for long-running tools / progress notifications.
-//! - Server-initiated GET event stream.
+//! - Progress notifications from a long-running tool source (issue #48).
+//! - Per-session server-push subscription state on the GET channel
+//!   (issue #47).
 //! - TLS termination (reverse-proxy responsibility).
 //! - Auth on the HTTP endpoint itself (reverse-proxy responsibility).
 
 use axum::{
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::post,
     Json, Router,
 };
+use futures::StreamExt;
 use indexmap::IndexMap;
 use rand::RngCore;
 use serde_json::{json, Value};
@@ -91,6 +122,21 @@ const PRUNE_INTERVAL_SECS: u64 = SESSION_TTL_SECS / 12;
 
 /// Header name for the MCP session identifier, per spec.
 const HEADER_SESSION_ID: &str = "mcp-session-id";
+
+/// Header name carrying the negotiated protocol version on every
+/// post-`initialize` request, per MCP spec 2025-06-18 §HTTP
+/// "Protocol Version Header".
+const HEADER_PROTOCOL_VERSION: &str = "mcp-protocol-version";
+
+/// Protocol versions this server accepts on the
+/// [`HEADER_PROTOCOL_VERSION`] header. Includes the advertised
+/// version ([`super::PROTOCOL_VERSION`], `2025-06-18`), the version
+/// assumed when the header is absent (`2025-03-26`, per the spec's
+/// backward-compatibility rule), and the normatively-equivalent
+/// successor `2025-11-25` so newer clients are not rejected. When the
+/// header is present but not in this set, the request is rejected with
+/// `400 Bad Request`.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2025-11-25"];
 
 /// Default port when `--spall-port` is omitted. Picked from the
 /// dynamic / unassigned range to avoid colliding with anything common.
@@ -184,7 +230,7 @@ pub async fn run_http(
     };
 
     let app = Router::new()
-        .route("/", post(handle_post))
+        .route("/", post(handle_post).delete(handle_delete).get(handle_get))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(cors)
         .with_state(state);
@@ -221,11 +267,15 @@ struct HttpState {
     verbose: bool,
 }
 
-async fn handle_post(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
+/// Shared Origin gate for every HTTP method on `/`. Returns
+/// `Some(403 response)` when the request's `Origin` is not allowed and
+/// `None` when it passes, applying the DNS-rebinding policy described on
+/// [`HttpState`]. POST, DELETE, and any future verb call this first so
+/// the rejection logic — and the `kind=http-request` verbose line — are
+/// identical across methods. (Returning `Option` rather than `Result`
+/// keeps the large `Response` off a `Result::Err` variant, which the
+/// `result_large_err` lint flags.)
+fn check_origin(headers: &HeaderMap, state: &HttpState) -> Option<Response> {
     // Origin policy:
     // - Empty allowlist + Origin absent → allow (curl, MCP test
     //   clients, same-process). Most browsers always send Origin on
@@ -270,19 +320,92 @@ async fn handle_post(
             super::verbose::SENTINEL,
             super::verbose::quote_if_needed(&origin_str),
             super::verbose::quote_if_needed(&outcome),
-            super::verbose::format_headers(&headers),
+            super::verbose::format_headers(headers),
         );
     }
 
-    if !allowed {
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "origin '{}' not allowed (configure with --spall-allowed-origin)",
-                origin
-            ),
+    if allowed {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "origin '{}' not allowed (configure with --spall-allowed-origin)",
+                    origin
+                ),
+            )
+                .into_response(),
         )
-            .into_response();
+    }
+}
+
+/// Shared session-id gate. Reads [`HEADER_SESSION_ID`], checks it
+/// against the live session map, and refreshes the last-seen marker on
+/// a hit. Returns `Some(400 response)` for a missing, empty, expired, or
+/// unknown session id (carrying the supplied JSON-RPC `id` in the error
+/// envelope) and `None` on a fresh session. POST uses this to gate
+/// post-`initialize` requests; future verbs that require an established
+/// session reuse the identical logic. (`Option` rather than `Result`
+/// mirrors [`check_origin`] and keeps the large `Response` off a
+/// `Result::Err` variant.)
+async fn check_session_id(
+    headers: &HeaderMap,
+    state: &HttpState,
+    rpc_id: &Value,
+) -> Option<Response> {
+    let sid = headers
+        .get(HEADER_SESSION_ID)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let ttl = Duration::from_secs(SESSION_TTL_SECS);
+    let now = Instant::now();
+    let valid = {
+        let mut sessions = state.sessions.write().await;
+        match sessions.get(&sid) {
+            Some(last_seen) if now.duration_since(*last_seen) < ttl => {
+                // Bump the last-seen marker so an active session
+                // doesn't expire mid-flight.
+                sessions.insert(sid.clone(), now);
+                true
+            }
+            Some(_) => {
+                // Expired — reclaim immediately so the next probe
+                // sees a clean miss.
+                sessions.remove(&sid);
+                false
+            }
+            None => false,
+        }
+    };
+    if valid {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id.clone(),
+                    "error": {
+                        "code": -32600,
+                        "message": "missing, expired, or invalid Mcp-Session-Id; call `initialize` first",
+                    },
+                })),
+            )
+                .into_response(),
+        )
+    }
+}
+
+async fn handle_post(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(resp) = check_origin(&headers, &state) {
+        return resp;
     }
 
     // Peek the JSON-RPC method to gate session-id requirements.
@@ -313,58 +436,62 @@ async fn handle_post(
     // SESSION_TTL_SECS) get the same 400 with a re-init hint so the
     // client can recover without restarting.
     if !is_initialize {
-        let sid = headers
-            .get(HEADER_SESSION_ID)
+        let rpc_id = parsed.get("id").cloned().unwrap_or(Value::Null);
+        if let Some(resp) = check_session_id(&headers, &state, &rpc_id).await {
+            return resp;
+        }
+
+        // MCP-Protocol-Version gate, applied after the session check so
+        // an invalid session still wins (it is the more fundamental
+        // gate). Per the spec's backward-compatibility rule: an ABSENT
+        // header means the client predates the header convention, so we
+        // assume `2025-03-26` and proceed. A PRESENT but unsupported
+        // version is rejected with 400. `initialize` is exempt — the
+        // client has not yet learned the version to send.
+        if let Some(version) = headers
+            .get(HEADER_PROTOCOL_VERSION)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let ttl = Duration::from_secs(SESSION_TTL_SECS);
-        let now = Instant::now();
-        let valid = {
-            let mut sessions = state.sessions.write().await;
-            match sessions.get(&sid) {
-                Some(last_seen) if now.duration_since(*last_seen) < ttl => {
-                    // Bump the last-seen marker so an active session
-                    // doesn't expire mid-flight.
-                    sessions.insert(sid.clone(), now);
-                    true
-                }
-                Some(_) => {
-                    // Expired — reclaim immediately so the next probe
-                    // sees a clean miss.
-                    sessions.remove(&sid);
-                    false
-                }
-                None => false,
+        {
+            if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": parsed.get("id").cloned().unwrap_or(Value::Null),
+                        "error": {
+                            "code": -32600,
+                            "message": format!(
+                                "unsupported MCP-Protocol-Version '{}'; supported: {}",
+                                version,
+                                SUPPORTED_PROTOCOL_VERSIONS.join(", "),
+                            ),
+                        },
+                    })),
+                )
+                    .into_response();
             }
-        };
-        if !valid {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "jsonrpc": "2.0",
-                    "id": parsed.get("id").cloned().unwrap_or(Value::Null),
-                    "error": {
-                        "code": -32600,
-                        "message": "missing, expired, or invalid Mcp-Session-Id; call `initialize` first",
-                    },
-                })),
-            )
-                .into_response();
         }
     }
 
-    // Dispatch via the same line handler the stdio transport uses.
-    let response = handle_line(
+    // Dispatch via the same line handler the stdio transport uses, then
+    // drain the reply stream into an owned vector. Every production
+    // method yields 0 frames (notifications) or exactly 1 frame
+    // (`initialize`, `ping`, `tools/list`, `tools/call`, parse errors);
+    // only the `#[cfg(debug_assertions)]` multi-frame placeholder yields >1.
+    let frames: Vec<Value> = handle_line(
         &body,
         &state.spec,
         &state.profiles,
         &state.registry,
         state.verbose,
     )
+    .await
+    .collect()
     .await;
 
-    let mut headers_out = HeaderMap::new();
+    // Mint the session id for `initialize` so the negotiated id rides on
+    // whichever response shape (JSON or SSE) we choose below.
+    let mut session_header: Option<(HeaderName, HeaderValue)> = None;
     if is_initialize {
         let sid = new_session_id();
         state
@@ -373,12 +500,154 @@ async fn handle_post(
             .await
             .insert(sid.clone(), Instant::now());
         if let Ok(v) = HeaderValue::from_str(&sid) {
-            headers_out.insert(HeaderName::from_static(HEADER_SESSION_ID), v);
+            session_header = Some((HeaderName::from_static(HEADER_SESSION_ID), v));
         }
     }
 
-    let body = response.unwrap_or(Value::Null);
+    // A POST whose body is only notifications/responses carries no reply
+    // frame: per MCP spec 2025-06-18 §HTTP "Sending Messages" clause 4
+    // the server MUST answer `202 Accepted` with no body. `handle_line`
+    // yields an empty stream for exactly those inputs
+    // (`notifications/initialized`, `notifications/cancelled`, and
+    // unknown-method notifications), so `frames.is_empty()` is the
+    // precise "no reply frame" signal. INVARIANT: every method that
+    // carries an `id` yields ≥1 frame from `handle_line` — none yields
+    // zero — so this predicate never mis-classifies a real request as a
+    // notification. Reachable only for the non-`initialize` path:
+    // `initialize` always yields a frame, so the session-mint above runs
+    // before this branch can fire (and `initialize` is never a
+    // notification, so a 202 here never drops a freshly-minted id).
+    if frames.is_empty() {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    // Content-negotiate the reply shape on the request `Accept` header.
+    // Per MCP 2025-06-18 §HTTP "Sending Messages" clause 5 the server MAY
+    // always answer with `application/json`; it MUST answer with
+    // `text/event-stream` only when the client asked for it. A client
+    // opts into SSE by listing `text/event-stream` in `Accept`.
+    let wants_sse = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false);
+
+    if wants_sse {
+        // One SSE `Event` per reply frame, then the stream closes
+        // (`stream::iter` completes after the last frame). Each frame is
+        // already a JSON-RPC `Value`; `Event::json_data` serializes it
+        // onto the `data:` field. Serialization of a `serde_json::Value`
+        // cannot fail in practice, so a failure degrades to an empty SSE
+        // comment rather than tearing down the response.
+        let events = frames.into_iter().map(|frame| {
+            let event = Event::default()
+                .json_data(&frame)
+                .unwrap_or_else(|_| Event::default().comment("frame serialization failed"));
+            Ok::<Event, std::convert::Infallible>(event)
+        });
+        let sse = Sse::new(futures::stream::iter(events));
+        return match session_header {
+            Some(header) => ([header], sse).into_response(),
+            None => sse.into_response(),
+        };
+    }
+
+    // Default JSON path. Real dispatch is single-frame, so send that
+    // frame as the response body. The only >1-frame producer is the
+    // `#[cfg(debug_assertions)]` multi-event placeholder; when a JSON reply is
+    // demanded for it, answer with the final (result) frame — the
+    // notification frames ahead of it have no JSON-single-response slot.
+    let body = match frames.len() {
+        1 => frames.into_iter().next().unwrap_or(Value::Null),
+        _ => frames.into_iter().last().unwrap_or(Value::Null),
+    };
+    let mut headers_out = HeaderMap::new();
+    if let Some((name, value)) = session_header {
+        headers_out.insert(name, value);
+    }
     (headers_out, Json(body)).into_response()
+}
+
+/// Server-initiated SSE channel, per MCP spec 2025-06-18 §HTTP. A client
+/// opens `GET /` (with `Accept: text/event-stream`) to receive
+/// server→client messages (progress, sampling, roots). spall v1 has no
+/// server-push source yet, so this returns a keep-alive-only stream:
+/// the connection stays open and emits SSE comment pings, the conformant
+/// "I offer a stream but have nothing to send yet" shape.
+///
+/// The Origin and session-id gates run identically to `handle_post` /
+/// `handle_delete` via the shared [`check_origin`] / [`check_session_id`]
+/// helpers, so the GET channel cannot bypass the handshake or the
+/// DNS-rebinding policy.
+///
+/// The per-session push source is tracked in issue #47: when a tool
+/// gains a long-running progress source, this handler would subscribe to
+/// that session's channel instead of `stream::pending`.
+async fn handle_get(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
+    if let Some(resp) = check_origin(&headers, &state) {
+        return resp;
+    }
+
+    // GET carries no JSON-RPC body, so the session gate uses a null id in
+    // any error envelope (mirroring the DELETE missing-id path).
+    if let Some(resp) = check_session_id(&headers, &state, &Value::Null).await {
+        return resp;
+    }
+
+    // Keep-alive-only: `stream::pending` never yields a data frame, so
+    // the only bytes on the wire are the periodic SSE comment pings the
+    // keep-alive driver emits. See issue #47 for the future per-session
+    // push source that would replace this pending stream.
+    let stream = futures::stream::pending::<Result<Event, std::convert::Infallible>>();
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// Client-initiated session termination, per MCP spec 2025-06-18 §HTTP
+/// "Session Management": `DELETE /` with `Mcp-Session-Id` ends that
+/// session.
+///
+/// - The [`check_origin`] gate runs first and rejects (403) before the
+///   session-id is read, identically to `handle_post`.
+/// - A missing or empty `Mcp-Session-Id` header is a malformed request:
+///   `400 Bad Request` with the standard JSON-RPC error envelope.
+/// - Otherwise the session is removed and `200 OK` returned with no
+///   body. Termination is IDEMPOTENT: removing an id that is absent
+///   (already terminated, expired, or never issued) still returns
+///   `200 OK`, because the goal state — "this session no longer
+///   exists" — holds either way. Mid-flight requests on a terminated
+///   session are out of scope; the existing `RwLock` on the session map
+///   is the only synchronization needed.
+async fn handle_delete(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
+    if let Some(resp) = check_origin(&headers, &state) {
+        return resp;
+    }
+
+    let sid = headers
+        .get(HEADER_SESSION_ID)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if sid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": {
+                    "code": -32600,
+                    "message": "missing or empty Mcp-Session-Id; DELETE requires the session id to terminate",
+                },
+            })),
+        )
+            .into_response();
+    }
+
+    // `remove` returning `None` (absent id) is fine — termination is
+    // idempotent, so a second DELETE for the same id still reaches the
+    // 200 OK goal state.
+    state.sessions.write().await.remove(sid);
+    StatusCode::OK.into_response()
 }
 
 /// True for `Origin` headers pointing at the same machine the default
