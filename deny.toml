@@ -9,7 +9,7 @@
 # Fail the build on any security advisory affecting a dependency.
 version = 2
 yanked = "deny"
-# Pre-existing, out-of-milestone-#1-scope advisories. All six are
+# Pre-existing, out-of-milestone-#1-scope advisories. All seven are
 # *unmaintained* notices (not vulnerabilities) on transitive dependencies spall
 # does not control, each with "no safe upgrade available". They predate the
 # spall-openapi extraction and are tracked as separate spall supply-chain debt;
@@ -33,6 +33,9 @@ ignore = [
     # paste unmaintained — feature-gated transitive via hasp's Azure KV backend
     # (azure_core); only seen under cargo-deny --all-features.
     "RUSTSEC-2024-0436",
+    # http-types notice — feature-gated transitive via hasp's Azure KV backend
+    # (azure_core); only seen under cargo-deny --all-features.
+    "RUSTSEC-2026-0174",
 ]
 
 [licenses]
