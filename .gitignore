@@ -22,3 +22,5 @@ reserve/Cargo.lock
 
 docs/book/
 lancedb/docs/book/
+
+notes/
