@@ -64,7 +64,7 @@
 
 Update `../doc/ai/30_DESIGN_RULES.md`, `../doc/ai/60_PERFORMANCE_NOTES.md`, and `../doc/ai/AI_CHANGELOG.md` for transport-boundary or streaming changes.
 
-## Unclear / Ask Human
+## Approval Gates
 
 - Confirm before changing path-parameter encoding behavior.
 - Confirm before expanding RFC 5988 parser semantics beyond current tests.

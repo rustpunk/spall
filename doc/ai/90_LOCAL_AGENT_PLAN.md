@@ -44,7 +44,7 @@ Sources: root `Cargo.toml`, `CLAUDE.md`, `.github/workflows/ci.yml`, crate `Carg
 2. Batch 2: crate root local `AGENTS.md` files for all four workspace crates.
 3. Batch 3: only if future work proves needed, add local guidance under `spall-cli/src/mcp/` or `spall-openapi/src/stream.rs` ownership areas. Do not create those initially to avoid clutter.
 
-## Probably Unnecessary Local `AGENTS.md`
+## Not Recommended Now Local `AGENTS.md`
 
 - `reserve/`: placeholder crate, not active implementation.
 - `examples/`: simple config examples.

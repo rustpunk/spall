@@ -68,7 +68,7 @@
 
 Update `../doc/ai/10_ARCHITECTURE.md`, `../doc/ai/30_DESIGN_RULES.md`, and `../doc/ai/AI_CHANGELOG.md` for boundary, IR, cache, or resolver rule changes.
 
-## Unclear / Ask Human
+## Approval Gates
 
 - Whether the "no unwrap in library crates" rule allows internal invariant unwraps.
 - Whether `url = "2"` is still needed by this crate.

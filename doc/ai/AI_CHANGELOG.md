@@ -19,13 +19,9 @@ Created the durable AI onboarding set under `doc/ai/`, root `AGENTS.md`, and hig
 - `spall-openapi` owns the transport-neutral request/response contract, request builder, auth contributors, pagination, and bounded JSON streaming.
 - CI runs workspace tests, clippy, rustdoc warnings, fmt, cargo-deny, MSRV 1.88, and a `spall-openapi` dependency-purity check.
 
-### Major Unresolved Questions
+### Open Question Routing
 
-- Config source priority may conflict between older docs and current implementation.
-- Proxy precedence may conflict between comments and implementation.
-- The strictness of "no `.unwrap()` in library crates" needs clarification.
-- Some older internal plans are useful history but not necessarily current truth.
-
+Current unresolved questions are tracked in `doc/ai/80_OPEN_QUESTIONS.md`. Keep this changelog focused on dated evidence, resolved uncertainty, and factual documentation maintenance history.
 ## Future Update Instructions
 
 When architecture changes:
