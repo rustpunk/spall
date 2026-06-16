@@ -51,7 +51,7 @@ Workspace package metadata sets version `0.1.0`, edition `2021`, MSRV `1.88`, an
 - `CLAUDE.md`: concise existing agent context.
 - `docs/src/`: mdBook source.
 - `docs/book/`: generated mdBook output; do not treat as the edit source.
-- `docs/internal/`: plans, design, and research. Useful but may be stale.
+- `docs/internal/`: plans, design, and research. Historical planning and research; treat as secondary evidence behind current source, tests, manifests, and CI.
 - `doc/ai/`: durable onboarding docs created by this pass.
 
 ## Tests, Examples, And Smoke

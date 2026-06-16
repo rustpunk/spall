@@ -1,6 +1,6 @@
 # Architecture
 
-## What This Project Appears To Be
+## Project Overview
 
 Verified: Spall is a Rust-native dynamic OpenAPI 3.x CLI. It parses OpenAPI specs at runtime, builds commands dynamically, executes HTTP requests, and supports validation, auth, formatted output, history, pagination, REPL, Arazzo workflows, and MCP exposure.
 
@@ -73,7 +73,7 @@ Verified:
 - CLI errors use `miette::Diagnostic` and map to explicit exit codes.
 - `spall-cli` distinguishes usage, network, spec, HTTP 4xx, HTTP 5xx, and validation exits.
 
-Open question: root `CLAUDE.md` says no `.unwrap()` in library crates, but source includes at least one mutex-lock `unwrap()` in `spall-core::validator`. Clarify whether the rule is strict or mainly about user-input paths.
+Current unresolved error-handling policy questions are tracked in `doc/ai/80_OPEN_QUESTIONS.md`; check that registry before changing library `.unwrap()` policy.
 
 ## Extension And Plugin Boundaries
 
@@ -83,10 +83,8 @@ Verified:
 - MCP exposes OpenAPI operations as tools.
 - Arazzo support exists in `spall-core` models/expressions and `spall-cli` runner.
 
-Hypothesis: future plugin/mock-server ideas in `docs/internal/plan` are not current implemented surfaces unless source confirms them.
+Current source does not implement plugin or mock-server surfaces; older plans are historical unless current source confirms them.
 
-## Areas Of Uncertainty
+## Open Question Routing
 
-- Exact source priority between per-API files, inline config, and spec directories conflicts with older docs.
-- Proxy precedence may conflict between `spall-cli/src/http.rs` comments and implementation.
-- Some internal plan documents are stale relative to current code.
+Current unresolved architecture questions are tracked in `doc/ai/80_OPEN_QUESTIONS.md`. Check that registry before changing config source priority, proxy precedence, or interpreting internal plan documents.

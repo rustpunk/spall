@@ -67,7 +67,7 @@
 
 Update `../doc/ai/10_ARCHITECTURE.md`, `../doc/ai/30_DESIGN_RULES.md`, `../doc/ai/50_TESTING_AND_COMMANDS.md`, and user docs under `../docs/src/` for CLI behavior changes.
 
-## Unclear / Ask Human
+## Approval Gates
 
 - Proxy precedence may be inconsistent between comments and implementation.
 - Long-term role of `execute_legacy_path`.

@@ -48,7 +48,7 @@
 - Expecting inline secrets to round-trip through serialization.
 - Inferring API-key auth from bare tokens.
 - Adding spec parsing to registry load.
-- Assuming old design docs describe current source priority without checking tests/source.
+- Treating old design docs as describing current source priority without checking tests/source.
 
 ## Local Commands
 
@@ -59,7 +59,7 @@
 
 Update `../doc/ai/80_OPEN_QUESTIONS.md` if config source priority is resolved. Update user docs under `../docs/src/config/` for config behavior changes.
 
-## Unclear / Ask Human
+## Approval Gates
 
 - Current config source priority should be clarified and tested before changing.
 - Whether profile header overlay order should be deterministic.

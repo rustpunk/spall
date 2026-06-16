@@ -18,14 +18,14 @@
 - Verified: Dynamic CLI command building belongs in `spall-cli::command`.
 - Verified: Public neutral request/response types are exported by `spall-openapi`.
 - Verified: `spall-core` IR types are cache-visible and must be treated as a stable-ish internal contract.
-- Hypothesis: Adding or removing fields in `ResolvedSpec` should be paired with an `IR_VERSION` review and cache tests.
+- When adding or removing fields in `ResolvedSpec`, review `IR_VERSION` and add or update cache tests.
 
 ## Error Handling Rules
 
 - Verified: Libraries use `thiserror`.
 - Verified: CLI errors use `miette` diagnostics and explicit exit-code mapping.
 - Verified: HTTP 4xx/5xx response bodies should be emitted before exit-code mapping.
-- Hypothesis: "No `.unwrap()` in library crates" is aspirational or user-input-focused, because current library code contains at least one mutex-lock `unwrap()`.
+- Library `.unwrap()` policy is tracked in `doc/ai/80_OPEN_QUESTIONS.md`; avoid adding new `.unwrap()` calls in library crates until that policy is resolved.
 
 ## State, Ownership, And Concurrency
 
